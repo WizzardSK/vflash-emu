@@ -1042,12 +1042,28 @@ static int vflash_hle_boot(VFlash *vf) {
                          * then uses R4 as interrupt mask or dispatch value.
                          *
                          * Task #1 at 0x10B0DF10: */
-                        uint32_t task1 = 0xB0DF10;  /* RAM offset */
-                        *(uint32_t*)(vf->ram + task1 + 0x00) = 0;
+                        /* Task table at 0x10B0DF00, 16 bytes per entry.
+                         * Entry format:
+                         *   +0: IRQ register address (for callback==-1 path)
+                         *       OR IRQ bitmask (for callback!=-1 path)
+                         *   +4: ???
+                         *   +8: callback (-1 = use entry[+0] as IRQ addr)
+                         *   +C: active flag (1)
+                         *
+                         * After scan, code writes:
+                         *   [R0] = 0xDC000008  (R0 = task[+0] for cb==-1)
+                         *   [0xDC000108] = R4  (R4 = OR'd task[+0] for cb!=-1)
+                         *
+                         * Set task #1 as IRQ controller task:
+                         *   entry[+0] = 0xDC000004 (IRQ enable register addr)
+                         *   entry[+8] = -1 (use addr path)
+                         *   entry[+C] = 1 (active) */
+                        uint32_t task1 = 0xB0DF10;
+                        *(uint32_t*)(vf->ram + task1 + 0x00) = 0xDC000004;
                         *(uint32_t*)(vf->ram + task1 + 0x04) = 0;
-                        *(uint32_t*)(vf->ram + task1 + 0x08) = 0xFFFFFFFF; /* -1 = no callback (skip) */
-                        *(uint32_t*)(vf->ram + task1 + 0x0C) = 1; /* active */
-                        printf("[HLE] Set task #1 active (callback=-1)\n");
+                        *(uint32_t*)(vf->ram + task1 + 0x08) = 0xFFFFFFFF;
+                        *(uint32_t*)(vf->ram + task1 + 0x0C) = 1;
+                        printf("[HLE] Set task #1: IRQ addr=0xDC000004\n");
                     }
                 }
             }
