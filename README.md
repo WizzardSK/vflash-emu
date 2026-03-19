@@ -140,12 +140,37 @@ V.Flash game discs contain a `BOOT.BIN` with a custom header:
 
 The entire file is loaded at the specified load address. The entry point trampoline at offset 0x10 jumps to the real init code. REL table processing is not yet implemented.
 
-## Current limitations
+## Boot ROM
 
-- **No video output yet** — CPU boots and runs init code (MMU setup, page table, CP15 config) but game code hasn't reached framebuffer writes
-- REL (relocation table) processing not implemented — may be needed for some games
-- I/O register map is estimated; may need adjustment with real game discs
-- Only one game tested (Spider-Man: Countdown to Doom)
+The emulator supports real boot ROM (`70004.bin`, 2MB) from V.Flash/V.Smile Pro hardware. Place it in the working directory or alongside game disc images.
+
+With boot ROM present, the emulator performs a real hardware boot sequence instead of HLE:
+1. ARM reset → ROM init at address 0
+2. System control config (PLL, clocks)
+3. ROM self-copy to RAM via flash controller remap
+4. Timer/IRQ controller initialization
+5. CD-ROM disc detection → BOOT.BIN load
+6. µMORE RTOS init → game start
+
+Without boot ROM, HLE boot is used (limited — µMORE RTOS not fully functional).
+
+### Flash controller (0xB8000000)
+
+The ZEVIO SoC flash controller maps boot ROM at `0xB8000000`. A remap register at `0xB8000800` allows ROM code to redirect execution from flash to RAM after copying itself.
+
+### System control (0x900A0000)
+
+| Register | Function |
+|----------|----------|
+| `0x900A000C` | Boot status (bit1: 0=cold boot, 1=warm boot) |
+| `0x900B0014` | PLL lock status (bit0: 1=locked) |
+
+## Current status
+
+- **Boot ROM loads and runs** — passes through hardware init, flash remap, timer/IRQ setup
+- **No video output yet** — ROM boot sequence still in early phase, hasn't loaded BOOT.BIN from disc
+- I/O register map is partially implemented; more stubs needed for ROM to complete boot
+- 6 games extracted and analyzed; all share identical 48KB µMORE init code
 
 ## Notes
 
