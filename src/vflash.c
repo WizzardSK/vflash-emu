@@ -234,9 +234,14 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
     if (addr >= VFLASH_IO_BASE) {
         uint32_t off = addr - VFLASH_IO_BASE;
 
-        /* IRQ + timers: 0x000–0x1FF */
+        /* Primary IRQ + timers: 0x80000000+0x000–0x1FF */
         if (off < 0x200)
             return ztimer_read(&vf->timer, off);
+
+        /* Secondary IRQ controller at 0xDC000000 (VIC)
+         * mapped to same ztimer — games use this via MMU */
+        if (off >= 0x5C000000u && off < 0x5C000200u)
+            return ztimer_read(&vf->timer, off - 0x5C000000u);
 
         /* CD-ROM DMA: 0x1000–0x1FFF */
         if (off >= 0x1000 && off < 0x2000) {
@@ -371,8 +376,13 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
     if (addr >= VFLASH_IO_BASE) {
         uint32_t off = addr - VFLASH_IO_BASE;
 
-        /* IRQ + timers */
+        /* Primary IRQ + timers */
         if (off < 0x200) { ztimer_write(&vf->timer, off, val); return; }
+
+        /* Secondary IRQ controller at 0xDC000000 */
+        if (off >= 0x5C000000u && off < 0x5C000200u) {
+            ztimer_write(&vf->timer, off - 0x5C000000u, val); return;
+        }
 
         /* CD-ROM DMA: 0x1000–0x1FFF */
         if (off >= 0x1000 && off < 0x2000) {
@@ -1024,6 +1034,13 @@ static int vflash_hle_boot(VFlash *vf) {
                         for (int i = 0; i < 6; i++)
                             *(uint32_t*)(vf->ram + base + cpsr_str_offsets[i]) = 0xE1A00000u;
                         printf("[HLE] Set task CPSR=0xD3, NOP'd %d CPSR writes\n", 6);
+
+                        /* Mark task #1 as active in the task table.
+                         * Task table at 0x10B0DF00, 16 bytes per entry.
+                         * Scanner checks [entry+0xC] == 1 for active.
+                         * Task #1 at 0x10B0DF10, active flag at 0x10B0DF1C. */
+                        *(uint32_t*)(vf->ram + 0xB0DF1C) = 1;
+                        printf("[HLE] Set task #1 active at 0x10B0DF1C\n");
                     }
                 }
             }
