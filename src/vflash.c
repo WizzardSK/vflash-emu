@@ -994,24 +994,27 @@ static int vflash_hle_boot(VFlash *vf) {
                         printf("[HLE] Set task count [0x%08X] = 1\n",
                                load_addr + 0xC004);
 
-                        /* ROM also pushes task entry PC pointer on stack
-                         * before calling µMORE init. The init function
-                         * does PUSH{R0}/POP{R0,R1} reading the extra
-                         * value from stack. Write a safe pointer there.
-                         * SP at init entry = STACK_TOP = 0x11000000.
-                         * [SP-4] (below initial SP) should have task PC ptr.
-                         * We write it to RAM at SP-4. */
-                        uint32_t sp_below = VFLASH_STACK_TOP - VFLASH_RAM_BASE - 4;
-                        /* Use load_addr+0xC4A4 as a guess for game main
-                         * (first function in game-specific code area).
-                         * Store a pointer-to-pointer: write PC value at
-                         * a scratch location, then write pointer to it. */
-                        uint32_t scratch = VFLASH_STACK_TOP - VFLASH_RAM_BASE - 0x100;
-                        /* scratch = address 0x10FFFF00 in RAM */
-                        *(uint32_t*)(vf->ram + scratch)     = 0x000000D3; /* CPSR: SVC */
-                        *(uint32_t*)(vf->ram + scratch + 4) = load_addr + 0xC4A4; /* task PC */
-                        /* Push pointer-to-PC on stack (will be read as R1 by POP) */
-                        *(uint32_t*)(vf->ram + sp_below) = VFLASH_RAM_BASE + scratch + 4;
+                        /* µMORE init at 0x53AA0 does PUSH{R0}/POP{R0,R1}.
+                         * POP reads R1 from [SP_init] = [load_addr+0x425C].
+                         * R1 then gets stored to [0x10B602E0] (task PC).
+                         * ROM pushes the game entry PC there before calling
+                         * µMORE init. We write it to the stack slot directly.
+                         *
+                         * Similarly, R0 gets stored to [0x10BCA4E0] (task CPSR).
+                         * R0 = saved R0 from PUSH{R0} which is whatever R0
+                         * was when µMORE init was called. ROM sets R0 to the
+                         * initial CPSR. Our patched return from init2 doesn't
+                         * set R0, so we also write CPSR to the stack. */
+                        uint32_t sp_init_off = 0xC0425C; /* load_addr+0x425C - RAM_BASE */
+                        /* [SP_init+0] = R0 slot (PUSH {R0}) = initial CPSR */
+                        /* [SP_init+4] would be R1 slot but POP reads below SP */
+                        /* Actually: PUSH{R0} decrements SP by 4, so:
+                         * After PUSH: SP = 0x10C04258, [0x10C04258] = R0
+                         * POP{R0,R1}: R0 = [0x10C04258], R1 = [0x10C0425C]
+                         * So R1 comes from ORIGINAL SP = load_addr+0x425C */
+                        *(uint32_t*)(vf->ram + sp_init_off) = load_addr + 0xC4A4;
+                        printf("[HLE] Set stack[SP_init] = 0x%08X (game main for R1→task PC)\n",
+                               load_addr + 0xC4A4);
                     }
                 }
             }
