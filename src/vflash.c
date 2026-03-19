@@ -123,6 +123,7 @@ struct VFlash {
     uint32_t  input_prev;
     int       debug;
     int       has_rom;    /* 1 if boot ROM loaded (real boot, no HLE) */
+    uint32_t  flash_remap; /* Flash controller: remap address at 0xB8000800 */
     uint64_t  frame_count;
 
     VideoRegs vid;
@@ -244,12 +245,21 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         if (off >= 0x5C000000u && off < 0x5C000200u)
             return ztimer_read(&vf->timer, off - 0x5C000000u);
 
-        /* Boot ROM at 0xB8000000 — ROM is 2MB, mapped here for
-         * runtime execution after initial boot from address 0.
-         * ROM code jumps to 0xB8xxxxxx after early init. */
+        /* Boot ROM / Flash controller at 0xB8000000.
+         * ROM code lives here. Flash remap register at 0xB8000800:
+         * writing to it sets a "jump vector" that reading returns,
+         * used to redirect execution from ROM to RAM after copy. */
         if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
-            uint32_t rom_off = off - 0x38000000u;
-            return *(uint32_t*)(vf->ram + rom_off);
+            uint32_t foff = off - 0x38000000u;
+            if (foff >= 0x800 && vf->flash_remap) {
+                /* Flash remap active: reading from 0xB8000800+N
+                 * returns data from RAM at remap_addr+N */
+                uint32_t remap_off = vf->flash_remap + (foff - 0x800);
+                if (remap_off < VFLASH_RAM_SIZE)
+                    return *(uint32_t*)(vf->ram + remap_off);
+                return 0;
+            }
+            return *(uint32_t*)(vf->ram + foff);
         }
 
         /* CD-ROM DMA: 0x1000–0x1FFF */
@@ -311,7 +321,7 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         if (off >= 0x100A0000u && off < 0x100C0000u) {
             uint32_t sreg = off - 0x100A0000u;
             switch (sreg) {
-                case 0x000C: return 0x02;    /* Boot status: bit1=1 (normal boot) */
+                case 0x000C: return 0x00;    /* Boot status: bit1=0 (cold boot → copy ROM to RAM) */
                 case 0x10014: return 0x01;   /* PLL lock: bit0=1 (locked) */
                 default:     return 0xFFFFFFFF; /* All ready/done bits set */
             }
@@ -401,6 +411,16 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
         /* Secondary IRQ controller at 0xDC000000 */
         if (off >= 0x5C000000u && off < 0x5C000200u) {
             ztimer_write(&vf->timer, off - 0x5C000000u, val); return;
+        }
+
+        /* Flash controller write at 0xB8000800 (remap register) */
+        if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
+            uint32_t foff = off - 0x38000000u;
+            if (foff == 0x800) {
+                vf->flash_remap = val;
+                printf("[ROM] Flash remap: 0x%08X\n", val);
+            }
+            return;
         }
 
         /* CD-ROM DMA: 0x1000–0x1FFF */
