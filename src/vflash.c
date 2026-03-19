@@ -1013,6 +1013,21 @@ static int vflash_hle_boot(VFlash *vf) {
         vf->cpu.r13_fiq = VFLASH_STACK_TOP - 0x3000;
         vf->cpu.r13_abt = VFLASH_STACK_TOP - 0x4000;
         vf->cpu.r13_und = VFLASH_STACK_TOP - 0x5000;
+        /* Initialize banked LR and SPSR for all modes.
+         * µMORE RTOS init switches between modes via MSR CPSR_c and
+         * returns via MOVS PC,LR which restores SPSR→CPSR. The ROM
+         * normally sets these up. We initialize LR to entry_point
+         * (safe default) and SPSR to SVC mode (the primary mode). */
+        vf->cpu.r14_svc = entry_point;
+        vf->cpu.r14_irq = entry_point;
+        vf->cpu.r14_fiq = entry_point;
+        vf->cpu.r14_abt = entry_point;
+        vf->cpu.r14_und = entry_point;
+        vf->cpu.spsr_svc = 0x000000D3;  /* SVC mode, IRQ+FIQ disabled */
+        vf->cpu.spsr_irq = 0x000000D3;
+        vf->cpu.spsr_fiq = 0x000000D3;
+        vf->cpu.spsr_abt = 0x000000D3;
+        vf->cpu.spsr_und = 0x000000D3;
 
         printf("[HLE] Boot: PC=0x%08X SP=0x%08X\n", entry_point, VFLASH_STACK_TOP);
 
