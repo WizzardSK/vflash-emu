@@ -1035,12 +1035,19 @@ static int vflash_hle_boot(VFlash *vf) {
                             *(uint32_t*)(vf->ram + base + cpsr_str_offsets[i]) = 0xE1A00000u;
                         printf("[HLE] Set task CPSR=0xD3, NOP'd %d CPSR writes\n", 6);
 
-                        /* Mark task #1 as active in the task table.
-                         * Task table at 0x10B0DF00, 16 bytes per entry.
-                         * Scanner checks [entry+0xC] == 1 for active.
-                         * Task #1 at 0x10B0DF10, active flag at 0x10B0DF1C. */
-                        *(uint32_t*)(vf->ram + 0xB0DF1C) = 1;
-                        printf("[HLE] Set task #1 active at 0x10B0DF1C\n");
+                        /* Fill task #1 in the task table.
+                         * Table at 0x10B0DF00, 16 bytes per entry.
+                         * Entry format: +0=?, +4=?, +8=callback, +C=active.
+                         * Scanner ORs callback into R4 for all active tasks,
+                         * then uses R4 as interrupt mask or dispatch value.
+                         *
+                         * Task #1 at 0x10B0DF10: */
+                        uint32_t task1 = 0xB0DF10;  /* RAM offset */
+                        *(uint32_t*)(vf->ram + task1 + 0x00) = 0;
+                        *(uint32_t*)(vf->ram + task1 + 0x04) = 0;
+                        *(uint32_t*)(vf->ram + task1 + 0x08) = 0xFFFFFFFF; /* -1 = no callback (skip) */
+                        *(uint32_t*)(vf->ram + task1 + 0x0C) = 1; /* active */
+                        printf("[HLE] Set task #1 active (callback=-1)\n");
                     }
                 }
             }
