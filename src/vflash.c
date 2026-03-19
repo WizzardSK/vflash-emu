@@ -1005,6 +1005,15 @@ static int vflash_hle_boot(VFlash *vf) {
         vf->cpu.r[13] = VFLASH_STACK_TOP;
         vf->cpu.cpsr  = 0x0000001F;  /* SYS mode, ARM (T=0), IRQ+FIQ enabled */
 
+        /* Set stack pointers for all ARM modes.
+         * µMORE RTOS expects these to be pre-initialized by boot ROM.
+         * Place each mode's stack 4KB apart below STACK_TOP. */
+        vf->cpu.r13_svc = VFLASH_STACK_TOP - 0x1000;
+        vf->cpu.r13_irq = VFLASH_STACK_TOP - 0x2000;
+        vf->cpu.r13_fiq = VFLASH_STACK_TOP - 0x3000;
+        vf->cpu.r13_abt = VFLASH_STACK_TOP - 0x4000;
+        vf->cpu.r13_und = VFLASH_STACK_TOP - 0x5000;
+
         printf("[HLE] Boot: PC=0x%08X SP=0x%08X\n", entry_point, VFLASH_STACK_TOP);
 
         /* Disassemble first 8 instructions */
