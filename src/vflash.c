@@ -953,38 +953,31 @@ static int vflash_hle_boot(VFlash *vf) {
                     if (insn_at_180 == 0xE590F000u) {
                         /* Install HLE ROM stub at 0x1880 in RAM mirror.
                          * The BOOT init code jumps here via LDR PC,[R0].
-                         * ROM REL function would process relocations and then
-                         * jump to the OS entry. Since REL table is empty (5A),
-                         * we just need to find and jump to the OS entry.
                          *
-                         * The OS entry is typically at a fixed offset in BOOT.BIN.
-                         * We search for the first function past the init data pool
-                         * that starts with a standard ARM prologue (PUSH {LR}). */
-                        uint32_t base = load_addr - VFLASH_RAM_BASE;
-                        uint32_t os_entry = 0;
-
-                        /* Strategy: scan code area for the µMORE OS init function.
-                         * It's typically the first major function after the small
-                         * init/startup block. Look for function at 0x4598+ range
-                         * (after init1/init2/init3 function bodies). */
-                        for (uint32_t scan = 0x4590; scan < 0x10000; scan += 4) {
-                            uint32_t insn = *(uint32_t*)(vf->ram + base + scan);
-                            /* Look for STMDB SP!, {R4-Rxx, LR} pattern (function entry) */
-                            if ((insn & 0xFFFF0000) == 0xE92D0000 && (insn & 0x4000)) {
-                                os_entry = load_addr + scan;
-                                break;
-                            }
-                        }
-
-                        if (!os_entry) os_entry = load_addr + 0x4598;
-
-                        /* Write stub at RAM mirror 0x1880:
-                         * LDR PC, [PC, #-4]    = 0xE51FF004
-                         * .word os_entry        = target address */
-                        vf->ram[0x1880]   = 0x04; vf->ram[0x1881] = 0xF0;
-                        vf->ram[0x1882]   = 0x1F; vf->ram[0x1883] = 0xE5;
-                        *(uint32_t*)(vf->ram + 0x1884) = os_entry;
-                        printf("[HLE] ROM stub at 0x1880 → OS entry 0x%08X\n", os_entry);
+                         * ROM REL function would: process relocations (empty
+                         * in tested games), enable IRQs, then return to caller
+                         * (0x10C00184). The caller writes "boot complete" to a
+                         * system register and enters WFI loop. Timer IRQ fires
+                         * and the OS ISR takes over.
+                         *
+                         * Our stub:
+                         *   MRS  R0, CPSR           ; read CPSR
+                         *   BIC  R0, R0, #0xC0      ; clear I+F bits (enable IRQs)
+                         *   MSR  CPSR_c, R0         ; write back
+                         *   LDR  PC, [PC, #-4]      ; jump to return address
+                         *   .word <return_addr>      ; = load_addr + 0x184
+                         */
+                        /* µMORE RTOS init at load_addr+0x53AA0 — sets up
+                         * exception stacks for all ARM modes (SVC/UND/ABT/IRQ/FIQ) */
+                        uint32_t ret_addr = load_addr + 0x53AA0;
+                        uint32_t stub_base = 0x1880;
+                        *(uint32_t*)(vf->ram + stub_base + 0x00) = 0xE10F0000u; /* MRS R0,CPSR */
+                        *(uint32_t*)(vf->ram + stub_base + 0x04) = 0xE3C000C0u; /* BIC R0,R0,#0xC0 */
+                        *(uint32_t*)(vf->ram + stub_base + 0x08) = 0xE121F000u; /* MSR CPSR_c,R0 */
+                        *(uint32_t*)(vf->ram + stub_base + 0x0C) = 0xE51FF004u; /* LDR PC,[PC,#-4] */
+                        *(uint32_t*)(vf->ram + stub_base + 0x10) = ret_addr;
+                        printf("[HLE] ROM stub at 0x%X → enable IRQ + return to 0x%08X\n",
+                               stub_base, ret_addr);
                     }
                 }
             }
