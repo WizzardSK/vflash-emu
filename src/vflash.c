@@ -967,17 +967,25 @@ static int vflash_hle_boot(VFlash *vf) {
                          *   LDR  PC, [PC, #-4]      ; jump to return address
                          *   .word <return_addr>      ; = load_addr + 0x184
                          */
-                        /* µMORE RTOS init at load_addr+0x53AA0 — sets up
-                         * exception stacks for all ARM modes (SVC/UND/ABT/IRQ/FIQ) */
-                        uint32_t ret_addr = load_addr + 0x53AA0;
-                        uint32_t stub_base = 0x1880;
-                        *(uint32_t*)(vf->ram + stub_base + 0x00) = 0xE10F0000u; /* MRS R0,CPSR */
-                        *(uint32_t*)(vf->ram + stub_base + 0x04) = 0xE3C000C0u; /* BIC R0,R0,#0xC0 */
-                        *(uint32_t*)(vf->ram + stub_base + 0x08) = 0xE121F000u; /* MSR CPSR_c,R0 */
-                        *(uint32_t*)(vf->ram + stub_base + 0x0C) = 0xE51FF004u; /* LDR PC,[PC,#-4] */
-                        *(uint32_t*)(vf->ram + stub_base + 0x10) = ret_addr;
-                        printf("[HLE] ROM stub at 0x%X → enable IRQ + return to 0x%08X\n",
-                               stub_base, ret_addr);
+                        /* ROM REL function normally processes relocations
+                         * and jumps to OS entry. For now, return to caller
+                         * (0x184 = error path with write to 0x900A0008).
+                         * We also map 0x900A0008 to a harmless I/O register
+                         * so the write succeeds, and NOP the infinite loop. */
+                        uint32_t base = load_addr - VFLASH_RAM_BASE;
+
+                        /* Skip the entire REL block by patching init2's
+                         * return address in the data pool. Init2 returns
+                         * to [load_addr+0xF8] which is normally 0x150
+                         * (the BL disable_caches + REL check). We redirect
+                         * it to the µMORE RTOS init function instead.
+                         *
+                         * The RTOS init at load_addr+0x53AA0 sets up ARM
+                         * mode stacks and starts the scheduler. */
+                        uint32_t os_init = load_addr + 0x53AA0;
+                        *(uint32_t*)(vf->ram + base + 0xF8) = os_init;
+                        printf("[HLE] Patched init2 return → 0x%08X (µMORE RTOS init)\n",
+                               os_init);
                     }
                 }
             }
