@@ -122,6 +122,7 @@ struct VFlash {
     uint32_t  input;
     uint32_t  input_prev;
     int       debug;
+    int       has_rom;    /* 1 if boot ROM loaded (real boot, no HLE) */
     uint64_t  frame_count;
 
     VideoRegs vid;
@@ -242,6 +243,14 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
          * mapped to same ztimer — games use this via MMU */
         if (off >= 0x5C000000u && off < 0x5C000200u)
             return ztimer_read(&vf->timer, off - 0x5C000000u);
+
+        /* Boot ROM at 0xB8000000 — ROM is 2MB, mapped here for
+         * runtime execution after initial boot from address 0.
+         * ROM code jumps to 0xB8xxxxxx after early init. */
+        if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
+            uint32_t rom_off = off - 0x38000000u;
+            return *(uint32_t*)(vf->ram + rom_off);
+        }
 
         /* CD-ROM DMA: 0x1000–0x1FFF */
         if (off >= 0x1000 && off < 0x2000) {
@@ -1241,6 +1250,37 @@ VFlash* vflash_create(const char *disc_path) {
     vf->cpu.mem_write16  = mem_write16;
     vf->cpu.mem_write8   = mem_write8;
 
+    /* Try to load boot ROM (70004.bin) — enables real boot instead of HLE */
+    {
+        const char *rom_paths[] = {
+            "70004.bin",
+            "../vflash-roms/70004.bin",
+            "/home/wizzard/share/GitHub/vflash-roms/70004.bin",
+            NULL
+        };
+        FILE *rom_fp = NULL;
+        for (int i = 0; rom_paths[i]; i++) {
+            rom_fp = fopen(rom_paths[i], "rb");
+            if (rom_fp) break;
+        }
+        if (rom_fp) {
+            fseek(rom_fp, 0, SEEK_END);
+            long rom_size = ftell(rom_fp);
+            fseek(rom_fp, 0, SEEK_SET);
+            if (rom_size > 0 && rom_size <= VFLASH_ROM_SIZE * 4) {
+                uint8_t *rom_data = malloc((size_t)rom_size);
+                fread(rom_data, 1, (size_t)rom_size, rom_fp);
+                /* Load ROM at physical address 0 (RAM mirror area).
+                 * ARM boots from address 0, ROM lives there on real HW. */
+                memcpy(vf->ram, rom_data, (size_t)rom_size);
+                printf("[ROM] Loaded boot ROM: %ld bytes at 0x00000000\n", rom_size);
+                free(rom_data);
+                vf->has_rom = 1;
+            }
+            fclose(rom_fp);
+        }
+    }
+
     if (disc_path) {
         if (is_raw_binary(disc_path)) {
             /* Raw ARM binary — load directly, skip ISO layer */
@@ -1256,7 +1296,13 @@ VFlash* vflash_create(const char *disc_path) {
                 vflash_destroy(vf);
                 return NULL;
             }
-            if (!vflash_hle_boot(vf)) {
+            if (vf->has_rom) {
+                /* Real boot ROM loaded — let it boot naturally.
+                 * ROM will read BOOT.BIN from CD, init µMORE, start game. */
+                arm9_reset(&vf->cpu);
+                vf->cpu.r[15] = 0x00000000;  /* ARM boots from address 0 */
+                printf("[ROM] Booting from ROM at 0x00000000\n");
+            } else if (!vflash_hle_boot(vf)) {
                 fprintf(stderr, "[VFlash] HLE boot failed — starting at 0x%08X\n",
                         VFLASH_LOAD_ADDR);
                 arm9_reset(&vf->cpu);
