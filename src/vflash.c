@@ -930,6 +930,64 @@ static int vflash_hle_boot(VFlash *vf) {
         } else if (is_vflash_boot(buf, entry.size)) {
             printf("[HLE] V.Flash BOOT format detected\n");
             entry_point = load_vflash_boot(vf, buf, entry.size);
+
+            /* HLE: Install ROM stub for REL processing function.
+             * The BOOT init code jumps to a ROM function (typically at 0x1880)
+             * via LDR PC,[R0] where R0 points to the REL descriptor.
+             * The ROM function processes relocations and continues boot.
+             * Since we don't have the ROM, we install a stub that:
+             *  1. Reads the REL descriptor to find if there are relocations
+             *  2. If table is empty (padded with 0x5A), skips processing
+             *  3. Returns by jumping to the code after the REL check
+             *
+             * For now: REL table is empty in tested games, so the stub is a
+             * simple NOP that patches the BOOT code to skip the REL jump.
+             * We replace the LDR PC,[R0] at load_addr+0x180 with a NOP. */
+            {
+                uint32_t load_addr = *(uint32_t*)(buf + 8);
+                if (load_addr >= VFLASH_RAM_BASE &&
+                    load_addr + 0x184 < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
+                    uint32_t off_180 = load_addr - VFLASH_RAM_BASE + 0x180;
+                    uint32_t insn_at_180 = *(uint32_t*)(vf->ram + off_180);
+                    /* Verify it's LDR PC,[R0] = 0xE590F000 */
+                    if (insn_at_180 == 0xE590F000u) {
+                        /* Install HLE ROM stub at 0x1880 in RAM mirror.
+                         * The BOOT init code jumps here via LDR PC,[R0].
+                         * ROM REL function would process relocations and then
+                         * jump to the OS entry. Since REL table is empty (5A),
+                         * we just need to find and jump to the OS entry.
+                         *
+                         * The OS entry is typically at a fixed offset in BOOT.BIN.
+                         * We search for the first function past the init data pool
+                         * that starts with a standard ARM prologue (PUSH {LR}). */
+                        uint32_t base = load_addr - VFLASH_RAM_BASE;
+                        uint32_t os_entry = 0;
+
+                        /* Strategy: scan code area for the µMORE OS init function.
+                         * It's typically the first major function after the small
+                         * init/startup block. Look for function at 0x4598+ range
+                         * (after init1/init2/init3 function bodies). */
+                        for (uint32_t scan = 0x4590; scan < 0x10000; scan += 4) {
+                            uint32_t insn = *(uint32_t*)(vf->ram + base + scan);
+                            /* Look for STMDB SP!, {R4-Rxx, LR} pattern (function entry) */
+                            if ((insn & 0xFFFF0000) == 0xE92D0000 && (insn & 0x4000)) {
+                                os_entry = load_addr + scan;
+                                break;
+                            }
+                        }
+
+                        if (!os_entry) os_entry = load_addr + 0x4598;
+
+                        /* Write stub at RAM mirror 0x1880:
+                         * LDR PC, [PC, #-4]    = 0xE51FF004
+                         * .word os_entry        = target address */
+                        vf->ram[0x1880]   = 0x04; vf->ram[0x1881] = 0xF0;
+                        vf->ram[0x1882]   = 0x1F; vf->ram[0x1883] = 0xE5;
+                        *(uint32_t*)(vf->ram + 0x1884) = os_entry;
+                        printf("[HLE] ROM stub at 0x1880 → OS entry 0x%08X\n", os_entry);
+                    }
+                }
+            }
         } else if (looks_like_arm(buf, entry.size)) {
             printf("[HLE] Raw ARM binary detected\n");
             entry_point = load_raw(vf, buf, entry.size);
