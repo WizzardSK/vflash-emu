@@ -305,13 +305,13 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
-        if (vf->debug)
-            fprintf(stderr, "[IO] R32 0x%08X (unmapped)\n", addr);
-        return 0xFFFFFFFF;
+        /* Silently return 0 for all unmapped I/O — many ZEVIO SoC
+         * peripherals are accessed through MMU-mapped addresses that
+         * don't correspond to our physical I/O layout. Returning 0
+         * (all interrupts clear, all status idle) is safe. */
+        return 0;
     }
 
-    if (vf->debug)
-        fprintf(stderr, "[MEM] R32 unmapped 0x%08X\n", addr);
     return 0;
 }
 
@@ -548,13 +548,10 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
             return;
         }
 
-        if (vf->debug)
-            fprintf(stderr, "[IO] W32 0x%08X = 0x%08X (unmapped)\n", addr, val);
+        /* Silently accept writes to unmapped I/O */
         return;
     }
-
-    if (vf->debug)
-        fprintf(stderr, "[MEM] W32 unmapped 0x%08X = 0x%08X\n", addr, val);
+    /* Silently ignore writes to unmapped memory */
 }
 
 
@@ -1015,6 +1012,18 @@ static int vflash_hle_boot(VFlash *vf) {
                         *(uint32_t*)(vf->ram + sp_init_off) = load_addr + 0xC4A4;
                         printf("[HLE] Set stack[SP_init] = 0x%08X (game main for R1→task PC)\n",
                                load_addr + 0xC4A4);
+
+                        /* Pre-write initial CPSR at [0x10BCA4E0] and NOP ALL
+                         * STR R0,[R2] instructions in µMORE init that would
+                         * overwrite it with a bad value. There are 6 such STRs
+                         * in the SVC/UND/ABT mode setup blocks. */
+                        *(uint32_t*)(vf->ram + 0xBCA4E0) = 0x000000D3;
+                        static const uint32_t cpsr_str_offsets[] = {
+                            0x53AC0, 0x53B0C, 0x53BA8, 0x53BF4, 0x53C54, 0x53CA0
+                        };
+                        for (int i = 0; i < 6; i++)
+                            *(uint32_t*)(vf->ram + base + cpsr_str_offsets[i]) = 0xE1A00000u;
+                        printf("[HLE] Set task CPSR=0xD3, NOP'd %d CPSR writes\n", 6);
                     }
                 }
             }
