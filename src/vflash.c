@@ -307,6 +307,16 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
+        /* System control at 0x900A0000-0x900BFFFF (off = 0x100A0000-0x100BFFFF) */
+        if (off >= 0x100A0000u && off < 0x100C0000u) {
+            uint32_t sreg = off - 0x100A0000u;
+            switch (sreg) {
+                case 0x000C: return 0x02;    /* Boot status: bit1=1 (normal boot) */
+                case 0x10014: return 0x01;   /* PLL lock: bit0=1 (locked) */
+                default:     return 0xFFFFFFFF; /* All ready/done bits set */
+            }
+        }
+
         /* UART stub: 0x5000–0x5FFF
          * Always report TX_READY so OS never gets stuck polling */
         if (off >= 0x5000 && off < 0x6000) {
