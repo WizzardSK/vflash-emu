@@ -1,0 +1,8 @@
+*.o
+vflash
+disc_analyze
+disc_compare
+mjp_extract
+ptx_extract
+testrom_gen
+testrom.bin
