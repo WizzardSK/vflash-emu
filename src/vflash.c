@@ -986,6 +986,32 @@ static int vflash_hle_boot(VFlash *vf) {
                         *(uint32_t*)(vf->ram + base + 0xF8) = os_init;
                         printf("[HLE] Patched init2 return → 0x%08X (µMORE RTOS init)\n",
                                os_init);
+
+                        /* ROM initializes [load_addr+0xC004] to non-zero
+                         * (task count). If zero, init3 skips task setup
+                         * entirely. Set to 1 for minimal task setup. */
+                        *(uint32_t*)(vf->ram + base + 0xC004) = 1;
+                        printf("[HLE] Set task count [0x%08X] = 1\n",
+                               load_addr + 0xC004);
+
+                        /* ROM also pushes task entry PC pointer on stack
+                         * before calling µMORE init. The init function
+                         * does PUSH{R0}/POP{R0,R1} reading the extra
+                         * value from stack. Write a safe pointer there.
+                         * SP at init entry = STACK_TOP = 0x11000000.
+                         * [SP-4] (below initial SP) should have task PC ptr.
+                         * We write it to RAM at SP-4. */
+                        uint32_t sp_below = VFLASH_STACK_TOP - VFLASH_RAM_BASE - 4;
+                        /* Use load_addr+0xC4A4 as a guess for game main
+                         * (first function in game-specific code area).
+                         * Store a pointer-to-pointer: write PC value at
+                         * a scratch location, then write pointer to it. */
+                        uint32_t scratch = VFLASH_STACK_TOP - VFLASH_RAM_BASE - 0x100;
+                        /* scratch = address 0x10FFFF00 in RAM */
+                        *(uint32_t*)(vf->ram + scratch)     = 0x000000D3; /* CPSR: SVC */
+                        *(uint32_t*)(vf->ram + scratch + 4) = load_addr + 0xC4A4; /* task PC */
+                        /* Push pointer-to-PC on stack (will be read as R1 by POP) */
+                        *(uint32_t*)(vf->ram + sp_below) = VFLASH_RAM_BASE + scratch + 4;
                     }
                 }
             }
