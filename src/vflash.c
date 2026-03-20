@@ -1309,17 +1309,38 @@ static void install_vector_table(VFlash *vf) {
             ram_w32(vf, base + 12, 0xEAFFFFFEu);
             ram_w32(vf, base + 16, 0xEAFFFFFEu);
         } else if (i == 5) {
-            /* IRQ: clear SP804 timer interrupt, then return.
-             * LDR R0, [PC, #+8]  → data at base+16 = 0x9001000C
+            /* IRQ handler: clear timer, call task callback, return.
+             * Uses a larger stub area (40 bytes = 10 words).
+             *
+             * STMFD SP!, {R0-R3, R12, LR}   ; save caller-saved regs
+             * LDR R0, [PC, #+0x14]           ; R0 = 0x9001000C (timer IntClr)
              * MOV R1, #1
-             * STR R1, [R0]        ; write to SP804 IntClr
-             * SUBS PC, LR, #4    ; return from IRQ
-             * .word 0x9001000C   ; SP804 timer0 IntClr address */
-            ram_w32(vf, base +  0, 0xE59F0008u);      /* LDR R0, [PC, #+8] */
-            ram_w32(vf, base +  4, 0xE3A01001u);      /* MOV R1, #1 */
-            ram_w32(vf, base +  8, 0xE5801000u);      /* STR R1, [R0] */
-            ram_w32(vf, base + 12, 0xE25EF004u);      /* SUBS PC, LR, #4 */
-            ram_w32(vf, base + 16, 0x9001000Cu);      /* data: timer IntClr addr */
+             * STR R1, [R0]                    ; clear timer IRQ
+             * LDR R0, [PC, #+0x10]           ; R0 = task callback addr
+             * CMP R0, #0
+             * BLXNE R0                        ; call callback if non-zero
+             * LDMFD SP!, {R0-R3, R12, LR}    ; restore regs
+             * SUBS PC, LR, #4                ; return from IRQ
+             * .word 0x9001000C               ; timer IntClr
+             * .word <callback>               ; task #0 callback
+             *
+             * Note: we write callback address AFTER loading BOOT.BIN
+             * in the HLE boot setup. For now, write 0 (no callback). */
+            uint32_t irq_base = HLE_STUB_BASE + 5 * 20;
+            ram_w32(vf, irq_base +  0, 0xE92D500Fu);  /* PUSH {R0-R3,R12,LR} */
+            ram_w32(vf, irq_base +  4, 0xE59F0014u);  /* LDR R0, [PC, #+0x14] → +20 */
+            ram_w32(vf, irq_base +  8, 0xE3A01001u);  /* MOV R1, #1 */
+            ram_w32(vf, irq_base + 12, 0xE5801000u);  /* STR R1, [R0] */
+            ram_w32(vf, irq_base + 16, 0xE59F0010u);  /* LDR R0, [PC, #+0x10] → +24 */
+            ram_w32(vf, irq_base + 20, 0xE3500000u);  /* CMP R0, #0 */
+            ram_w32(vf, irq_base + 24, 0x112FFF30u);  /* BLXNE R0 */
+            ram_w32(vf, irq_base + 28, 0xE8BD500Fu);  /* POP {R0-R3,R12,LR} */
+            ram_w32(vf, irq_base + 32, 0xE25EF004u);  /* SUBS PC, LR, #4 */
+            ram_w32(vf, irq_base + 36, 0x9001000Cu);  /* data: timer IntClr */
+            ram_w32(vf, irq_base + 40, 0x00000000u);  /* data: callback (patched later) */
+            printf("[HLE] IRQ handler at 0x%08X (with task callback slot at +40)\n", irq_base);
+            /* Skip the normal stub write */
+            continue;
         } else {
             /* SWI/FIQ/RESET: MOVS PC, LR (return from exception) */
             ram_w32(vf, base +  0, 0xE1B0F00Eu);      /* MOVS PC, LR */
@@ -1505,7 +1526,28 @@ static int vflash_hle_boot(VFlash *vf) {
                     for (int i = 0; i < 14; i++)
                     for (int i = 0; i < 13; i++)
                         *(uint32_t*)(vf->ram + 0x1880 + i * 4) = stub[i];
-                    printf("[HLE] Installed ROM stub at 0x1880 (PLL config + IRQ enable + WFI)\n");
+                    printf("[HLE] Installed ROM stub at 0x1880 (IRQ enable + VIC init + idle)\n");
+
+                    /* Populate µMORE task table so VIC init has something to dispatch.
+                     * Task table at 0x10B0DF00, 16 bytes per entry, up to 30 entries.
+                     * Entry: +0=IRQ_addr/mask, +4=priority, +8=callback, +C=active.
+                     * Set task #0 as timer IRQ handler (callback = VIC init addr). */
+                    {
+                        uint32_t base = load_addr - VFLASH_RAM_BASE;
+                        /* Set task count to 1 */
+                        *(uint32_t*)(vf->ram + base + 0xC004) = 1;
+
+                        /* Task #0 entry at 0x10B0DF00 */
+                        uint32_t task0 = 0xB0DF00;  /* RAM offset */
+                        *(uint32_t*)(vf->ram + task0 + 0x00) = 0x00000001; /* IRQ mask: bit 0 (timer) */
+                        *(uint32_t*)(vf->ram + task0 + 0x04) = 0;
+                        *(uint32_t*)(vf->ram + task0 + 0x08) = load_addr + 0xC4A4; /* callback = VIC init */
+                        *(uint32_t*)(vf->ram + task0 + 0x0C) = 1; /* active */
+                        printf("[HLE] Task #0: mask=0x1 callback=0x%08X\n", load_addr + 0xC4A4);
+
+                        /* IRQ callback = 0 (just clear timer, no dispatch).
+                         * Game code will be called directly from ROM stub. */
+                    }
                     /* Verify stub */
                     for (int si = 0; si < 13; si++) {
                         printf("[HLE]   [0x%04X] = 0x%08X\n", 0x1880+si*4,
