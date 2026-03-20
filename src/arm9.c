@@ -528,6 +528,27 @@ void arm9_swi(ARM9 *cpu) {
 }
 
 void arm9_undef(ARM9 *cpu) {
+    static int undef_count = 0;
+    if (undef_count < 3) {
+        uint32_t bad_pc = PC - 8;
+        uint32_t insn = cpu->mem_read32(cpu->mem_ctx, bad_pc);
+        fprintf(stderr, "[UNDEF] #%d at PC=0x%08X insn=0x%08X CPSR=0x%08X\n",
+                undef_count, bad_pc, insn, CPSR);
+    }
+    undef_count++;
+
+    /* ROM boot recovery: if UNDEF fires with BOOT.BIN pre-loaded,
+     * the ROM failed to load BOOT.BIN via ATAPI. Redirect to BOOT.BIN
+     * entry at 0x10C00010 (V.Flash BOOT format trampoline). */
+    if (undef_count == 1 && (CPSR & 0x1F) == ARM9_MODE_SVC) {
+        uint32_t boot_magic = cpu->mem_read32(cpu->mem_ctx, 0x10C00000);
+        if (boot_magic == 0x544F4F42) { /* "BOOT" in LE */
+            fprintf(stderr, "[UNDEF] ROM boot recovery: redirecting to BOOT.BIN at 0x10C00010\n");
+            PC = 0x10C00010;
+            return;
+        }
+    }
+
     save_bank(cpu,CPSR&0x1F);
     cpu->spsr_und = CPSR;
     cpu->r14_und  = PC - 4;

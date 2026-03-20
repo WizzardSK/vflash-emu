@@ -362,14 +362,22 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         /* ATAPI CD-ROM controller at 0xAA000000 (off = 0x2A000000) */
         if (off >= 0x2A000000u && off < 0x2A001000u) {
             uint32_t areg = off - 0x2A000000u;
+            uint32_t val = 0;
             switch (areg) {
-                case 0x02: return 0;     /* Sector count */
-                case 0x03: return 0;     /* LBA low */
-                case 0x05: return 0;     /* LBA mid/high */
-                case 0x07: return 0x40;  /* Status: DRDY (drive ready) */
-                case 0x17: return 0x40;  /* Alt status: DRDY */
-                default:   return 0;
+                case 0x02: val = 0; break;     /* Sector count */
+                case 0x03: val = 0; break;     /* LBA low */
+                case 0x05: val = 0; break;     /* LBA mid/high */
+                case 0x07: val = 0x40; break;  /* Status: DRDY (drive ready) */
+                case 0x17: val = 0x40; break;  /* Alt status: DRDY */
+                default:   val = 0; break;
             }
+            static int atapi_read_count = 0;
+            if (atapi_read_count < 20) {
+                printf("[ATAPI] Read reg 0x%02X = 0x%08X (PC=0x%08X)\n",
+                       areg, val, vf->cpu.r[15]);
+                atapi_read_count++;
+            }
+            return val;
         }
 
         /* DMA / CD-ROM controller at 0x8FFF0000 (off = 0x0FFF0000) */
@@ -419,7 +427,7 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             switch (sreg) {
                 case 0x00: return 0x01000010; /* Model ID */
                 case 0x04: return 0;
-                case 0x0C: return 0x00;       /* Boot status: cold boot */
+                case 0x0C: return vf->misc_regs[0x0C >> 2]; /* Boot status: 0=cold, bit1=warm */
                 case 0x28: return 0x00000000; /* ASIC ID low */
                 case 0x2C: return 0x00000000; /* ASIC ID high */
                 default:
@@ -638,10 +646,8 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
         /* ATAPI CD-ROM write at 0xAA000000 */
         if (off >= 0x2A000000u && off < 0x2A001000u) {
             uint32_t areg = off - 0x2A000000u;
-            if (areg == 0x07) {
-                /* Command register — ATAPI command issued */
-                printf("[ATAPI] Command: 0x%02X\n", val & 0xFF);
-            }
+            printf("[ATAPI] Write reg 0x%02X = 0x%08X (PC=0x%08X)\n",
+                   areg, val, vf->cpu.r[15]);
             return;
         }
 
@@ -792,6 +798,24 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                         printf("[FLASH] Patched SDRAM table: 0xFF at RAM[0x%X]\n", tbl_off);
                         printf("[FLASH] Verify: RAM[0x%X]=0x%08X\n", tbl_off,
                                *(uint32_t*)(vf->ram + tbl_off));
+                    }
+
+                    /* Pre-load BOOT.BIN into RAM so the ROM can jump to it
+                     * after calibration. On real HW, the ROM uses the ATAPI
+                     * controller to read BOOT.BIN from disc. We bypass ATAPI
+                     * by loading it now, so when ROM jumps to 0x10C00000+
+                     * the code is already in place. */
+                    if (vf->cd && vf->cd->is_open) {
+                        CDEntry boot_entry;
+                        if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &boot_entry)) {
+                            uint32_t dest = 0xC00000; /* RAM offset for 0x10C00000 */
+                            uint32_t max_sz = VFLASH_RAM_SIZE - dest;
+                            if (boot_entry.size < max_sz) max_sz = boot_entry.size;
+                            int rd = cdrom_read_file(vf->cd, &boot_entry,
+                                vf->ram + dest, 0, max_sz);
+                            printf("[ROM-PRELOAD] BOOT.BIN: %d bytes at RAM[0x%X] (0x%08X)\n",
+                                   rd, dest, VFLASH_RAM_BASE + dest);
+                        }
                     }
                 }
             }
@@ -981,6 +1005,52 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
             uint32_t sreg = off - 0x100A0000u;
             if ((sreg >> 2) < 64)
                 vf->misc_regs[sreg >> 2] = val;
+
+            /* 0x900A0008: system reset trigger.
+             * ROM callback at 0x1880 writes 1 here to reboot.
+             * Simulate warm reboot: set warm boot flag (bit1 of
+             * boot status at 0x900A000C) and restart from ROM addr 0. */
+            if (sreg == 0x08 && val == 1 && vf->has_rom) {
+                printf("[REBOOT] Warm reboot triggered (write 1 to 0x900A0008)\n");
+
+                /* Instead of full reboot + warm path (which just loops at
+                 * RAM[0xFFC8] NOP sled), we patch the warm boot entry to:
+                 * 1. Enable IRQs
+                 * 2. Set up SP804 timer for 60Hz periodic IRQ
+                 * 3. Idle loop (let timer IRQs drive scheduler)
+                 *
+                 * This simulates what µMORE's warm boot handler would do. */
+                uint32_t wb = 0xFFC8; /* RAM offset for warm boot entry */
+                /* MRS R0, CPSR */
+                *(uint32_t*)(vf->ram + wb +  0) = 0xE10F0000;
+                /* BIC R0, R0, #0xC0  (enable IRQ+FIQ) */
+                *(uint32_t*)(vf->ram + wb +  4) = 0xE3C000C0;
+                /* MSR CPSR_c, R0 */
+                *(uint32_t*)(vf->ram + wb +  8) = 0xE121F000;
+                /* WFI (MCR p15,0,R0,c7,c0,4) */
+                *(uint32_t*)(vf->ram + wb + 12) = 0xEE070F90;
+                /* B .-4 (loop back to WFI) */
+                *(uint32_t*)(vf->ram + wb + 16) = 0xEAFFFFFD;
+
+                /* Set up SP804 timer + VIC for scheduler ticks */
+                vf->timer.timer[0].load = 37500;  /* ~60Hz */
+                vf->timer.timer[0].count = 37500;
+                vf->timer.timer[0].ctrl = 0xE2;   /* enable, periodic, IntEnable */
+                vf->timer.irq.enable = (1 << IRQ_TIMER0);
+
+                /* Set warm boot flag and restart from ROM */
+                vf->misc_regs[0x0C >> 2] |= 0x02;
+                arm9_reset(&vf->cpu);
+                vf->cpu.r[15] = 0x00000000;
+                /* Set IRQ stack for warm boot */
+                vf->cpu.r13_irq = 0x10800000;
+                /* Re-enable MMU AFTER reset so IRQ vectors go through
+                 * BOOT.BIN page table (VA 0 → SDRAM with µMORE handlers) */
+                vf->cpu.cp15.ttb = 0x10C08000;
+                vf->cpu.cp15.mmu_enabled = 1;
+                vf->cpu.cp15.control = 0x0000507D;
+                printf("[REBOOT] Warm boot: MMU TTB=0x10C08000, timer on, PC=0x00\n");
+            }
             return;
         }
 
