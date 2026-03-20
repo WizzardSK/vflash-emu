@@ -1549,23 +1549,7 @@ void vflash_run_frame(VFlash *vf) {
         ztimer_tick(&vf->timer, actual);
         done += (int)actual;   /* advance by what CPU actually consumed */
 
-        /* Force-clear I bit so IRQ can be delivered.
-         * Only after init completes (~5M cycles = ~2 frames).
-         * µMORE RTOS never enables IRQ itself (ROM normally does). */
-        /* Force IRQ delivery after init settles (~500K cycles = 200ms).
-         * Also ensure IRQ mode SP is valid before first IRQ fires.
-         * ROM BL #1 normally sets IRQ SP but self-modified code skips it. */
-        if (vf->has_rom && vf->cpu.cycles > 1250000 && (vf->cpu.cpsr & 0x80)) {
-            static int irq_forced = 0;
-            if (!irq_forced) {
-                printf("[IRQ] Force-enabling IRQ at cycle %llu, PC=0x%08X, SP_irq=0x%08X\n",
-                       (unsigned long long)vf->cpu.cycles, vf->cpu.r[15], vf->cpu.r13_irq);
-                irq_forced = 1;
-            }
-            if (vf->cpu.r13_irq == 0 || vf->cpu.r13_irq > 0xF0000000u)
-                vf->cpu.r13_irq = 0x10800000;
-            vf->cpu.cpsr &= ~0x80u;
-        }
+        /* IRQ delivery handled at frame boundary, not per-slice */
 
         if (ztimer_fiq_pending(&vf->timer))
             arm9_fiq(&vf->cpu);
@@ -1579,11 +1563,19 @@ void vflash_run_frame(VFlash *vf) {
         memset(vf->framebuf, 0,
                VFLASH_SCREEN_W * VFLASH_SCREEN_H * sizeof(uint32_t));
 
-    if (vf->debug && (vf->frame_count % 300) == 0) {
-        fprintf(stderr, "[Frame %lu] fb_dirty=%d PC=0x%08X cycles=%llu\n",
-                (unsigned long)vf->frame_count, vf->vid.fb_dirty,
-                vf->cpu.r[15], (unsigned long long)vf->cpu.cycles);
-        arm9_dump_regs(vf->cpu.r, vf->cpu.cpsr);
+    /* Force ONE IRQ per frame by clearing I bit at frame boundary.
+     * This prevents IRQ nesting (stack overflow from nested IRQs).
+     * Only after init completes (~frame 1). */
+    if (vf->has_rom && vf->frame_count >= 1) {
+        if (vf->cpu.r13_irq == 0 || vf->cpu.r13_irq > 0xF0000000u)
+            vf->cpu.r13_irq = 0x10800000;
+        vf->cpu.cpsr &= ~0x80u;  /* clear I bit → one IRQ will fire */
+    }
+
+    if ((vf->frame_count % 60) == 0) {
+        printf("[Frame %lu] PC=0x%08X CPSR=0x%08X SP=0x%08X\n",
+                (unsigned long)vf->frame_count, vf->cpu.r[15],
+                vf->cpu.cpsr, vf->cpu.r[13]);
     }
 
     vf->frame_count++;
