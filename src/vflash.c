@@ -254,12 +254,27 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
             uint32_t foff = off - 0x38000000u;
             if (foff >= 0x800 && vf->flash_remap) {
-                /* Flash remap: reads from 0xB8000800+N are redirected
-                 * to RAM at remap_addr+N. Init code self-modifies RAM
-                 * so we MUST read from RAM (not ROM) to see changes. */
-                uint32_t remap_off = vf->flash_remap + (foff - 0x800);
-                if (remap_off < VFLASH_RAM_SIZE)
-                    return *(uint32_t*)(vf->ram + remap_off);
+                /* Flash remap: 0xB8000800+N reads from RAM[remap+N]
+                 * for the cold-boot copied region (0xD00 bytes from
+                 * ROM[0x800] to RAM[0x7F0]). Beyond that, reads from
+                 * original ROM. Self-modified code only exists in the
+                 * copied region; rest is untouched flash content.
+                 *
+                 * Cold boot copies ROM[0x800..0x14FF] → RAM[0x7F0..0x14EF]
+                 * remap_addr = 0x118
+                 * RAM[0x118+N] is in copied region if N < 0xD00+0x7F0-0x118 = 0xDD8
+                 * Simplified: use RAM for N < 0x1000, ROM for N >= 0x1000 */
+                uint32_t N = foff - 0x800;
+                if (N < 0x1000) {
+                    uint32_t remap_off = vf->flash_remap + N;
+                    if (remap_off < VFLASH_RAM_SIZE)
+                        return *(uint32_t*)(vf->ram + remap_off);
+                } else {
+                    /* Beyond copied region: read from original ROM */
+                    uint32_t rom_off = vf->flash_remap + N;
+                    if (rom_off < vf->rom_size)
+                        return *(uint32_t*)(vf->rom + rom_off);
+                }
                 return 0;
             }
             if (foff < vf->rom_size)
@@ -504,6 +519,19 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                                 printf("[DMA#%d] BOOT.BIN: %d bytes → RAM[0x%X]\n",
                                        dma_call, rd, dest);
                             }
+
+                            /* Force-enable timer and IRQ for µMORE scheduler.
+                             * On real HW, ROM BL #1 enables these, but with
+                             * self-modifying code the enable sequence may
+                             * not execute properly in emulation. */
+                            vf->timer.timer[0].load = 150000; /* 1ms @ 150MHz */
+                            vf->timer.timer[0].count = 150000;
+                            vf->timer.timer[0].ctrl = 0x77; /* enable+periodic+IRQ */
+                            vf->timer.irq.enable = 0xFFFFFFFF; /* all IRQs enabled */
+                            /* Force IRQ enable in CPSR — ROM BL #1 normally
+                             * does this but self-modified code may skip it */
+                            vf->cpu.cpsr &= ~0xC0u; /* clear I+F bits */
+                            printf("[DMA] Force-enabled timer0 + IRQ + CPSR\n");
                         }
                     }
                     break;
@@ -1490,6 +1518,11 @@ void vflash_run_frame(VFlash *vf) {
 
         ztimer_tick(&vf->timer, actual);
         done += (int)actual;   /* advance by what CPU actually consumed */
+
+        /* Force-clear I bit so IRQ can be delivered.
+         * µMORE RTOS never enables IRQ itself (ROM normally does). */
+        if (vf->has_rom && (vf->cpu.cpsr & 0x80))
+            vf->cpu.cpsr &= ~0x80u;
 
         if (ztimer_fiq_pending(&vf->timer))
             arm9_fiq(&vf->cpu);

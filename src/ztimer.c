@@ -26,11 +26,11 @@ void ztimer_tick(ZevioTimer *zt, uint32_t cycles) {
 
     for (int i = 0; i < 2; i++) {
         Timer *t = &zt->timer[i];
-        if (!(t->ctrl & 1)) continue;  /* Not enabled */
+        if (!(t->ctrl & 0x11)) continue;  /* Not enabled (bit0 or bit4) */
 
         if (t->count <= cycles) {
-            t->count = (t->ctrl & 2) ? t->load : 0;  /* Reload or stop */
-            if (t->ctrl & 4) {  /* IRQ enabled */
+            t->count = (t->ctrl & 0x22) ? t->load : 0;  /* Reload (bit1 or bit5) */
+            if (t->ctrl & 0x44) {  /* IRQ enabled (bit2 or bit6) */
                 t->irq_pending = 1;
                 ztimer_raise_irq(zt, IRQ_TIMER0 + i);
             }
