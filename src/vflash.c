@@ -270,8 +270,7 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                 uint32_t N = foff - 0x800;
                 uint32_t remap_off = vf->flash_remap + N;
                 if (N < 0x98) {
-                    /* Self-modified C code + scheduler → RAM
-                     * BL functions start at N=0x98 (BL #1 at 0xB80008B0) */
+                    /* Self-modified C code + data pool → RAM */
                     if (remap_off < VFLASH_RAM_SIZE)
                         return *(uint32_t*)(vf->ram + remap_off);
                 } else {
