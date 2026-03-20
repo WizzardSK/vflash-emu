@@ -1606,17 +1606,22 @@ void vflash_run_frame(VFlash *vf) {
     }
 
     if ((vf->frame_count % 10) == 0) {
-        printf("[Frame %lu] PC=0x%08X CPSR=0x%08X SP=0x%08X LR=0x%08X\n",
+        printf("[Frame %lu] PC=0x%08X CPSR=0x%08X R7=0x%08X R8=0x%08X R9=0x%08X\n",
                 (unsigned long)vf->frame_count, vf->cpu.r[15],
-                vf->cpu.cpsr, vf->cpu.r[13], vf->cpu.r[14]);
+                vf->cpu.cpsr, vf->cpu.r[7], vf->cpu.r[8], vf->cpu.r[9]);
     }
-    /* One-shot: dump IRQ handler context on frame 3 */
-    if (vf->frame_count == 3 && vf->has_rom) {
-        printf("[IRQ-TRACE] Handler call target (BL from 0x1A10):\n");
-        for (int i = 0; i < 16; i++) {
-            uint32_t off = 0xEC0 + i * 4;
-            uint32_t v = *(uint32_t*)(vf->ram + off);
-            printf("  RAM[0x%04X] = 0x%08X\n", off, v);
+    /* Fix task table pointer if it's garbage (contains ROM code instead of pointer) */
+    if (vf->frame_count == 2 && vf->has_rom) {
+        uint32_t tbl_ptr = *(uint32_t*)(vf->ram + 0xC08);
+        printf("[TASK] Table pointer at RAM[0xC08] = 0x%08X\n", tbl_ptr);
+        if (tbl_ptr < 0x10000000 || tbl_ptr > 0x10FFFFFF) {
+            /* Create dummy task table at RAM[0x7F0000] (safe area near top)
+             * with one entry that has non-zero value to match scheduler check */
+            uint32_t task_tbl = 0x7F0000;
+            for (int i = 0; i < 64; i++)
+                *(uint32_t*)(vf->ram + task_tbl + i * 4) = 0x00000001;
+            *(uint32_t*)(vf->ram + 0xC08) = 0x10000000 + task_tbl;
+            printf("[TASK] Installed dummy task table at 0x%08X\n", 0x10000000 + task_tbl);
         }
     }
 
