@@ -119,6 +119,8 @@ struct VFlash {
 
     uint8_t  *ram;
     uint8_t  *sram;    /* Internal SRAM / TCM (128KB at 0x0FFE0000) */
+    uint8_t  *rom;     /* Boot ROM (2MB, mapped at 0x00000000 and 0xB8000000) */
+    uint32_t  rom_size;
     uint32_t  input;
     uint32_t  input_prev;
     int       debug;
@@ -245,21 +247,21 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         if (off >= 0x5C000000u && off < 0x5C000200u)
             return ztimer_read(&vf->timer, off - 0x5C000000u);
 
-        /* Boot ROM / Flash controller at 0xB8000000.
-         * ROM code lives here. Flash remap register at 0xB8000800:
-         * writing to it sets a "jump vector" that reading returns,
-         * used to redirect execution from ROM to RAM after copy. */
+        /* Boot ROM at 0xB8000000 (full 2MB).
+         * Flash remap register at 0xB8000800: writing an address
+         * redirects reads from 0xB8000800+ to that RAM address. */
         if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
             uint32_t foff = off - 0x38000000u;
             if (foff >= 0x800 && vf->flash_remap) {
-                /* Flash remap active: reading from 0xB8000800+N
-                 * returns data from RAM at remap_addr+N */
+                /* Flash remap active */
                 uint32_t remap_off = vf->flash_remap + (foff - 0x800);
                 if (remap_off < VFLASH_RAM_SIZE)
                     return *(uint32_t*)(vf->ram + remap_off);
                 return 0;
             }
-            return *(uint32_t*)(vf->ram + foff);
+            if (foff < vf->rom_size)
+                return *(uint32_t*)(vf->rom + foff);
+            return 0;
         }
 
         /* CD-ROM DMA: 0x1000–0x1FFF */
@@ -1295,16 +1297,18 @@ VFlash* vflash_create(const char *disc_path) {
         }
         if (rom_fp) {
             fseek(rom_fp, 0, SEEK_END);
-            long rom_size = ftell(rom_fp);
+            long rom_sz = ftell(rom_fp);
             fseek(rom_fp, 0, SEEK_SET);
-            if (rom_size > 0 && rom_size <= VFLASH_ROM_SIZE * 4) {
-                uint8_t *rom_data = malloc((size_t)rom_size);
-                fread(rom_data, 1, (size_t)rom_size, rom_fp);
-                /* Load ROM at physical address 0 (RAM mirror area).
-                 * ARM boots from address 0, ROM lives there on real HW. */
-                memcpy(vf->ram, rom_data, (size_t)rom_size);
-                printf("[ROM] Loaded boot ROM: %ld bytes at 0x00000000\n", rom_size);
-                free(rom_data);
+            if (rom_sz > 0 && rom_sz <= 0x200000) {
+                vf->rom = malloc((size_t)rom_sz);
+                vf->rom_size = (uint32_t)rom_sz;
+                fread(vf->rom, 1, (size_t)rom_sz, rom_fp);
+                /* Map first 512KB of ROM at physical address 0 (boot mirror).
+                 * Full 2MB ROM accessible at 0xB8000000 via I/O handler.
+                 * MAME maps only 512KB at address 0 (0x00000000-0x0007FFFF). */
+                uint32_t boot_size = rom_sz < 0x80000 ? (uint32_t)rom_sz : 0x80000;
+                memcpy(vf->ram, vf->rom, boot_size);
+                printf("[ROM] Loaded boot ROM: %ld bytes (512KB at 0x0, full at 0xB8000000)\n", rom_sz);
                 vf->has_rom = 1;
             }
             fclose(rom_fp);
@@ -1355,6 +1359,7 @@ void vflash_destroy(VFlash *vf) {
     audio_destroy(vf->audio);
     free(vf->ram);
     free(vf->sram);
+    free(vf->rom);
     free(vf);
 }
 
