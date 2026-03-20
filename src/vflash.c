@@ -366,28 +366,15 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         /* ZEVIO Timer A at 0x90010000 (off = 0x10010000) */
         if (off >= 0x10010000u && off < 0x10011000u) {
             uint32_t treg = off - 0x10010000u;
-            switch (treg) {
-                case 0x14: return 60;  /* Timer load value */
-                case 0x18: /* Timer current count — decrement each read */
-                {
-                    static uint32_t tcnt = 60;
-                    if (tcnt > 0) tcnt--;
-                    else tcnt = 60;
-                    return tcnt;
-                }
-                case 0x84: /* Status: return IRQ pending flag */
-                    return vf->timer.timer[0].irq_pending ? 1 : 0;
-                default: return 0;
-            }
+            /* Return incrementing cycle-based count for ALL timer reads.
+             * µMORE polls various timer regs; returning monotonic count
+             * simulates a running timer regardless of which reg is read. */
+            return (uint32_t)(vf->cpu.cycles >> 8);
         }
 
         /* ZEVIO Timer B at 0x900C0000 (off = 0x100C0000) */
         if (off >= 0x100C0000u && off < 0x100C1000u) {
-            uint32_t treg = off - 0x100C0000u;
-            switch (treg) {
-                case 0x84: return vf->timer.timer[1].irq_pending ? 1 : 0;
-                default: return 0;
-            }
+            return (uint32_t)(vf->cpu.cycles >> 8);
         }
 
         /* System control at 0x900A0000-0x900BFFFF (off = 0x100A0000-0x100BFFFF) */
@@ -592,6 +579,7 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                             /* Don't overwrite vectors — let BL init set them.
                              * With pure ROM remap, BL #1 installs proper handlers. */
                             printf("[DMA] Using ROM-installed vectors and handlers\n");
+                            /* Mark that DMA is done — remap will be disabled at frame boundary */
                         }
                     }
                     break;
@@ -1584,6 +1572,13 @@ void vflash_run_frame(VFlash *vf) {
 
         ztimer_tick(&vf->timer, actual);
         done += (int)actual;
+
+        /* Deliver IRQ if pending, CPSR allows, and remap is off (init done) */
+        if (!vf->flash_remap && ztimer_irq_pending(&vf->timer)) {
+            if (vf->cpu.r13_irq < 0x10000000u || vf->cpu.r13_irq > 0x10FFFFFFu)
+                vf->cpu.r13_irq = 0x10800000;
+            arm9_irq(&vf->cpu);
+        }
     }
 
     ztimer_raise_irq(&vf->timer, IRQ_TIMER0);   /* vsync */
@@ -1592,8 +1587,8 @@ void vflash_run_frame(VFlash *vf) {
         memset(vf->framebuf, 0,
                VFLASH_SCREEN_W * VFLASH_SCREEN_H * sizeof(uint32_t));
 
-    vf->timer.irq.status = 0;
-    vf->timer.timer[0].irq_pending = 0;
+    /* Don't clear IRQ status — µMORE C code polls it for timer events.
+     * Timer tick naturally sets pending bits; µMORE reads and clears them. */
 
     /* Fix LR for µMORE scheduler. ROM uses LDR PC (not BL) to
      * jump to scheduler at 0xB8000820. This doesn't set LR, so
@@ -1603,9 +1598,14 @@ void vflash_run_frame(VFlash *vf) {
     /* Patch ROM[0x138] (flash remap LDR PC) to include LR setup.
      * Write BL-equivalent: MOV LR,PC then LDR PC at RAM[0x138-0x13C].
      * This only needs to happen once. */
-    /* No LR patch needed — self-modified C code handles flow */
+    /* Disable flash remap after init completes (frame 1+).
+     * On real HW, CPU runs from RAM after boot, not flash remap. */
+    if (vf->has_rom && vf->frame_count == 1 && vf->flash_remap) {
+        vf->flash_remap = 0;
+        printf("[BOOT] Flash remap disabled at frame 1\n");
+    }
 
-    if ((vf->frame_count % 60) == 0) {
+    if ((vf->frame_count % 10) == 0) {
         printf("[Frame %lu] PC=0x%08X CPSR=0x%08X SP=0x%08X LR=0x%08X\n",
                 (unsigned long)vf->frame_count, vf->cpu.r[15],
                 vf->cpu.cpsr, vf->cpu.r[13], vf->cpu.r[14]);
