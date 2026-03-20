@@ -129,6 +129,9 @@ struct VFlash {
     uint8_t   flash_buf[0x2000]; /* Flash controller write buffer (captures writes to 0xB8000800+) */
     int       flash_buf_dirty;   /* 1 if flash_buf has been written to */
     uint32_t  dma_param_a, dma_param_b, dma_param_c;
+    uint32_t  misc_regs[64];   /* Misc system control at 0x900A0000 (read/write) */
+    uint32_t  rtc_regs[16];    /* RTC scratch at 0x900900F0-0x900900FF */
+    uint32_t  pmu_regs[16];    /* PMU at 0x900B0000 */
     uint64_t  frame_count;
 
     VideoRegs vid;
@@ -270,9 +273,7 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
-        /* NOR Flash controller at 0xB8000000 (2MB).
-         * Offsets 0x000-0x7FF: controller registers + ROM data.
-         * Offsets 0x800+: flash window (buffered writes, remap to RAM). */
+        /* NOR Flash controller at 0xB8000000 (2MB). */
         if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
             uint32_t foff = off - 0x38000000u;
             if (foff < 0x800) {
@@ -293,8 +294,10 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             if (vf->flash_remap) {
                 /* After remap: read from RAM[remap+N] (buffer was flushed there) */
                 uint32_t remap_off = vf->flash_remap + boff;
-                if (remap_off + 3 < VFLASH_RAM_SIZE)
-                    return *(uint32_t*)(vf->ram + remap_off);
+                if (remap_off + 3 < VFLASH_RAM_SIZE) {
+                    uint32_t val = *(uint32_t*)(vf->ram + remap_off);
+                    return val;
+                }
                 return 0;
             }
             /* Before remap: return buffered data or ROM */
@@ -413,16 +416,21 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
-        /* Misc System Control at 0x900A0000 (off = 0x100A0000) */
-        if (off >= 0x100A0000u && off < 0x100A1000u) {
+        /* Misc System Control at 0x900A0000 (off = 0x100A0000).
+         * ROM uses 0x900A0F04 as a read/write config register. */
+        if (off >= 0x100A0000u && off < 0x100B0000u) {
             uint32_t sreg = off - 0x100A0000u;
             switch (sreg) {
-                case 0x00: return 0x01000010; /* Model ID (Nspire classic-like) */
+                case 0x00: return 0x01000010; /* Model ID */
                 case 0x04: return 0;
                 case 0x0C: return 0x00;       /* Boot status: cold boot */
                 case 0x28: return 0x00000000; /* ASIC ID low */
                 case 0x2C: return 0x00000000; /* ASIC ID high */
-                default:   return 0;
+                default:
+                    /* Read/write registers (0x900A0F04 etc.) */
+                    if ((sreg >> 2) < 64)
+                        return vf->misc_regs[sreg >> 2];
+                    return 0;
             }
         }
 
@@ -430,16 +438,18 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         if (off >= 0x100B0000u && off < 0x100B1000u) {
             uint32_t preg = off - 0x100B0000u;
             switch (preg) {
-                case 0x00: return 0x00141002; /* clocks_load */
-                case 0x04: return 0;          /* wake_mask */
-                case 0x08: return 0x2000;     /* PMU status (Nspire) */
+                case 0x00: return vf->pmu_regs[0] ? vf->pmu_regs[0] : 0x00141002;
+                case 0x04: return vf->pmu_regs[1]; /* wake_mask */
+                case 0x08: return 0x2000;     /* PMU status */
                 case 0x0C: return 0;
-                case 0x14: return 0x01;       /* PLL lock: bit0=1 */
-                case 0x18: return 0;          /* disable */
-                case 0x20: return 0;          /* disable2 */
-                case 0x24: return 0x00141002; /* current clocks */
+                case 0x14: return vf->pmu_regs[0x14>>2] | 0x01; /* PLL lock always set */
+                case 0x18: return vf->pmu_regs[0x18>>2];
+                case 0x20: return vf->pmu_regs[0x20>>2];
+                case 0x24: return vf->pmu_regs[0] ? vf->pmu_regs[0] : 0x00141002;
                 case 0x28: return 0x114;      /* ON key not pressed */
-                default:   return 0;
+                default:
+                    if ((preg >> 2) < 16) return vf->pmu_regs[preg >> 2];
+                    return 0;
             }
         }
 
@@ -495,9 +505,13 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
-        /* RTC at 0x90090000 (off = 0x10090000) */
+        /* RTC at 0x90090000 (off = 0x10090000).
+         * ROM uses 0x900900F0-0x900900FF as scratch storage (write then read back). */
         if (off >= 0x10090000u && off < 0x10091000u) {
             uint32_t rreg = off - 0x10090000u;
+            /* Scratch registers at 0xF0-0xFF used by ROM SDRAM calibration */
+            if (rreg >= 0xF0 && rreg < 0x100)
+                return vf->rtc_regs[(rreg - 0xF0) >> 2];
             switch (rreg) {
                 case 0x00:  return 0x67000000; /* RTCDR: time */
                 case 0x14:  return 0;          /* RTCRIS */
@@ -903,6 +917,53 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                         ztimer_raise_irq(&vf->timer, IRQ_AUDIO);
                     }
                     break;
+            }
+            return;
+        }
+
+        /* GPIO write at 0x90000000 — silently accept */
+        if (off >= 0x10000000u && off < 0x10001000u) return;
+
+        /* PL011 UART write at 0x90020000 */
+        if (off >= 0x10020000u && off < 0x10021000u) {
+            uint32_t ureg = off - 0x10020000u;
+            if (ureg == 0x00) {
+                /* UARTDR: TX data — print to stderr */
+                char c = (char)(val & 0xFF);
+                if (c >= 0x20 || c == '\n')
+                    fprintf(stderr, "%c", c);
+            }
+            return;
+        }
+
+        /* Watchdog write at 0x90060000 — silently accept */
+        if (off >= 0x10060000u && off < 0x10061000u) return;
+
+        /* RTC write at 0x90090000 — store scratch registers */
+        if (off >= 0x10090000u && off < 0x10091000u) {
+            uint32_t rreg = off - 0x10090000u;
+            if (rreg >= 0xF0 && rreg < 0x100)
+                vf->rtc_regs[(rreg - 0xF0) >> 2] = val;
+            return;
+        }
+
+        /* Misc System Control write at 0x900A0000 — store all writes */
+        if (off >= 0x100A0000u && off < 0x100B0000u) {
+            uint32_t sreg = off - 0x100A0000u;
+            if ((sreg >> 2) < 64)
+                vf->misc_regs[sreg >> 2] = val;
+            return;
+        }
+
+        /* PMU write at 0x900B0000 — store and handle clock changes */
+        if (off >= 0x100B0000u && off < 0x100B1000u) {
+            uint32_t preg = off - 0x100B0000u;
+            if ((preg >> 2) < 16)
+                vf->pmu_regs[preg >> 2] = val;
+            /* Writing to 0x900B000C triggers clock change (Nspire pmu_write) */
+            if (preg == 0x0C && (val & 4)) {
+                /* Clock change complete — raise power IRQ like Nspire */
+                vf->pmu_regs[0x14 >> 2] |= 1; /* Set PLL lock bit */
             }
             return;
         }
