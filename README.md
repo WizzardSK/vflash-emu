@@ -154,44 +154,71 @@ With boot ROM present, the emulator performs a real hardware boot sequence inste
 
 Without boot ROM, HLE boot is used (limited — µMORE RTOS not fully functional).
 
-### Flash controller (0xB8000000)
+### ZEVIO SoC — same as TI-Nspire!
 
-The ZEVIO SoC flash controller maps boot ROM at `0xB8000000`. A remap register at `0xB8000800` allows ROM code to redirect execution from flash to RAM after copying itself.
+The V.Flash uses the same LSI Logic ZEVIO SoC as the TI-Nspire calculator. All peripherals are standard ARM PrimeCell IP blocks, documented by the [Hackspire](https://hackspire.org/index.php/Memory-mapped_I/O_ports_on_CX) community and the [Firebird](https://github.com/nspire-emus/firebird) emulator source code.
 
-### System control (0x900A0000)
+### I/O register map
 
-| Register | Function |
-|----------|----------|
-| `0x900A000C` | Boot status (bit1: 0=cold boot, 1=warm boot) |
-| `0x900B0014` | PLL lock status (bit0: 1=locked) |
+| Address | Peripheral | Type |
+|---------|-----------|------|
+| `0x00000000` | Boot ROM (512KB mirror) | NOR flash |
+| `0x8FFF0000` | SDRAM Controller | ARM DMC-340 |
+| `0x8FFF1000` | NAND Controller | ARM PL351 |
+| `0x90000000` | GPIO | |
+| `0x90010000` | Fast Timer | ARM SP804 (22.5 MHz) |
+| `0x90020000` | UART | ARM PL011 |
+| `0x90030000` | Fastboot RAM | 4KB |
+| `0x90050000` | I2C Controller | Synopsys DW |
+| `0x90060000` | Watchdog Timer | ARM SP805 |
+| `0x90090000` | Real-Time Clock | ARM PL031 |
+| `0x900A0000` | Misc System Control | |
+| `0x900B0000` | Power Management | Clocks, PLL |
+| `0x900C0000` | First Timer | ARM SP804 (32 kHz) |
+| `0x900D0000` | Second Timer | ARM SP804 (32 kHz) |
+| `0x900E0000` | Keypad Controller | |
+| `0x90110000` | LED Control | |
+| `0xAA000000` | ATAPI CD-ROM | Sony CXD3059AR |
+| `0xB0000000` | USB OTG Controller | ChipIdea |
+| `0xB8000000` | NOR Flash Controller | DMA to RAM |
+| `0xC0000000` | LCD Controller | ARM PL111 |
+| `0xC4000000` | ADC | 4 channels |
+| `0xDC000000` | Interrupt Controller | ARM PL190 VIC |
 
-### I/O register map (discovered)
+### SP804 Timer registers
 
-| Address | Function |
-|---------|----------|
-| `0x80000000` | Primary IRQ controller (status, enable, clear) |
-| `0x80002000` | Video DMA (framebuffer, JPEG decode) |
-| `0x80003000` | Audio DMA |
-| `0x80004000` | GPIO / buttons |
-| `0x80005000` | UART (TX→stderr) |
-| `0x8FFF0000` | Flash/memory DMA controller |
-| `0x90010000` | ZEVIO Timer A (ctrl at +0x38, status at +0x84) |
-| `0x900A0000` | System control (boot status, config) |
-| `0x900B0000` | PLL controller (lock status at +0x14) |
-| `0x900C0000` | ZEVIO Timer B |
-| `0xAA000000` | ATAPI CD-ROM controller (Sony CXD3059AR) |
-| `0xB8000000` | Boot ROM / Flash controller (remap at +0x800) |
-| `0xDC000000` | Secondary IRQ controller (VIC) |
+Standard ARM dual-timer. Two timers per block at offsets +0x00 and +0x20:
+
+| Offset | Register | Description |
+|--------|----------|-------------|
+| +0x00 | Load | Count reload value |
+| +0x04 | Value | Current count (decrementing) |
+| +0x08 | Control | bit7=enable, bit6=periodic, bit5=IntEnable |
+| +0x0C | IntClr | Write to clear interrupt |
+| +0x10 | RIS | Raw interrupt status |
+| +0x14 | MIS | Masked interrupt status |
+| +0x18 | BGLoad | Background load value |
+
+### PL190 VIC registers
+
+| Offset | Register | Description |
+|--------|----------|-------------|
+| +0x000 | IRQStatus | Masked IRQ status |
+| +0x008 | RawIntr | Raw interrupt status |
+| +0x00C | IntSelect | FIQ select |
+| +0x010 | IntEnable | Set interrupt enable bits |
+| +0x014 | IntEnClr | Clear interrupt enable bits |
 
 ## Current status
 
-- **Boot ROM loads and runs** — full cold boot: system control, PLL, flash remap, BL #1-#7 init, DMA
-- **BOOT.BIN loaded from CD** — via HLE DMA into RAM at load address (0x10C00000)
-- **µMORE RTOS init runs** — mode stacks (SVC/UND/ABT/IRQ/FIQ), page table, MMU enabled
-- **Timer IRQ fires** — one per frame via force-enabled CPSR
-- **SDL window opens** — but framebuffer empty (no video DMA writes yet)
-- **Blocking issue** — IRQ handler not installed by ROM init; exception handlers at 0x1000199C are empty
+- **Boot ROM boots fully** — cold boot, PLL, flash copy, BL #1-#7 init, BOOT.BIN load
+- **SP804 timer fires** — proper ARM SP804 implementation, periodic IRQ via PL190 VIC
+- **µMORE RTOS scheduler runs** — mode stacks, MMU, context switch loop at 100% CPU
+- **IRQ enabled** — CPSR I=0 after flash remap disabled, SP stable
+- **SDL window opens** — black (no video writes yet)
+- **Blocking**: scheduler idles (R8=0, no task dispatch) — task table pointer uninitialized due to flash remap cold boot offset mismatch
 - 6 games extracted and analyzed; all share identical 48KB µMORE init code
+- LCD controller is PL111 at `0xC0000000` (not yet implemented)
 
 ## Notes
 
