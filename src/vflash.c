@@ -2522,7 +2522,10 @@ void vflash_run_frame(VFlash *vf) {
 
     ztimer_raise_irq(&vf->timer, IRQ_TIMER0);   /* vsync */
 
-    if (!vf->vid.fb_dirty)
+    /* Don't clear framebuffer every frame — keep last displayed content.
+     * On real hardware, the display controller holds the last frame.
+     * Only clear if explicitly requested or on first frame. */
+    if (vf->frame_count == 0)
         memset(vf->framebuf, 0,
                VFLASH_SCREEN_W * VFLASH_SCREEN_H * sizeof(uint32_t));
 
@@ -2579,30 +2582,27 @@ void vflash_run_frame(VFlash *vf) {
 
         if (mjp_found && mjp_entry.size > 100) {
             printf("[ROM-VIDEO] Found MJP: %s (%u bytes)\n", mjp_entry.name, mjp_entry.size);
-            /* Read enough for MIAV header + first frame */
+            /* Read first frame from MIAV container (I-frame with full JPEG tables) */
             uint32_t read_sz = mjp_entry.size < 262144 ? mjp_entry.size : 262144;
             uint8_t *mjpbuf = malloc(read_sz);
             if (mjpbuf) {
                 int rd = cdrom_read_file(vf->cd, &mjp_entry, mjpbuf, 0, read_sz);
                 if (rd > 76) {
-                    /* MIAV header: 64 bytes, then "00dc" chunk at 0x40:
-                     *   +0x00: "00dc" tag (4 bytes)
-                     *   +0x04: flags (4 bytes)
-                     *   +0x08: frame size in bytes (LE uint32)
-                     *   +0x0C: JPEG data starts here (byte-swapped) */
+                    /* MIAV header (64 bytes) + first "00dc" chunk at 0x40 */
                     uint32_t frame_sz = 0;
-                    if (rd >= 0x4C) {
+                    uint32_t data_off = 0x4C;
+                    if (rd >= 0x4C && memcmp(mjpbuf + 0x40, "00dc", 4) == 0) {
                         frame_sz = *(uint32_t*)(mjpbuf + 0x48);
-                        if (frame_sz > (uint32_t)(rd - 0x4C))
-                            frame_sz = rd - 0x4C;
+                        if (frame_sz > (uint32_t)(rd - data_off))
+                            frame_sz = rd - data_off;
                     }
                     if (frame_sz == 0)
-                        frame_sz = rd - 0x4C;
+                        frame_sz = rd - data_off;
 
                     /* Byte-swap frame data (V.Flash stores JPEG in 16-bit swapped order).
                      * The hardware JPEG encoder omits byte-stuffing (FF 00 → just FF)
                      * in entropy data, so we must re-insert it after swapping. */
-                    uint8_t *jpeg = mjpbuf + 0x4C;
+                    uint8_t *jpeg = mjpbuf + data_off;
 
                     for (uint32_t bi = 0; bi + 1 < frame_sz; bi += 2) {
                         uint8_t tmp = jpeg[bi];
