@@ -588,8 +588,10 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                                 *(uint32_t*)(vf->ram + 0x88) = 0x10001974u; /* dabt */
                                 *(uint32_t*)(vf->ram + 0x94) = 0x10001A40u; /* fiq */
 
-                                /* Install minimal IRQ handler at RAM[h] */
-                                if (*(uint32_t*)(vf->ram + h) == 0) {
+                                /* Install minimal IRQ handler at RAM[h].
+                                 * Force-overwrite even if BL init wrote something —
+                                 * the init handler depends on uninitialized data. */
+                                {
                                 *(uint32_t*)(vf->ram + h +  0) = 0xE24EE004u; /* SUB LR,LR,#4 */
                                 *(uint32_t*)(vf->ram + h +  4) = 0xE92D500Fu; /* STMFD SP!,{R0-R3,R12,LR} */
                                 *(uint32_t*)(vf->ram + h +  8) = 0xE59F0010u; /* LDR R0,[PC,#16] */
@@ -1578,6 +1580,12 @@ void vflash_run_frame(VFlash *vf) {
 
     vf->vid.fb_dirty = 0;
 
+    /* Re-enable timer at frame start (may have been disabled for IRQ delivery) */
+    if (vf->has_rom && vf->timer.timer[0].load > 0 && vf->timer.timer[0].ctrl == 0) {
+        vf->timer.timer[0].ctrl = 0x77;
+        vf->timer.timer[0].count = vf->timer.timer[0].load;
+    }
+
     int done = 0;
     while (done < TOTAL) {
         int slice = (TOTAL - done < SLICE) ? (TOTAL - done) : SLICE;
@@ -1587,14 +1595,7 @@ void vflash_run_frame(VFlash *vf) {
         uint32_t actual = (uint32_t)(vf->cpu.cycles - cyc_before);
 
         ztimer_tick(&vf->timer, actual);
-        done += (int)actual;   /* advance by what CPU actually consumed */
-
-        /* IRQ delivery handled at frame boundary, not per-slice */
-
-        if (ztimer_fiq_pending(&vf->timer))
-            arm9_fiq(&vf->cpu);
-        else if (ztimer_irq_pending(&vf->timer))
-            arm9_irq(&vf->cpu);
+        done += (int)actual;
     }
 
     ztimer_raise_irq(&vf->timer, IRQ_TIMER0);   /* vsync */
@@ -1603,14 +1604,12 @@ void vflash_run_frame(VFlash *vf) {
         memset(vf->framebuf, 0,
                VFLASH_SCREEN_W * VFLASH_SCREEN_H * sizeof(uint32_t));
 
-    /* Force ONE IRQ per frame by clearing I bit at frame boundary.
-     * This prevents IRQ nesting (stack overflow from nested IRQs).
-     * Only after init completes (~frame 1). */
-    if (vf->has_rom && vf->frame_count >= 1) {
-        if (vf->cpu.r13_irq == 0 || vf->cpu.r13_irq > 0xF0000000u)
-            vf->cpu.r13_irq = 0x10800000;
-        vf->cpu.cpsr &= ~0x80u;  /* clear I bit → one IRQ will fire */
-    }
+    /* Don't deliver ARM IRQ — µMORE handler depends on uninitialized data.
+     * Just clear pending flags. µMORE will handle scheduling through
+     * its own cooperative mechanism (context switch via CP15). */
+    vf->timer.irq.status = 0;
+    vf->timer.timer[0].irq_pending = 0;
+    vf->timer.timer[1].irq_pending = 0;
 
     if ((vf->frame_count % 60) == 0) {
         printf("[Frame %lu] PC=0x%08X CPSR=0x%08X SP=0x%08X\n",
