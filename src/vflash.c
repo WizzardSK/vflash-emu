@@ -254,13 +254,12 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
             uint32_t foff = off - 0x38000000u;
             if (foff >= 0x800 && vf->flash_remap) {
-                /* Flash remap active: redirect reads to ROM data at
-                 * the remap offset. Use ROM source (not RAM) because
-                 * BL init functions modify RAM but remap should still
-                 * return original ROM code for instruction fetch. */
+                /* Flash remap: reads from 0xB8000800+N are redirected
+                 * to RAM at remap_addr+N. Init code self-modifies RAM
+                 * so we MUST read from RAM (not ROM) to see changes. */
                 uint32_t remap_off = vf->flash_remap + (foff - 0x800);
-                if (remap_off < vf->rom_size)
-                    return *(uint32_t*)(vf->rom + remap_off);
+                if (remap_off < VFLASH_RAM_SIZE)
+                    return *(uint32_t*)(vf->ram + remap_off);
                 return 0;
             }
             if (foff < vf->rom_size)
