@@ -261,13 +261,19 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                  *
                  * Use RAM for the self-modified region (N=0x00-0x50),
                  * ROM for the rest (BL function bodies, handlers). */
-                /* Pure ROM flash remap — always read from original ROM.
-                 * Self-modified code in RAM is ignored. This ensures
-                 * all BL functions run original ROM code including
-                 * exception handler installation. */
-                uint32_t remap_off = vf->flash_remap + (foff - 0x800);
-                if (remap_off < vf->rom_size)
-                    return *(uint32_t*)(vf->rom + remap_off);
+                /* Hybrid flash remap:
+                 * N < 0x20: BL call sequence → ROM (original BL calls)
+                 * N = 0x20: Main init LDR PC → RAM (self-modified target)
+                 * N > 0x20: BL function bodies → ROM
+                 * This ensures BL functions install handlers (ROM) while
+                 * main init can continue past first run (RAM modification). */
+                uint32_t N = foff - 0x800;
+                uint32_t remap_off = vf->flash_remap + N;
+                {
+                    /* Everything else — use original ROM */
+                    if (remap_off < vf->rom_size)
+                        return *(uint32_t*)(vf->rom + remap_off);
+                }
                 return 0;
             }
             if (foff < vf->rom_size)
@@ -356,6 +362,14 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         if (off >= 0x10010000u && off < 0x10011000u) {
             uint32_t treg = off - 0x10010000u;
             switch (treg) {
+                case 0x14: return 60;  /* Timer load value */
+                case 0x18: /* Timer current count — decrement each read */
+                {
+                    static uint32_t tcnt = 60;
+                    if (tcnt > 0) tcnt--;
+                    else tcnt = 60;
+                    return tcnt;
+                }
                 case 0x84: /* Status: return IRQ pending flag */
                     return vf->timer.timer[0].irq_pending ? 1 : 0;
                 default: return 0;
@@ -1573,21 +1587,10 @@ void vflash_run_frame(VFlash *vf) {
         memset(vf->framebuf, 0,
                VFLASH_SCREEN_W * VFLASH_SCREEN_H * sizeof(uint32_t));
 
-    /* Deliver one timer IRQ per frame. With pure ROM flash remap,
-     * BL #1 properly installs µMORE IRQ handler with initialized data.
-     * Clear I bit, deliver, set SPSR I=1 to prevent re-nesting. */
-    if (vf->has_rom && vf->frame_count >= 2) {
-        /* Ensure IRQ SP is valid */
-        if (vf->cpu.r13_irq < 0x10000000u || vf->cpu.r13_irq > 0x10FFFFFFu)
-            vf->cpu.r13_irq = 0x10800000;
-        vf->cpu.cpsr &= ~0x80u;
-        if (ztimer_irq_pending(&vf->timer)) {
-            arm9_irq(&vf->cpu);
-            vf->cpu.spsr_irq |= 0x80u;
-        }
-        vf->timer.irq.status = 0;
-        vf->timer.timer[0].irq_pending = 0;
-    }
+    /* No ARM IRQ delivery — µMORE uses polling-based scheduling.
+     * Just keep timer ticking and clear pending flags. */
+    vf->timer.irq.status = 0;
+    vf->timer.timer[0].irq_pending = 0;
 
     if ((vf->frame_count % 60) == 0) {
         printf("[Frame %lu] PC=0x%08X CPSR=0x%08X SP=0x%08X LR=0x%08X\n",
