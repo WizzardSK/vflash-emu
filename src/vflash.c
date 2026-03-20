@@ -91,6 +91,62 @@ typedef struct {
     uint32_t sector_sz;
 } CDRomRegs;
 
+/* ATAPI CD-ROM controller state (at 0xAA000000)
+ * Standard ATA task file + PACKET command state machine.
+ * The ZEVIO 1020 SoC wraps this with additional registers
+ * for DMA and interrupt control at offsets 0x08+ */
+#define ATAPI_STATE_IDLE     0
+#define ATAPI_STATE_CMD      1  /* waiting for 12-byte PACKET CDB */
+#define ATAPI_STATE_DATA_IN  2  /* transferring data to host */
+#define ATAPI_STATE_DATA_OUT 3  /* transferring data from host */
+#define ATAPI_STATE_COMPLETE 4  /* command complete */
+
+/* ATA status bits */
+#define ATA_SR_BSY   0x80
+#define ATA_SR_DRDY  0x40
+#define ATA_SR_DRQ   0x08
+#define ATA_SR_ERR   0x01
+/* ATA interrupt reason (sector count register in ATAPI) */
+#define ATAPI_IR_COD  0x01  /* 1=command, 0=data */
+#define ATAPI_IR_IO   0x02  /* 1=to host, 0=from host */
+
+typedef struct {
+    /* Standard ATA task file registers */
+    uint8_t  error;       /* reg 0x01 read */
+    uint8_t  features;    /* reg 0x01 write */
+    uint8_t  sect_count;  /* reg 0x02 (ATAPI: interrupt reason) */
+    uint8_t  lba_low;     /* reg 0x03 */
+    uint8_t  byte_count_lo; /* reg 0x04 */
+    uint8_t  byte_count_hi; /* reg 0x05 */
+    uint8_t  drive_head;  /* reg 0x06 */
+    uint8_t  status;      /* reg 0x07 read */
+    uint8_t  dev_ctrl;    /* reg 0x0E write */
+
+    /* PACKET command state */
+    int      state;
+    uint8_t  packet[12];  /* 12-byte CDB */
+    int      packet_pos;  /* bytes received of CDB so far */
+
+    /* Data transfer buffer */
+    uint8_t *data_buf;
+    uint32_t data_size;   /* total bytes to transfer */
+    uint32_t data_pos;    /* current position in buffer */
+
+    /* Sense data for REQUEST SENSE */
+    uint8_t  sense_key;
+    uint8_t  asc;         /* additional sense code */
+    uint8_t  ascq;        /* additional sense code qualifier */
+
+    /* ZEVIO IDE wrapper registers (0x08-0xFF) */
+    uint32_t zevio_regs[64];
+
+    /* Reboot counter for warm boot handling */
+    int      reboot_count;
+
+    /* Logging */
+    int      log_count;
+} ATAPIState;
+
 /* Video DMA state */
 typedef struct {
     uint32_t fb_addr;
@@ -137,6 +193,7 @@ struct VFlash {
     VideoRegs vid;
     AudioRegs aud;
     CDRomRegs cdr;
+    ATAPIState atapi;
 
     /* Debugger state */
     uint32_t bp[16];   /* breakpoint addresses (0 = unused) */
@@ -166,6 +223,406 @@ static inline uint32_t phys_read32(VFlash *vf, uint32_t pa) {
     if (pa >= VFLASH_SRAM_BASE && pa + 3 < VFLASH_SRAM_BASE + VFLASH_SRAM_SIZE)
         return *(uint32_t*)(vf->sram + (pa - VFLASH_SRAM_BASE));
     return 0;
+}
+
+/* ---- ATAPI CD-ROM controller ---- */
+
+static void atapi_init(ATAPIState *a) {
+    memset(a, 0, sizeof(*a));
+    a->status = ATA_SR_DRDY;
+    a->sect_count = ATAPI_IR_COD | ATAPI_IR_IO; /* ready for command */
+    a->sense_key = 0x06; /* UNIT ATTENTION (power on) */
+    a->asc = 0x29;       /* power on reset */
+}
+
+static void atapi_set_sense(ATAPIState *a, uint8_t key, uint8_t asc, uint8_t ascq) {
+    a->sense_key = key;
+    a->asc = asc;
+    a->ascq = ascq;
+}
+
+static void atapi_complete_ok(ATAPIState *a) {
+    a->state = ATAPI_STATE_IDLE;
+    a->status = ATA_SR_DRDY;
+    a->sect_count = ATAPI_IR_COD | ATAPI_IR_IO; /* command complete, to host */
+    a->error = 0;
+    atapi_set_sense(a, 0, 0, 0); /* no error */
+}
+
+static void atapi_complete_err(ATAPIState *a, uint8_t key, uint8_t asc, uint8_t ascq) {
+    a->state = ATAPI_STATE_IDLE;
+    a->status = ATA_SR_DRDY | ATA_SR_ERR;
+    a->sect_count = ATAPI_IR_COD | ATAPI_IR_IO;
+    a->error = (key << 4); /* sense key in error register bits 7:4 */
+    atapi_set_sense(a, key, asc, ascq);
+}
+
+static void atapi_start_data_in(ATAPIState *a, uint8_t *buf, uint32_t size) {
+    a->data_buf = buf;
+    a->data_size = size;
+    a->data_pos = 0;
+    a->state = ATAPI_STATE_DATA_IN;
+    a->status = ATA_SR_DRDY | ATA_SR_DRQ;
+    a->sect_count = ATAPI_IR_IO; /* data to host, not command */
+    a->byte_count_lo = size & 0xFF;
+    a->byte_count_hi = (size >> 8) & 0xFF;
+}
+
+/* Process a 12-byte ATAPI PACKET command */
+static void atapi_exec_packet(VFlash *vf) {
+    ATAPIState *a = &vf->atapi;
+    uint8_t *cdb = a->packet;
+    uint8_t opcode = cdb[0];
+
+    if (a->log_count < 200)
+        printf("[ATAPI] PACKET cmd: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+               cdb[0],cdb[1],cdb[2],cdb[3],cdb[4],cdb[5],
+               cdb[6],cdb[7],cdb[8],cdb[9],cdb[10],cdb[11]);
+
+    /* Free previous data buffer */
+    if (a->data_buf) { free(a->data_buf); a->data_buf = NULL; }
+    a->data_size = 0;
+    a->data_pos = 0;
+
+    switch (opcode) {
+        case 0x00: /* TEST UNIT READY */
+            if (vf->cd && vf->cd->is_open)
+                atapi_complete_ok(a);
+            else
+                atapi_complete_err(a, 0x02, 0x3A, 0x00); /* NOT READY, medium not present */
+            break;
+
+        case 0x03: { /* REQUEST SENSE */
+            uint8_t alloc = cdb[4] ? cdb[4] : 18;
+            uint8_t *buf = calloc(1, alloc);
+            buf[0] = 0x70;           /* current errors, fixed format */
+            buf[2] = a->sense_key;
+            buf[7] = 10;             /* additional sense length */
+            buf[12] = a->asc;
+            buf[13] = a->ascq;
+            atapi_start_data_in(a, buf, alloc);
+            break;
+        }
+
+        case 0x12: { /* INQUIRY */
+            uint16_t alloc = (cdb[3] << 8) | cdb[4];
+            if (alloc == 0) alloc = 36;
+            if (alloc > 96) alloc = 96;
+            uint8_t *buf = calloc(1, alloc);
+            buf[0] = 0x05;  /* peripheral type: CD-ROM */
+            buf[1] = 0x80;  /* removable */
+            buf[2] = 0x00;  /* ATAPI version */
+            buf[3] = 0x21;  /* response format = 2, HiSup */
+            buf[4] = 31;    /* additional length */
+            /* Vendor (8 bytes) */
+            memcpy(buf + 8,  "VTECH   ", 8);
+            /* Product (16 bytes) */
+            memcpy(buf + 16, "V.Flash CD-ROM  ", 16);
+            /* Revision (4 bytes) */
+            memcpy(buf + 32, "1.00", 4);
+            atapi_start_data_in(a, buf, alloc);
+            break;
+        }
+
+        case 0x1A: { /* MODE SENSE(6) */
+            uint8_t alloc = cdb[4] ? cdb[4] : 4;
+            uint8_t *buf = calloc(1, alloc);
+            buf[0] = alloc - 1; /* mode data length */
+            buf[1] = 0x05;     /* medium type: CD-ROM */
+            atapi_start_data_in(a, buf, alloc);
+            break;
+        }
+
+        case 0x1E: /* PREVENT/ALLOW MEDIUM REMOVAL */
+            atapi_complete_ok(a);
+            break;
+
+        case 0x25: { /* READ CAPACITY */
+            if (!vf->cd || !vf->cd->is_open) {
+                atapi_complete_err(a, 0x02, 0x3A, 0x00);
+                break;
+            }
+            uint8_t *buf = calloc(1, 8);
+            uint32_t last_lba = vf->cd->sector_count - 1;
+            buf[0] = (last_lba >> 24) & 0xFF;
+            buf[1] = (last_lba >> 16) & 0xFF;
+            buf[2] = (last_lba >> 8) & 0xFF;
+            buf[3] = last_lba & 0xFF;
+            buf[4] = 0; buf[5] = 0; buf[6] = 0x08; buf[7] = 0x00; /* 2048 bytes */
+            atapi_start_data_in(a, buf, 8);
+            break;
+        }
+
+        case 0x28: { /* READ(10) */
+            if (!vf->cd || !vf->cd->is_open) {
+                atapi_complete_err(a, 0x02, 0x3A, 0x00);
+                break;
+            }
+            uint32_t lba = ((uint32_t)cdb[2] << 24) | ((uint32_t)cdb[3] << 16) |
+                           ((uint32_t)cdb[4] << 8)  | cdb[5];
+            uint16_t count = ((uint16_t)cdb[7] << 8) | cdb[8];
+            if (count == 0) { atapi_complete_ok(a); break; }
+            uint32_t total = (uint32_t)count * 2048;
+            uint8_t *buf = malloc(total);
+            if (!buf) { atapi_complete_err(a, 0x04, 0x00, 0x00); break; }
+            for (uint16_t i = 0; i < count; i++) {
+                if (!cdrom_read_sector(vf->cd, lba + i, buf + i * 2048)) {
+                    free(buf);
+                    atapi_complete_err(a, 0x03, 0x11, 0x00); /* medium error */
+                    return;
+                }
+            }
+            if (a->log_count < 200)
+                printf("[ATAPI] READ(10): LBA=%u count=%u (%u bytes)\n", lba, count, total);
+            atapi_start_data_in(a, buf, total);
+            break;
+        }
+
+        case 0x43: { /* READ TOC */
+            uint16_t alloc = ((uint16_t)cdb[7] << 8) | cdb[8];
+            uint8_t format = cdb[2] & 0x0F;
+            if (alloc == 0) alloc = 12;
+            if (alloc > 804) alloc = 804;
+            uint8_t *buf = calloc(1, alloc);
+            if (format == 0) {
+                /* Format 0: TOC — single data track */
+                uint32_t last_lba = vf->cd ? vf->cd->sector_count : 0;
+                int len = 10; /* 2 header + 8 per track descriptor (1 track + lead-out) */
+                if (alloc >= 4) {
+                    buf[0] = 0; buf[1] = len; /* TOC data length */
+                    buf[2] = 1; buf[3] = 1;   /* first/last track */
+                }
+                if (alloc >= 12) {
+                    /* Track 1 descriptor */
+                    buf[4] = 0; buf[5] = 0x14; /* ADR=1, control=data */
+                    buf[6] = 1;  /* track number */
+                    buf[7] = 0;
+                    buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = 0; /* LBA 0 */
+                }
+                if (alloc >= 20) {
+                    len = 18;
+                    buf[0] = 0; buf[1] = len;
+                    /* Lead-out (track 0xAA) */
+                    buf[12] = 0; buf[13] = 0x14;
+                    buf[14] = 0xAA; buf[15] = 0;
+                    buf[16] = (last_lba >> 24) & 0xFF;
+                    buf[17] = (last_lba >> 16) & 0xFF;
+                    buf[18] = (last_lba >> 8) & 0xFF;
+                    buf[19] = last_lba & 0xFF;
+                }
+            }
+            atapi_start_data_in(a, buf, alloc);
+            break;
+        }
+
+        case 0x46: /* GET CONFIGURATION */
+        case 0x4A: /* GET EVENT STATUS NOTIFICATION */
+        case 0x51: /* READ DISC INFORMATION */
+        case 0x5A: { /* MODE SENSE(10) */
+            uint16_t alloc = ((uint16_t)cdb[7] << 8) | cdb[8];
+            if (alloc == 0) alloc = 8;
+            uint8_t *buf = calloc(1, alloc);
+            buf[0] = 0; buf[1] = 6; /* mode data length */
+            atapi_start_data_in(a, buf, alloc < 8 ? alloc : 8);
+            break;
+        }
+
+        case 0xBE: { /* READ CD */
+            if (!vf->cd || !vf->cd->is_open) {
+                atapi_complete_err(a, 0x02, 0x3A, 0x00);
+                break;
+            }
+            uint32_t lba = ((uint32_t)cdb[2] << 24) | ((uint32_t)cdb[3] << 16) |
+                           ((uint32_t)cdb[4] << 8)  | cdb[5];
+            uint32_t count = ((uint32_t)cdb[6] << 16) | ((uint32_t)cdb[7] << 8) | cdb[8];
+            if (count == 0) { atapi_complete_ok(a); break; }
+            uint32_t total = count * 2048;
+            uint8_t *buf = malloc(total);
+            if (!buf) { atapi_complete_err(a, 0x04, 0x00, 0x00); break; }
+            for (uint32_t i = 0; i < count; i++) {
+                if (!cdrom_read_sector(vf->cd, lba + i, buf + i * 2048)) {
+                    free(buf);
+                    atapi_complete_err(a, 0x03, 0x11, 0x00);
+                    return;
+                }
+            }
+            atapi_start_data_in(a, buf, total);
+            break;
+        }
+
+        default:
+            printf("[ATAPI] Unknown PACKET opcode: 0x%02X\n", opcode);
+            atapi_complete_err(a, 0x05, 0x20, 0x00); /* ILLEGAL REQUEST, invalid opcode */
+            break;
+    }
+}
+
+/* Write to ATAPI command register (reg 0x07) */
+static void atapi_write_command(VFlash *vf, uint8_t cmd) {
+    ATAPIState *a = &vf->atapi;
+
+    switch (cmd) {
+        case 0x08: /* DEVICE RESET */
+            atapi_init(a);
+            printf("[ATAPI] Device reset\n");
+            break;
+
+        case 0xA0: /* PACKET */
+            a->state = ATAPI_STATE_CMD;
+            a->packet_pos = 0;
+            a->status = ATA_SR_DRDY | ATA_SR_DRQ;
+            a->sect_count = ATAPI_IR_COD; /* command phase, from host */
+            if (a->log_count < 200)
+                printf("[ATAPI] PACKET command started\n");
+            break;
+
+        case 0xA1: { /* IDENTIFY PACKET DEVICE */
+            uint8_t *buf = calloc(1, 512);
+            /* Word 0: general config — ATAPI CD-ROM, 12-byte packets */
+            buf[0] = 0x80; buf[1] = 0x85; /* 0x8580: removable, ATAPI, 12-byte cmd */
+            /* Words 27-46: model string (40 ASCII chars, swapped pairs) */
+            const char *model = "V.Flash CD-ROM                          ";
+            for (int i = 0; i < 40; i += 2) {
+                buf[54 + i]     = model[i + 1];
+                buf[54 + i + 1] = model[i];
+            }
+            /* Word 49: capabilities — LBA, DMA */
+            buf[98] = 0x00; buf[99] = 0x03;
+            /* Word 53: validity */
+            buf[106] = 0x06; buf[107] = 0x00;
+            /* Word 63: multiword DMA */
+            buf[126] = 0x07; buf[127] = 0x00;
+            atapi_start_data_in(a, buf, 512);
+            printf("[ATAPI] IDENTIFY PACKET DEVICE\n");
+            break;
+        }
+
+        case 0xEC: /* IDENTIFY DEVICE — not valid for ATAPI, return error */
+            a->status = ATA_SR_DRDY | ATA_SR_ERR;
+            a->error = 0x04; /* ABRT */
+            a->sect_count = ATAPI_IR_COD | ATAPI_IR_IO;
+            /* Set signature for ATAPI device */
+            a->lba_low = 0x01;
+            a->byte_count_lo = 0x14;
+            a->byte_count_hi = 0xEB;
+            break;
+
+        default:
+            printf("[ATAPI] Unknown ATA command: 0x%02X\n", cmd);
+            a->status = ATA_SR_DRDY | ATA_SR_ERR;
+            a->error = 0x04; /* ABRT */
+            break;
+    }
+}
+
+/* Read 16-bit word from ATAPI data port */
+static uint16_t atapi_read_data16(ATAPIState *a) {
+    if (a->state != ATAPI_STATE_DATA_IN || !a->data_buf)
+        return 0;
+    uint16_t val = 0;
+    if (a->data_pos < a->data_size)
+        val = a->data_buf[a->data_pos++];
+    if (a->data_pos < a->data_size)
+        val |= (uint16_t)a->data_buf[a->data_pos++] << 8;
+    if (a->data_pos >= a->data_size) {
+        free(a->data_buf);
+        a->data_buf = NULL;
+        atapi_complete_ok(a);
+    }
+    return val;
+}
+
+/* Read 32-bit word from ATAPI data port */
+static uint32_t atapi_read_data32(ATAPIState *a) {
+    uint16_t lo = atapi_read_data16(a);
+    uint16_t hi = atapi_read_data16(a);
+    return ((uint32_t)hi << 16) | lo;
+}
+
+/* Write 16-bit word to ATAPI data port (for PACKET CDB) */
+static void atapi_write_data16(VFlash *vf, uint16_t val) {
+    ATAPIState *a = &vf->atapi;
+    if (a->state == ATAPI_STATE_CMD) {
+        /* Receiving 12-byte PACKET CDB, 2 bytes at a time */
+        if (a->packet_pos < 12)
+            a->packet[a->packet_pos++] = val & 0xFF;
+        if (a->packet_pos < 12)
+            a->packet[a->packet_pos++] = (val >> 8) & 0xFF;
+        if (a->packet_pos >= 12) {
+            a->status = ATA_SR_BSY;
+            atapi_exec_packet(vf);
+            a->log_count++;
+        }
+    }
+}
+
+/* Write 32-bit word to ATAPI data port */
+static void atapi_write_data32(VFlash *vf, uint32_t val) {
+    atapi_write_data16(vf, val & 0xFFFF);
+    atapi_write_data16(vf, (val >> 16) & 0xFFFF);
+}
+
+/* Read ATAPI register */
+static uint32_t atapi_read_reg(VFlash *vf, uint32_t reg) {
+    ATAPIState *a = &vf->atapi;
+    uint32_t val = 0;
+
+    switch (reg) {
+        case 0x00: val = atapi_read_data16(a); break;
+        case 0x01: val = a->error; break;
+        case 0x02: val = a->sect_count; break;
+        case 0x03: val = a->lba_low; break;
+        case 0x04: val = a->byte_count_lo; break;
+        case 0x05: val = a->byte_count_hi; break;
+        case 0x06: val = a->drive_head; break;
+        case 0x07: val = a->status; break;
+        case 0x0E: /* alt status (no side effects) */
+        case 0x17:
+        case 0x27:
+            val = a->status; break;
+        case 0x10: val = atapi_read_data16(a); break; /* 16-bit data */
+        case 0x14: val = atapi_read_data32(a); break; /* 32-bit data */
+        default:
+            /* ZEVIO wrapper registers */
+            if (reg < 256)
+                val = a->zevio_regs[reg >> 2];
+            break;
+    }
+
+    if (a->log_count < 200 && reg != 0x07 && reg != 0x0E && reg != 0x17 && reg != 0x27)
+        printf("[ATAPI] Read reg 0x%02X = 0x%08X (PC=0x%08X)\n",
+               reg, val, vf->cpu.r[15]);
+    return val;
+}
+
+/* Write ATAPI register */
+static void atapi_write_reg(VFlash *vf, uint32_t reg, uint32_t val) {
+    ATAPIState *a = &vf->atapi;
+
+    if (a->log_count < 200)
+        printf("[ATAPI] Write reg 0x%02X = 0x%08X (PC=0x%08X)\n",
+               reg, val, vf->cpu.r[15]);
+
+    switch (reg) {
+        case 0x00: atapi_write_data16(vf, val & 0xFFFF); break;
+        case 0x01: a->features = val; break;
+        case 0x02: a->sect_count = val; break;
+        case 0x03: a->lba_low = val; break;
+        case 0x04: a->byte_count_lo = val; break;
+        case 0x05: a->byte_count_hi = val; break;
+        case 0x06: a->drive_head = val; break;
+        case 0x07: atapi_write_command(vf, val); break;
+        case 0x0E: a->dev_ctrl = val;
+                   if (val & 0x04) atapi_init(a); /* SRST */
+                   break;
+        case 0x10: atapi_write_data16(vf, val & 0xFFFF); break;
+        case 0x14: atapi_write_data32(vf, val); break;
+        default:
+            /* ZEVIO wrapper registers */
+            if (reg < 256)
+                a->zevio_regs[reg >> 2] = val;
+            break;
+    }
 }
 
 /* MMU virtual→physical address translation (ARM926EJ-S two-level page table)
@@ -362,22 +819,7 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         /* ATAPI CD-ROM controller at 0xAA000000 (off = 0x2A000000) */
         if (off >= 0x2A000000u && off < 0x2A001000u) {
             uint32_t areg = off - 0x2A000000u;
-            uint32_t val = 0;
-            switch (areg) {
-                case 0x02: val = 0; break;     /* Sector count */
-                case 0x03: val = 0; break;     /* LBA low */
-                case 0x05: val = 0; break;     /* LBA mid/high */
-                case 0x07: val = 0x40; break;  /* Status: DRDY (drive ready) */
-                case 0x17: val = 0x40; break;  /* Alt status: DRDY */
-                default:   val = 0; break;
-            }
-            static int atapi_read_count = 0;
-            if (atapi_read_count < 500) {
-                printf("[ATAPI] Read reg 0x%02X = 0x%08X (PC=0x%08X)\n",
-                       areg, val, vf->cpu.r[15]);
-                atapi_read_count++;
-            }
-            return val;
+            return atapi_read_reg(vf, areg);
         }
 
         /* DMA / CD-ROM controller at 0x8FFF0000 (off = 0x0FFF0000) */
@@ -646,8 +1088,7 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
         /* ATAPI CD-ROM write at 0xAA000000 */
         if (off >= 0x2A000000u && off < 0x2A001000u) {
             uint32_t areg = off - 0x2A000000u;
-            printf("[ATAPI] Write reg 0x%02X = 0x%08X (PC=0x%08X)\n",
-                   areg, val, vf->cpu.r[15]);
+            atapi_write_reg(vf, areg, val);
             return;
         }
 
@@ -1011,113 +1452,81 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
              * Simulate warm reboot: set warm boot flag (bit1 of
              * boot status at 0x900A000C) and restart from ROM addr 0. */
             if (sreg == 0x08 && val == 1 && vf->has_rom) {
-                printf("[REBOOT] Warm reboot triggered (write 1 to 0x900A0008)\n");
+                vf->atapi.reboot_count++;
+                printf("[REBOOT] Warm reboot #%d triggered (write 1 to 0x900A0008)\n",
+                       vf->atapi.reboot_count);
 
-                /* Instead of full reboot + warm path (which just loops at
-                 * RAM[0xFFC8] NOP sled), we patch the warm boot entry to:
-                 * 1. Enable IRQs
-                 * 2. Set up SP804 timer for 60Hz periodic IRQ
-                 * 3. Idle loop (let timer IRQs drive scheduler)
-                 *
-                 * This simulates what µMORE's warm boot handler would do. */
-                /* Patch warm boot entry at RAM[0xFFC8] to re-run BOOT.BIN.
-                 * On the second run, init functions will detect the already-
-                 * initialized µMORE state. We also patch BOOT[0x20] (ROM
-                 * callback address) to point to our scheduler start stub
-                 * instead of 0x1880, so the code won't reboot again. */
+                /* Log what BOOT.BIN init wrote to key RAM locations */
+                printf("[REBOOT] RAM[0xFFC8] = 0x%08X 0x%08X 0x%08X 0x%08X\n",
+                       *(uint32_t*)(vf->ram + 0xFFC8),
+                       *(uint32_t*)(vf->ram + 0xFFCC),
+                       *(uint32_t*)(vf->ram + 0xFFD0),
+                       *(uint32_t*)(vf->ram + 0xFFD4));
+                printf("[REBOOT] RAM[0xFF80] = 0x%08X 0x%08X 0x%08X 0x%08X\n",
+                       *(uint32_t*)(vf->ram + 0xFF80),
+                       *(uint32_t*)(vf->ram + 0xFF84),
+                       *(uint32_t*)(vf->ram + 0xFF88),
+                       *(uint32_t*)(vf->ram + 0xFF8C));
+                printf("[REBOOT] RAM[0xFF90] = 0x%08X 0x%08X 0x%08X 0x%08X\n",
+                       *(uint32_t*)(vf->ram + 0xFF90),
+                       *(uint32_t*)(vf->ram + 0xFF94),
+                       *(uint32_t*)(vf->ram + 0xFF98),
+                       *(uint32_t*)(vf->ram + 0xFF9C));
+                printf("[REBOOT] RAM[0xFFC0] = 0x%08X 0x%08X 0x%08X 0x%08X\n",
+                       *(uint32_t*)(vf->ram + 0xFFC0),
+                       *(uint32_t*)(vf->ram + 0xFFC4),
+                       *(uint32_t*)(vf->ram + 0xFFC8),
+                       *(uint32_t*)(vf->ram + 0xFFCC));
+                printf("[REBOOT] RAM[0xFFD0] = 0x%08X 0x%08X 0x%08X 0x%08X\n",
+                       *(uint32_t*)(vf->ram + 0xFFD0),
+                       *(uint32_t*)(vf->ram + 0xFFD4),
+                       *(uint32_t*)(vf->ram + 0xFFD8),
+                       *(uint32_t*)(vf->ram + 0xFFDC));
+                printf("[REBOOT] RAM[0xFFE0] = 0x%08X 0x%08X 0x%08X 0x%08X\n",
+                       *(uint32_t*)(vf->ram + 0xFFE0),
+                       *(uint32_t*)(vf->ram + 0xFFE4),
+                       *(uint32_t*)(vf->ram + 0xFFE8),
+                       *(uint32_t*)(vf->ram + 0xFFEC));
+                printf("[REBOOT] BOOT[0x20] callback = 0x%08X\n",
+                       *(uint32_t*)(vf->ram + 0xC00020));
 
-                /* Write scheduler stub at RAM[0xFF00].
-                 * BOOT.BIN disables MMU before calling this, so we must
-                 * re-enable it first (so IRQ vectors go through page table
-                 * to µMORE handlers). Then set up timer, VIC, enable IRQs. */
-                uint32_t ss = 0xFF00;
-                int si = 0;
-                /* Re-enable MMU: MCR p15,0,R0,C2,C0,0 (set TTB) */
-                *(uint32_t*)(vf->ram + ss + si) = 0xE59F0048; si += 4; /* LDR R0,[PC,#72] → dp[0] */
-                *(uint32_t*)(vf->ram + ss + si) = 0xEE020F10; si += 4; /* MCR p15,0,R0,C2,C0,0 */
-                /* Read CP15 C1, set MMU+cache bits, write back */
-                *(uint32_t*)(vf->ram + ss + si) = 0xEE110F10; si += 4; /* MRC p15,0,R0,C1,C0,0 */
-                *(uint32_t*)(vf->ram + ss + si) = 0xE59F1040; si += 4; /* LDR R1,[PC,#64] → dp[1] */
-                *(uint32_t*)(vf->ram + ss + si) = 0xE1800001; si += 4; /* ORR R0,R0,R1 */
-                *(uint32_t*)(vf->ram + ss + si) = 0xEE010F10; si += 4; /* MCR p15,0,R0,C1,C0,0 */
-                /* Set up SP804 timer */
-                *(uint32_t*)(vf->ram + ss + si) = 0xE59F0038; si += 4; /* LDR R0,[PC,#56] → dp[2] */
-                *(uint32_t*)(vf->ram + ss + si) = 0xE3A01C92; si += 4; /* MOV R1,#0x9200 */
-                *(uint32_t*)(vf->ram + ss + si) = 0xE381107C; si += 4; /* ORR R1,#0x7C (=0x927C=37500) */
-                *(uint32_t*)(vf->ram + ss + si) = 0xE5801000; si += 4; /* STR R1,[R0] timer load */
-                *(uint32_t*)(vf->ram + ss + si) = 0xE3A010E2; si += 4; /* MOV R1,#0xE2 timer ctrl */
-                *(uint32_t*)(vf->ram + ss + si) = 0xE5801008; si += 4; /* STR R1,[R0,#8] */
-                /* Enable VIC timer IRQ */
-                *(uint32_t*)(vf->ram + ss + si) = 0xE59F0024; si += 4; /* LDR R0,[PC,#36] → dp[3] */
-                *(uint32_t*)(vf->ram + ss + si) = 0xE3A01001; si += 4; /* MOV R1,#1 */
-                *(uint32_t*)(vf->ram + ss + si) = 0xE5801010; si += 4; /* STR R1,[R0,#0x10] */
-                /* Enable CPU IRQs */
-                *(uint32_t*)(vf->ram + ss + si) = 0xE10F0000; si += 4; /* MRS R0,CPSR */
-                *(uint32_t*)(vf->ram + ss + si) = 0xE3C000C0; si += 4; /* BIC R0,#0xC0 */
-                *(uint32_t*)(vf->ram + ss + si) = 0xE121F000; si += 4; /* MSR CPSR_c,R0 */
-                /* Idle loop */
-                *(uint32_t*)(vf->ram + ss + si) = 0xEE070F90; si += 4; /* WFI */
-                *(uint32_t*)(vf->ram + ss + si) = 0xEAFFFFFD; si += 4; /* B WFI */
-                /* Data pool (dp[0..3]) */
-                *(uint32_t*)(vf->ram + ss + si) = 0x10C08000; si += 4; /* dp[0] TTB */
-                *(uint32_t*)(vf->ram + ss + si) = 0x0000507D; si += 4; /* dp[1] CP15 C1 bits */
-                *(uint32_t*)(vf->ram + ss + si) = 0x90010000; si += 4; /* dp[2] SP804 */
-                *(uint32_t*)(vf->ram + ss + si) = 0xDC000000; si += 4; /* dp[3] VIC */
-
-                /* Patch BOOT.BIN[0x20] = callback address.
-                 * Change from 0x1880 (ROM reboot) to our scheduler stub.
-                 * BOOT entry at 0x10C0017C loads [0x10C00020] as target. */
-                uint32_t sched_va = 0x1000FF00; /* VA of scheduler stub */
-                *(uint32_t*)(vf->ram + 0xC00020) = sched_va;
-                printf("[REBOOT] Patched BOOT callback: 0x1880 → 0x%08X\n", sched_va);
-
-                /* Warm boot entry = jump to BOOT.BIN entry (second run) */
-                uint32_t wb = 0xFFC8;
-                *(uint32_t*)(vf->ram + wb + 0) = 0xE51FF004; /* LDR PC,[PC,-#4] */
-                *(uint32_t*)(vf->ram + wb + 4) = 0x10C00010; /* BOOT.BIN entry */
-
-                /* Write IRQ handler at RAM[0xFF98] — this is where the ROM's
-                 * vector table dispatches IRQs (ROM[0xD44] = 0x1000FF98).
-                 * Handler: save regs, clear timer IRQ, restore, return. */
-                {
-                    uint32_t ih = 0xFF98;
-                    int ii = 0;
-                    /* PUSH {R0-R3,R12,LR} */
-                    *(uint32_t*)(vf->ram + ih + ii) = 0xE92D500F; ii += 4;
-                    /* LDR R0, [PC, #12] → timer IntClr addr at +24
-                     * PC at +4 execute = +12, target at +24, offset=12 */
-                    *(uint32_t*)(vf->ram + ih + ii) = 0xE59F000C; ii += 4;
-                    /* MOV R1, #1 */
-                    *(uint32_t*)(vf->ram + ih + ii) = 0xE3A01001; ii += 4;
-                    /* STR R1, [R0] → clear timer IRQ */
-                    *(uint32_t*)(vf->ram + ih + ii) = 0xE5801000; ii += 4;
-                    /* POP {R0-R3,R12,LR} */
-                    *(uint32_t*)(vf->ram + ih + ii) = 0xE8BD500F; ii += 4;
-                    /* SUBS PC, LR, #4 → return from IRQ */
-                    *(uint32_t*)(vf->ram + ih + ii) = 0xE25EF004; ii += 4;
-                    /* Data: SP804 timer IntClr = 0x9001000C */
-                    *(uint32_t*)(vf->ram + ih + ii) = 0x9001000C; ii += 4;
-                    printf("[REBOOT] IRQ handler at RAM[0xFF98] (timer clear + return)\n");
+                if (vf->atapi.reboot_count > 3) {
+                    printf("[REBOOT] Too many reboots, stopping reboot loop\n");
+                    return;
                 }
 
-                /* DON'T enable timer here — it would fire during BOOT.BIN
-                 * init (second run) while MMU is off. Timer will be enabled
-                 * when the scheduler stub at 0xFF00 actually runs. */
-                vf->timer.timer[0].ctrl = 0;  /* disable timer */
-                vf->timer.irq.enable = 0;     /* disable all IRQs */
+                if (vf->atapi.reboot_count == 1) {
+                    /* First reboot: BOOT.BIN init has set up µMORE vectors and
+                     * handler addresses at RAM[0xFF80-0xFFE4].
+                     * ROM warm boot will jump to RAM[0xFFC8] (currently B .).
+                     * Patch it to enable IRQs first, so µMORE's IRQ handler
+                     * at 0x100873D0 can drive the scheduler. */
+
+                    /* Write IRQ-enable + idle stub at RAM[0xFF60] */
+                    uint32_t p = 0xFF60;
+                    *(uint32_t*)(vf->ram + p) = 0xE10F0000; p += 4; /* MRS R0, CPSR */
+                    *(uint32_t*)(vf->ram + p) = 0xE3C000C0; p += 4; /* BIC R0, #0xC0 */
+                    *(uint32_t*)(vf->ram + p) = 0xE129F000; p += 4; /* MSR CPSR_cxsf, R0 */
+                    *(uint32_t*)(vf->ram + p) = 0xEAFFFFFE; p += 4; /* B . */
+
+                    /* Patch RAM[0xFFC8]: B to our stub at 0xFF60 */
+                    int32_t boff = (int32_t)(0xFF60 - (0xFFC8 + 8)) >> 2;
+                    *(uint32_t*)(vf->ram + 0xFFC8) = 0xEA000000 | (boff & 0x00FFFFFF);
+                    printf("[REBOOT] Patched RAM[0xFFC8]: B 0x1000FF60 (IRQ enable + idle)\n");
+
+                    /* Set up SP804 timer for periodic IRQs */
+                    vf->timer.timer[0].load = 37500;
+                    vf->timer.timer[0].count = 37500;
+                    vf->timer.timer[0].ctrl = 0xE2;
+                    vf->timer.irq.enable |= 0x01;
+                    printf("[REBOOT] Timer0 configured: load=%u\n", vf->timer.timer[0].load);
+                }
 
                 /* Set warm boot flag and restart from ROM */
                 vf->misc_regs[0x0C >> 2] |= 0x02;
                 arm9_reset(&vf->cpu);
                 vf->cpu.r[15] = 0x00000000;
-                /* Set IRQ stack for warm boot */
                 vf->cpu.r13_irq = 0x10800000;
-                /* Re-enable MMU AFTER reset so IRQ vectors go through
-                 * BOOT.BIN page table (VA 0 → SDRAM with µMORE handlers) */
-                vf->cpu.cp15.ttb = 0x10C08000;
-                vf->cpu.cp15.mmu_enabled = 1;
-                vf->cpu.cp15.control = 0x0000507D;
-                printf("[REBOOT] Warm boot: MMU TTB=0x10C08000, timer on, PC=0x00\n");
             }
             return;
         }
@@ -1735,18 +2144,17 @@ static int vflash_hle_boot(VFlash *vf) {
                                         jpeg[bi+1] = tmp;
                                     }
 
-                                    /* Find JPEG SOI marker (0xFFD8) after byteswap */
-                                    int soi = -1;
+                                    /* Find JPEG SOI (FFD8) and EOI (FFD9) markers */
+                                    int soi = -1, eoi = -1;
                                     for (uint32_t bi = 0; bi + 1 < jpeg_sz; bi++) {
-                                        if (jpeg[bi] == 0xFF && jpeg[bi+1] == 0xD8) {
-                                            soi = bi;
-                                            break;
-                                        }
+                                        if (jpeg[bi] == 0xFF && jpeg[bi+1] == 0xD8 && soi < 0) soi = bi;
+                                        if (jpeg[bi] == 0xFF && jpeg[bi+1] == 0xD9 && soi >= 0) { eoi = bi; break; }
                                     }
 
                                     if (soi >= 0) {
-                                        printf("[HLE-VIDEO] JPEG SOI at offset %d, decoding...\n", soi + 76);
-                                        if (mjp_decode_frame(vf->video, jpeg + soi, jpeg_sz - soi)) {
+                                        uint32_t jsz = eoi >= 0 ? (uint32_t)(eoi + 2 - soi) : (jpeg_sz - soi);
+                                        printf("[HLE-VIDEO] JPEG SOI at offset %d size=%u, decoding...\n", soi + 76, jsz);
+                                        if (mjp_decode_frame(vf->video, jpeg + soi, jsz)) {
                                             memcpy(vf->framebuf, mjp_get_framebuf(vf->video),
                                                    VFLASH_SCREEN_W * VFLASH_SCREEN_H * 4);
                                             vf->vid.fb_dirty = 1;
@@ -2009,6 +2417,8 @@ VFlash* vflash_create(const char *disc_path) {
         arm9_reset(&vf->cpu);
     }
 
+    atapi_init(&vf->atapi);
+
     printf("[VFlash] System ready\n");
     return vf;
 }
@@ -2018,6 +2428,7 @@ void vflash_destroy(VFlash *vf) {
     cdrom_destroy(vf->cd);
     mjp_destroy(vf->video);
     audio_destroy(vf->audio);
+    free(vf->atapi.data_buf);
     free(vf->ram);
     free(vf->sram);
     free(vf->rom);
@@ -2113,12 +2524,31 @@ void vflash_run_frame(VFlash *vf) {
     if (vf->frame_count == 1 && vf->has_rom && vf->cd && vf->cd->is_open && !vf->vid.fb_dirty) {
         CDEntry mjp_entry;
         static const char *mjp_names[] = {
-            "MAIN01.MJP", "MAIN.MJP", "CUTSCENE01.MJP",
+            "EN.MJP", "MAIN01.MJP", "MAIN.MJP", "CUTSCENE01.MJP",
+            "INTRO.MJP", "MOVIE.MJP", "OPENING.MJP",
             "101KW_MOVIE.MJP", "106KW_MOVIE.MJP", NULL
         };
         int mjp_found = 0;
+        /* Try known names first, then search for any .MJP file */
         for (int mi = 0; mjp_names[mi] && !mjp_found; mi++)
             mjp_found = cdrom_find_file_any(vf->cd, mjp_names[mi], &mjp_entry);
+        if (!mjp_found) {
+            /* Scan root directory for any .MJP file */
+            CDEntry entries[64];
+            uint8_t pvd[2048];
+            if (cdrom_read_sector(vf->cd, 16, pvd)) {
+                uint32_t root_lba  = *(uint32_t*)(pvd + 156 + 2);
+                uint32_t root_size = *(uint32_t*)(pvd + 156 + 10);
+                int n = cdrom_list_dir(vf->cd, root_lba, root_size, entries, 64);
+                for (int ei = 0; ei < n && !mjp_found; ei++) {
+                    char *dot = strrchr(entries[ei].name, '.');
+                    if (dot && (strcmp(dot, ".MJP") == 0 || strcmp(dot, ".mjp") == 0)) {
+                        mjp_entry = entries[ei];
+                        mjp_found = 1;
+                    }
+                }
+            }
+        }
 
         if (mjp_found && mjp_entry.size > 100) {
             printf("[ROM-VIDEO] Found MJP: %s (%u bytes)\n", mjp_entry.name, mjp_entry.size);
@@ -2142,25 +2572,25 @@ void vflash_run_frame(VFlash *vf) {
                     if (frame_sz == 0)
                         frame_sz = rd - 0x4C;
 
+                    /* Byte-swap frame data (V.Flash stores JPEG in 16-bit swapped order) */
                     uint8_t *jpeg = mjpbuf + 0x4C;
-                    uint32_t jpeg_sz = frame_sz;
 
-                    /* Byteswap pairs (V.Flash MJP stores JPEG byte-swapped) */
-                    for (uint32_t bi = 0; bi + 1 < jpeg_sz; bi += 2) {
+                    for (uint32_t bi = 0; bi + 1 < frame_sz; bi += 2) {
                         uint8_t tmp = jpeg[bi];
                         jpeg[bi] = jpeg[bi+1];
                         jpeg[bi+1] = tmp;
                     }
 
-                    /* Find JPEG SOI marker (0xFFD8) */
+                    /* Find JPEG SOI marker (FFD8) */
                     int soi = -1;
-                    for (uint32_t bi = 0; bi + 1 < jpeg_sz; bi++) {
+                    for (uint32_t bi = 0; bi + 1 < frame_sz; bi++) {
                         if (jpeg[bi] == 0xFF && jpeg[bi+1] == 0xD8) { soi = bi; break; }
                     }
 
                     if (soi >= 0) {
-                        printf("[ROM-VIDEO] JPEG frame: offset=0x4C+%d size=%u\n", soi, jpeg_sz - soi);
-                        if (mjp_decode_frame(vf->video, jpeg + soi, jpeg_sz - soi)) {
+                        uint32_t jpeg_sz = frame_sz - soi;
+                        printf("[ROM-VIDEO] JPEG frame: SOI=%d size=%u (frame_sz=%u)\n", soi, jpeg_sz, frame_sz);
+                        if (mjp_decode_frame(vf->video, jpeg + soi, jpeg_sz)) {
                             memcpy(vf->framebuf, mjp_get_framebuf(vf->video),
                                    VFLASH_SCREEN_W * VFLASH_SCREEN_H * 4);
                             vf->vid.fb_dirty = 1;

@@ -27,15 +27,26 @@ void mjp_destroy(MJPDecoder *dec) {
     if (dec) { free(dec->framebuf); free(dec); }
 }
 
+static void mjp_output_message(j_common_ptr cinfo) {
+    (void)cinfo; /* suppress libjpeg warnings */
+}
+
 int mjp_decode_frame(MJPDecoder *dec, const uint8_t *data, uint32_t size) {
     struct jpeg_decompress_struct cinfo;
     MJPErrorMgr jerr;
+    int decoded_lines = 0;
 
     cinfo.err = jpeg_std_error(&jerr.pub);
     jerr.pub.error_exit = mjp_error_exit;
+    jerr.pub.output_message = mjp_output_message;
     if (setjmp(jerr.setjmp_buf)) {
+        /* Error during decode — return partial result if we got any lines */
         jpeg_destroy_decompress(&cinfo);
-        fprintf(stderr, "[MJP] JPEG decode error\n");
+        if (decoded_lines > 0) {
+            dec->frames_decoded++;
+            return 1; /* partial decode is OK */
+        }
+        fprintf(stderr, "[MJP] JPEG decode error (no scanlines decoded)\n");
         return 0;
     }
 
@@ -52,6 +63,7 @@ int mjp_decode_frame(MJPDecoder *dec, const uint8_t *data, uint32_t size) {
     while ((int)cinfo.output_scanline < h) {
         int y = cinfo.output_scanline;
         jpeg_read_scanlines(&cinfo, &row, 1);
+        decoded_lines++;
         if (y < dec->height) {
             for (int x = 0; x < w && x < dec->width; x++) {
                 uint8_t r = row[x*3+0];
