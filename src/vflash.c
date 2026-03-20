@@ -332,6 +332,14 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
+        /* Timer A at 0x90010000 (off = 0x10010000) */
+        if (off >= 0x10010000u && off < 0x10010100u)
+            return ztimer_read(&vf->timer, 0x100 + (off - 0x10010000u));
+
+        /* Timer B at 0x900C0000 (off = 0x100C0000) */
+        if (off >= 0x100C0000u && off < 0x100C0100u)
+            return ztimer_read(&vf->timer, 0x120 + (off - 0x100C0000u));
+
         /* System control at 0x900A0000-0x900BFFFF (off = 0x100A0000-0x100BFFFF) */
         if (off >= 0x100A0000u && off < 0x100C0000u) {
             uint32_t sreg = off - 0x100A0000u;
@@ -424,6 +432,17 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
             ztimer_write(&vf->timer, off - 0x5C000000u, val); return;
         }
 
+        /* Timer A write at 0x90010000 */
+        if (off >= 0x10010000u && off < 0x10010100u) {
+            ztimer_write(&vf->timer, 0x100 + (off - 0x10010000u), val);
+            return;
+        }
+        /* Timer B write at 0x900C0000 */
+        if (off >= 0x100C0000u && off < 0x100C0100u) {
+            ztimer_write(&vf->timer, 0x120 + (off - 0x100C0000u), val);
+            return;
+        }
+
         /* DMA controller write at 0x8FFF0000 */
         if (off >= 0x0FFF0000u && off < 0x0FFF1000u) {
             uint32_t dreg = off - 0x0FFF0000u;
@@ -431,22 +450,44 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                 case 0x00: vf->dma_param_a = val; break;
                 case 0x04: vf->dma_param_b = val; break;
                 case 0x08:
-                    /* DMA enable — trigger CD-ROM read into RAM.
-                     * ROM writes this after setting params A/B/C.
-                     * HLE: find and load BOOT.BIN from disc to 0x10010000.
-                     * This is where ROM expects the game binary. */
+                    /* DMA enable — trigger CD-ROM sector read into RAM.
+                     * Params: A = LBA start, B = sector count, C = dest/config
+                     * First call loads BOOT.BIN, subsequent calls load game data. */
                     if (val == 1 && vf->cd && vf->cd->is_open) {
-                        CDEntry entry;
-                        if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &entry)) {
-                            uint32_t dest = 0x10000;  /* RAM offset for 0x10010000 */
-                            uint32_t max_sz = VFLASH_RAM_SIZE - dest;
-                            if (entry.size < max_sz) max_sz = entry.size;
-                            uint8_t *buf = vf->ram + dest;
-                            int rd = cdrom_read_file(vf->cd, &entry, buf, 0, max_sz);
-                            printf("[DMA] Loaded BOOT.BIN: %d bytes at RAM[0x%X] (0x%08X)\n",
-                                   rd, dest, VFLASH_RAM_BASE + dest);
+                        uint32_t lba = vf->dma_param_a;
+                        uint32_t count = vf->dma_param_b;
+                        uint32_t dest_off = vf->dma_param_c;
+                        static int dma_call = 0;
+                        dma_call++;
+
+                        if (dma_call == 1) {
+                            /* First DMA: load BOOT.BIN to 0x10010000 */
+                            CDEntry entry;
+                            if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &entry)) {
+                                uint32_t dest = 0x10000;
+                                uint32_t max_sz = VFLASH_RAM_SIZE - dest;
+                                if (entry.size < max_sz) max_sz = entry.size;
+                                int rd = cdrom_read_file(vf->cd, &entry,
+                                    vf->ram + dest, 0, max_sz);
+                                printf("[DMA#%d] BOOT.BIN: %d bytes → RAM[0x%X]\n",
+                                       dma_call, rd, dest);
+                            }
                         } else {
-                            printf("[DMA] BOOT.BIN not found on disc!\n");
+                            /* Subsequent DMA: read sectors by LBA */
+                            uint32_t dest = dest_off;
+                            if (dest >= VFLASH_RAM_BASE)
+                                dest -= VFLASH_RAM_BASE;
+                            if (dest + count * 2048 <= VFLASH_RAM_SIZE) {
+                                for (uint32_t i = 0; i < count; i++) {
+                                    cdrom_read_sector(vf->cd, lba + i,
+                                        vf->ram + dest + i * 2048);
+                                }
+                                printf("[DMA#%d] LBA=%u cnt=%u → RAM[0x%X]\n",
+                                       dma_call, lba, count, dest);
+                            } else {
+                                printf("[DMA#%d] LBA=%u cnt=%u dest=0x%X (out of range)\n",
+                                       dma_call, lba, count, dest);
+                            }
                         }
                     }
                     break;
