@@ -1524,7 +1524,6 @@ static int vflash_hle_boot(VFlash *vf) {
                         vic_init,     /* +34: data: VIC init addr */
                     };
                     for (int i = 0; i < 14; i++)
-                    for (int i = 0; i < 13; i++)
                         *(uint32_t*)(vf->ram + 0x1880 + i * 4) = stub[i];
                     printf("[HLE] Installed ROM stub at 0x1880 (IRQ enable + VIC init + idle)\n");
 
@@ -1565,6 +1564,70 @@ static int vflash_hle_boot(VFlash *vf) {
                     /* Set VIC to enable timer IRQ */
                     vf->timer.irq.enable = (1 << IRQ_TIMER0);
                     printf("[HLE] VIC IRQ enable: 0x%08X\n", vf->timer.irq.enable);
+
+                    /* VIDEO TEST: Load first MJP frame from disc and display it.
+                     * This proves the video pipeline works while µMORE scheduler
+                     * is still being investigated. Searches for any .MJP file
+                     * on disc and decodes the first JPEG frame. */
+                    {
+                        CDEntry mjp_entry;
+                        static const char *mjp_names[] = {
+                            "MAIN01.MJP", "MAIN.MJP", "CUTSCENE01.MJP", NULL
+                        };
+                        int mjp_found = 0;
+                        for (int mi = 0; mjp_names[mi] && !mjp_found; mi++)
+                            mjp_found = cdrom_find_file_any(vf->cd, mjp_names[mi], &mjp_entry);
+
+                        if (mjp_found && mjp_entry.size > 100) {
+                            printf("[HLE-VIDEO] Found MJP: %s (%u bytes)\n",
+                                   mjp_entry.name, mjp_entry.size);
+                            /* Read first 256KB to get the full first JPEG frame */
+                            uint32_t read_sz = mjp_entry.size < 262144 ? mjp_entry.size : 262144;
+                            uint8_t *mjpbuf = malloc(read_sz);
+                            if (mjpbuf) {
+                                int rd = cdrom_read_file(vf->cd, &mjp_entry, mjpbuf, 0, read_sz);
+                                if (rd > 76) {
+                                    /* MJP header: skip first 76 bytes, then byteswap JPEG data.
+                                     * V.Flash MJP = MIAV container with byte-swapped JPEG frames. */
+                                    uint8_t *jpeg = mjpbuf + 76;
+                                    uint32_t jpeg_sz = rd - 76;
+
+                                    /* Byteswap pairs */
+                                    for (uint32_t bi = 0; bi + 1 < jpeg_sz; bi += 2) {
+                                        uint8_t tmp = jpeg[bi];
+                                        jpeg[bi] = jpeg[bi+1];
+                                        jpeg[bi+1] = tmp;
+                                    }
+
+                                    /* Find JPEG SOI marker (0xFFD8) after byteswap */
+                                    int soi = -1;
+                                    for (uint32_t bi = 0; bi + 1 < jpeg_sz; bi++) {
+                                        if (jpeg[bi] == 0xFF && jpeg[bi+1] == 0xD8) {
+                                            soi = bi;
+                                            break;
+                                        }
+                                    }
+
+                                    if (soi >= 0) {
+                                        printf("[HLE-VIDEO] JPEG SOI at offset %d, decoding...\n", soi + 76);
+                                        if (mjp_decode_frame(vf->video, jpeg + soi, jpeg_sz - soi)) {
+                                            memcpy(vf->framebuf, mjp_get_framebuf(vf->video),
+                                                   VFLASH_SCREEN_W * VFLASH_SCREEN_H * 4);
+                                            vf->vid.fb_dirty = 1;
+                                            printf("[HLE-VIDEO] First frame decoded and displayed!\n");
+                                        } else {
+                                            printf("[HLE-VIDEO] JPEG decode failed\n");
+                                        }
+                                    } else {
+                                        printf("[HLE-VIDEO] No JPEG SOI marker found in MJP data\n");
+                                    }
+                                }
+                                free(mjpbuf);
+                            }
+                        } else {
+                            printf("[HLE-VIDEO] No MJP file found on disc\n");
+                        }
+                    }
                 }
             }
         } else if (looks_like_arm(buf, entry.size)) {
@@ -1719,31 +1782,6 @@ static int vflash_load_rawbin(VFlash *vf, const char *path) {
         }
     }
     return 1;
-}
-
-/* Dump page table when MMU is first enabled */
-static void mmu_dump_pagetable(void *ctx, uint32_t ttb) {
-    VFlash *vf = ctx;
-    if (!vf || !vf->ram) return;
-    printf("[MMU] Page table dump (TTB=0x%08X):\n", ttb);
-    for (int i = 0; i < 4096; i++) {
-        uint32_t pa = ttb + i * 4;
-        uint32_t l1 = 0;
-        if (pa >= VFLASH_RAM_BASE && pa + 3 < VFLASH_RAM_BASE + VFLASH_RAM_SIZE)
-            l1 = *(uint32_t*)(vf->ram + (pa - VFLASH_RAM_BASE));
-        else if (!vf->has_rom && pa + 3 < VFLASH_RAM_SIZE)
-            l1 = *(uint32_t*)(vf->ram + pa);
-        else continue;
-        if (l1 == 0) continue;
-        uint32_t typ = l1 & 3;
-        if (typ == 2) {
-            printf("[MMU]   L1[0x%03X]: VA 0x%03X00000 → PA 0x%08X (section)\n",
-                   i, i, l1 & 0xFFF00000);
-        } else if (typ == 1) {
-            printf("[MMU]   L1[0x%03X]: VA 0x%03X00000 → L2 at 0x%08X (coarse)\n",
-                   i, i, l1 & 0xFFFFFC00);
-        }
-    }
 }
 
 VFlash* vflash_create(const char *disc_path) {
