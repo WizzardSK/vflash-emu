@@ -261,17 +261,13 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                  *
                  * Use RAM for the self-modified region (N=0x00-0x50),
                  * ROM for the rest (BL function bodies, handlers). */
-                uint32_t N = foff - 0x800;
-                uint32_t remap_off = vf->flash_remap + N;
-                if (N >= 0x20 && N < 0x50) {
-                    /* Self-modified main init area (after BL sequence) → RAM */
-                    if (remap_off < VFLASH_RAM_SIZE)
-                        return *(uint32_t*)(vf->ram + remap_off);
-                } else {
-                    /* BL function bodies → original ROM */
-                    if (remap_off < vf->rom_size)
-                        return *(uint32_t*)(vf->rom + remap_off);
-                }
+                /* Pure ROM flash remap — always read from original ROM.
+                 * Self-modified code in RAM is ignored. This ensures
+                 * all BL functions run original ROM code including
+                 * exception handler installation. */
+                uint32_t remap_off = vf->flash_remap + (foff - 0x800);
+                if (remap_off < vf->rom_size)
+                    return *(uint32_t*)(vf->rom + remap_off);
                 return 0;
             }
             if (foff < vf->rom_size)
@@ -1604,12 +1600,21 @@ void vflash_run_frame(VFlash *vf) {
         memset(vf->framebuf, 0,
                VFLASH_SCREEN_W * VFLASH_SCREEN_H * sizeof(uint32_t));
 
-    /* Don't deliver ARM IRQ — µMORE handler depends on uninitialized data.
-     * Just clear pending flags. µMORE will handle scheduling through
-     * its own cooperative mechanism (context switch via CP15). */
-    vf->timer.irq.status = 0;
-    vf->timer.timer[0].irq_pending = 0;
-    vf->timer.timer[1].irq_pending = 0;
+    /* Deliver one timer IRQ per frame. With pure ROM flash remap,
+     * BL #1 properly installs µMORE IRQ handler with initialized data.
+     * Clear I bit, deliver, set SPSR I=1 to prevent re-nesting. */
+    if (vf->has_rom && vf->frame_count >= 2) {
+        /* Ensure IRQ SP is valid */
+        if (vf->cpu.r13_irq < 0x10000000u || vf->cpu.r13_irq > 0x10FFFFFFu)
+            vf->cpu.r13_irq = 0x10800000;
+        vf->cpu.cpsr &= ~0x80u;
+        if (ztimer_irq_pending(&vf->timer)) {
+            arm9_irq(&vf->cpu);
+            vf->cpu.spsr_irq |= 0x80u;
+        }
+        vf->timer.irq.status = 0;
+        vf->timer.timer[0].irq_pending = 0;
+    }
 
     if ((vf->frame_count % 60) == 0) {
         printf("[Frame %lu] PC=0x%08X CPSR=0x%08X SP=0x%08X\n",
