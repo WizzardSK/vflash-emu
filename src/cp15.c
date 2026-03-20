@@ -78,6 +78,7 @@ void cp15_write(CP15 *cp, uint32_t crn, uint32_t crm, uint32_t op2, uint32_t val
                 printf("[CP15] MMU ENABLED! TTB=0x%08X HIVEC=%d\n", cp->ttb, cp->hivec);
                 printf("[CP15] Control=0x%08X DC=%d IC=%d\n",
                        cp->control, cp->dcache_enabled, cp->icache_enabled);
+                /* Page table dump removed */
             }
             break;
         }

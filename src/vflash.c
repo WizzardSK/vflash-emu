@@ -225,16 +225,16 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
 
-    /* Physical address 0 = Boot ROM (512KB, read-only NOR flash).
-     * Same model as TI-Nspire (Firebird): ROM always at physical addr 0,
-     * SDRAM always at 0x10000000. The MMU remaps virtual addr 0 → SDRAM
-     * after page table setup (like Nspire INT_MMU_Initialize).
-     * After MMU translation, addr here is PHYSICAL — if MMU mapped
-     * VA 0 to PA 0x10000000, we'll hit the SDRAM handler below. */
-    if (addr < 0x00200000u) {  /* 0-2MB: boot ROM region */
+    /* Physical address 0:
+     * With boot ROM: 512KB read-only NOR flash (always present)
+     * Without ROM (HLE): addr 0 = RAM (writable, for vector table + stubs) */
+    if (addr < 0x00200000u) {
         if (vf->has_rom && addr < vf->rom_size)
             return *(uint32_t*)(vf->rom + addr);
-        return 0;  /* unmapped ROM area */
+        /* HLE mode: addr 0 = RAM (same buffer as 0x10000000) */
+        if (!vf->has_rom && addr < VFLASH_RAM_SIZE)
+            return *(uint32_t*)(vf->ram + addr);
+        return 0;
     }
 
     /* High vector mirror at 0xFFFF0000–0xFFFFFFFF (ARM HIVEC, CR1.V=1)
@@ -545,12 +545,16 @@ static uint16_t mem_read16(void *ctx, uint32_t addr) {
     if (addr < 0x00200000u) {
         if (vf->has_rom && addr + 1 < vf->rom_size)
             return *(uint16_t*)(vf->rom + addr);
+        if (!vf->has_rom && addr + 1 < VFLASH_RAM_SIZE)
+            return *(uint16_t*)(vf->ram + addr);
         return 0;
     }
     if (addr >= 0xFFFF0000u) {
         uint32_t off = addr - 0xFFFF0000u;
         if (vf->has_rom && off + 1 < vf->rom_size)
             return *(uint16_t*)(vf->rom + off);
+        if (!vf->has_rom && off + 1 < VFLASH_RAM_SIZE)
+            return *(uint16_t*)(vf->ram + off);
         return 0;
     }
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE)
@@ -568,12 +572,16 @@ static uint8_t mem_read8(void *ctx, uint32_t addr) {
     if (addr < 0x00200000u) {
         if (vf->has_rom && addr < vf->rom_size)
             return vf->rom[addr];
+        if (!vf->has_rom && addr < VFLASH_RAM_SIZE)
+            return vf->ram[addr];
         return 0;
     }
     if (addr >= 0xFFFF0000u) {
         uint32_t off = addr - 0xFFFF0000u;
         if (vf->has_rom && off < vf->rom_size)
             return vf->rom[off];
+        if (!vf->has_rom && off < VFLASH_RAM_SIZE)
+            return vf->ram[off];
         return 0;
     }
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE)
@@ -589,10 +597,16 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
 
-    /* Physical addr 0-2MB = Boot ROM (read-only, writes silently ignored).
-     * On real HW, NOR flash ignores writes without a special command sequence. */
+    /* Physical addr 0-2MB:
+     * With ROM: read-only, writes ignored.
+     * HLE mode (no ROM): writable RAM for vector table and ROM stubs. */
     if (addr < 0x00200000u) {
-        return;  /* ROM is read-only */
+        if (vf->has_rom) return;  /* ROM is read-only */
+        if (addr < VFLASH_RAM_SIZE) {
+            *(uint32_t*)(vf->ram + addr) = val;
+            return;
+        }
+        return;
     }
 
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
@@ -1015,7 +1029,11 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
 static void mem_write16(void *ctx, uint32_t addr, uint16_t val) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
-    if (addr < 0x00200000u) return;  /* ROM read-only */
+    if (addr < 0x00200000u) {
+        if (vf->has_rom) return;
+        if (addr + 1 < VFLASH_RAM_SIZE) *(uint16_t*)(vf->ram + addr) = val;
+        return;
+    }
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
         *(uint16_t*)(vf->ram + (addr - VFLASH_RAM_BASE)) = val;
         return;
@@ -1037,7 +1055,11 @@ static void mem_write16(void *ctx, uint32_t addr, uint16_t val) {
 static void mem_write8(void *ctx, uint32_t addr, uint8_t val) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
-    if (addr < 0x00200000u) return;  /* ROM read-only */
+    if (addr < 0x00200000u) {
+        if (vf->has_rom) return;
+        if (addr < VFLASH_RAM_SIZE) vf->ram[addr] = val;
+        return;
+    }
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
         vf->ram[addr - VFLASH_RAM_BASE] = val;
         return;
@@ -1395,117 +1417,58 @@ static int vflash_hle_boot(VFlash *vf) {
                 uint32_t load_addr = *(uint32_t*)(buf + 8);
                 if (load_addr >= VFLASH_RAM_BASE &&
                     load_addr + 0x184 < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
-                    uint32_t off_180 = load_addr - VFLASH_RAM_BASE + 0x180;
-                    uint32_t insn_at_180 = *(uint32_t*)(vf->ram + off_180);
-                    /* Verify it's LDR PC,[R0] = 0xE590F000 */
-                    if (insn_at_180 == 0xE590F000u) {
-                        /* Install HLE ROM stub at 0x1880 in RAM mirror.
-                         * The BOOT init code jumps here via LDR PC,[R0].
-                         *
-                         * ROM REL function would: process relocations (empty
-                         * in tested games), enable IRQs, then return to caller
-                         * (0x10C00184). The caller writes "boot complete" to a
-                         * system register and enters WFI loop. Timer IRQ fires
-                         * and the OS ISR takes over.
-                         *
-                         * Our stub:
-                         *   MRS  R0, CPSR           ; read CPSR
-                         *   BIC  R0, R0, #0xC0      ; clear I+F bits (enable IRQs)
-                         *   MSR  CPSR_c, R0         ; write back
-                         *   LDR  PC, [PC, #-4]      ; jump to return address
-                         *   .word <return_addr>      ; = load_addr + 0x184
-                         */
-                        /* ROM REL function normally processes relocations
-                         * and jumps to OS entry. For now, return to caller
-                         * (0x184 = error path with write to 0x900A0008).
-                         * We also map 0x900A0008 to a harmless I/O register
-                         * so the write succeeds, and NOP the infinite loop. */
-                        uint32_t base = load_addr - VFLASH_RAM_BASE;
 
-                        /* Skip the entire REL block by patching init2's
-                         * return address in the data pool. Init2 returns
-                         * to [load_addr+0xF8] which is normally 0x150
-                         * (the BL disable_caches + REL check). We redirect
-                         * it to the µMORE RTOS init function instead.
-                         *
-                         * The RTOS init at load_addr+0x53AA0 sets up ARM
-                         * mode stacks and starts the scheduler. */
-                        uint32_t os_init = load_addr + 0x53AA0;
-                        *(uint32_t*)(vf->ram + base + 0xF8) = os_init;
-                        printf("[HLE] Patched init2 return → 0x%08X (µMORE RTOS init)\n",
-                               os_init);
+                    /* Install ROM REL function stub at address 0x1880.
+                     * All 6 tested games have [BOOT+0x20] = 0x1880 as the ROM callback.
+                     * The real ROM function at 0x1880:
+                     *   1. Writes PLL/SDRAM config to I/O registers
+                     *   2. Writes 1 to 0x900A0008 (system reset → warm reboot)
+                     *   3. Infinite loop (never returns)
+                     *
+                     * In HLE mode, addr 0 is RAM. Our stub does the I/O config
+                     * writes, then instead of rebooting, enables IRQs and enters
+                     * WFI loop. BOOT.BIN's three init functions (0x10C04368,
+                     * 0x10C044A0, 0x10C043A0) already set up µMORE state before
+                     * calling 0x1880, so the timer IRQ should wake the scheduler.
+                     *
+                     * Stub at 0x1880:
+                     *   LDR  R4, =0x900B0000    ; PMU clocks
+                     *   MOV  R5, #3
+                     *   STR  R5, [R4]            ; write clock config
+                     *   MRS  R0, CPSR
+                     *   BIC  R0, R0, #0xC0       ; enable IRQ+FIQ
+                     *   MSR  CPSR_c, R0
+                     * .loop:
+                     *   MCR  p15, 0, R0, c7, c0, 4  ; WFI (wait for interrupt)
+                     *   B    .loop
+                     *   .word 0x900B0000          ; data pool
+                     */
+                    uint32_t stub[] = {
+                        0xE59F401C,   /* LDR R4, [PC, #+0x1C] → [0x18A4] = 0x900B0000 */
+                        0xE3A05003,   /* MOV R5, #3 */
+                        0xE5845000,   /* STR R5, [R4] */
+                        0xE10F0000,   /* MRS R0, CPSR */
+                        0xE3C000C0,   /* BIC R0, R0, #0xC0 */
+                        0xE121F000,   /* MSR CPSR_c, R0 */
+                        0xEE070F90,   /* MCR p15, 0, R0, c7, c0, 4 (WFI) */
+                        0xEAFFFFFE,   /* B .-4 (loop on WFI) */
+                        0x900B0000,   /* data: PMU address */
+                    };
+                    for (int i = 0; i < 9; i++)
+                        *(uint32_t*)(vf->ram + 0x1880 + i * 4) = stub[i];
+                    printf("[HLE] Installed ROM stub at 0x1880 (PLL config + IRQ enable + WFI)\n");
 
-                        /* ROM initializes [load_addr+0xC004] to non-zero
-                         * (task count). If zero, init3 skips task setup
-                         * entirely. Set to 1 for minimal task setup. */
-                        *(uint32_t*)(vf->ram + base + 0xC004) = 1;
-                        printf("[HLE] Set task count [0x%08X] = 1\n",
-                               load_addr + 0xC004);
+                    /* Also set up SP804 timer to fire periodic IRQ.
+                     * µMORE scheduler needs timer ticks. */
+                    vf->timer.timer[0].load = 37500;  /* ~60Hz at 2.25MHz */
+                    vf->timer.timer[0].count = 37500;
+                    vf->timer.timer[0].ctrl = 0xE2;   /* enable, periodic, 32-bit, IntEnable */
+                    printf("[HLE] SP804 timer0: load=%u ctrl=0x%02X (60Hz periodic)\n",
+                           vf->timer.timer[0].load, vf->timer.timer[0].ctrl);
 
-                        /* µMORE init at 0x53AA0 does PUSH{R0}/POP{R0,R1}.
-                         * POP reads R1 from [SP_init] = [load_addr+0x425C].
-                         * R1 then gets stored to [0x10B602E0] (task PC).
-                         * ROM pushes the game entry PC there before calling
-                         * µMORE init. We write it to the stack slot directly.
-                         *
-                         * Similarly, R0 gets stored to [0x10BCA4E0] (task CPSR).
-                         * R0 = saved R0 from PUSH{R0} which is whatever R0
-                         * was when µMORE init was called. ROM sets R0 to the
-                         * initial CPSR. Our patched return from init2 doesn't
-                         * set R0, so we also write CPSR to the stack. */
-                        uint32_t sp_init_off = 0xC0425C; /* load_addr+0x425C - RAM_BASE */
-                        /* [SP_init+0] = R0 slot (PUSH {R0}) = initial CPSR */
-                        /* [SP_init+4] would be R1 slot but POP reads below SP */
-                        /* Actually: PUSH{R0} decrements SP by 4, so:
-                         * After PUSH: SP = 0x10C04258, [0x10C04258] = R0
-                         * POP{R0,R1}: R0 = [0x10C04258], R1 = [0x10C0425C]
-                         * So R1 comes from ORIGINAL SP = load_addr+0x425C */
-                        *(uint32_t*)(vf->ram + sp_init_off) = load_addr + 0xC4A4;
-                        printf("[HLE] Set stack[SP_init] = 0x%08X (game main for R1→task PC)\n",
-                               load_addr + 0xC4A4);
-
-                        /* Pre-write initial CPSR at [0x10BCA4E0] and NOP ALL
-                         * STR R0,[R2] instructions in µMORE init that would
-                         * overwrite it with a bad value. There are 6 such STRs
-                         * in the SVC/UND/ABT mode setup blocks. */
-                        *(uint32_t*)(vf->ram + 0xBCA4E0) = 0x000000D3;
-                        static const uint32_t cpsr_str_offsets[] = {
-                            0x53AC0, 0x53B0C, 0x53BA8, 0x53BF4, 0x53C54, 0x53CA0
-                        };
-                        for (int i = 0; i < 6; i++)
-                            *(uint32_t*)(vf->ram + base + cpsr_str_offsets[i]) = 0xE1A00000u;
-                        printf("[HLE] Set task CPSR=0xD3, NOP'd %d CPSR writes\n", 6);
-
-                        /* Fill task #1 in the task table.
-                         * Table at 0x10B0DF00, 16 bytes per entry.
-                         * Entry format: +0=?, +4=?, +8=callback, +C=active.
-                         * Scanner ORs callback into R4 for all active tasks,
-                         * then uses R4 as interrupt mask or dispatch value.
-                         *
-                         * Task #1 at 0x10B0DF10: */
-                        /* Task table at 0x10B0DF00, 16 bytes per entry.
-                         * Entry format:
-                         *   +0: IRQ register address (for callback==-1 path)
-                         *       OR IRQ bitmask (for callback!=-1 path)
-                         *   +4: ???
-                         *   +8: callback (-1 = use entry[+0] as IRQ addr)
-                         *   +C: active flag (1)
-                         *
-                         * After scan, code writes:
-                         *   [R0] = 0xDC000008  (R0 = task[+0] for cb==-1)
-                         *   [0xDC000108] = R4  (R4 = OR'd task[+0] for cb!=-1)
-                         *
-                         * Set task #1 as IRQ controller task:
-                         *   entry[+0] = 0xDC000004 (IRQ enable register addr)
-                         *   entry[+8] = -1 (use addr path)
-                         *   entry[+C] = 1 (active) */
-                        uint32_t task1 = 0xB0DF10;
-                        *(uint32_t*)(vf->ram + task1 + 0x00) = 0xDC000004;
-                        *(uint32_t*)(vf->ram + task1 + 0x04) = 0;
-                        *(uint32_t*)(vf->ram + task1 + 0x08) = 0xFFFFFFFF;
-                        *(uint32_t*)(vf->ram + task1 + 0x0C) = 1;
-                        printf("[HLE] Set task #1: IRQ addr=0xDC000004\n");
-                    }
+                    /* Set VIC to enable timer IRQ */
+                    vf->timer.irq.enable = (1 << IRQ_TIMER0);
+                    printf("[HLE] VIC IRQ enable: 0x%08X\n", vf->timer.irq.enable);
                 }
             }
         } else if (looks_like_arm(buf, entry.size)) {
@@ -1662,6 +1625,31 @@ static int vflash_load_rawbin(VFlash *vf, const char *path) {
     return 1;
 }
 
+/* Dump page table when MMU is first enabled */
+static void mmu_dump_pagetable(void *ctx, uint32_t ttb) {
+    VFlash *vf = ctx;
+    if (!vf || !vf->ram) return;
+    printf("[MMU] Page table dump (TTB=0x%08X):\n", ttb);
+    for (int i = 0; i < 4096; i++) {
+        uint32_t pa = ttb + i * 4;
+        uint32_t l1 = 0;
+        if (pa >= VFLASH_RAM_BASE && pa + 3 < VFLASH_RAM_BASE + VFLASH_RAM_SIZE)
+            l1 = *(uint32_t*)(vf->ram + (pa - VFLASH_RAM_BASE));
+        else if (!vf->has_rom && pa + 3 < VFLASH_RAM_SIZE)
+            l1 = *(uint32_t*)(vf->ram + pa);
+        else continue;
+        if (l1 == 0) continue;
+        uint32_t typ = l1 & 3;
+        if (typ == 2) {
+            printf("[MMU]   L1[0x%03X]: VA 0x%03X00000 → PA 0x%08X (section)\n",
+                   i, i, l1 & 0xFFF00000);
+        } else if (typ == 1) {
+            printf("[MMU]   L1[0x%03X]: VA 0x%03X00000 → L2 at 0x%08X (coarse)\n",
+                   i, i, l1 & 0xFFFFFC00);
+        }
+    }
+}
+
 VFlash* vflash_create(const char *disc_path) {
     VFlash *vf = calloc(1, sizeof(VFlash));
 
@@ -1672,6 +1660,7 @@ VFlash* vflash_create(const char *disc_path) {
     vf->audio = audio_create();
 
     cp15_reset(&vf->cpu.cp15);
+    /* Note: mmu_dump_pagetable available for debugging */
     ztimer_reset(&vf->timer);
 
     vf->cpu.mem_ctx      = vf;
