@@ -6,3 +6,8 @@ mjp_extract
 ptx_extract
 testrom_gen
 testrom.bin
+vflash_dbg
+*.iso
+*.cue
+*.bin
+!testrom.bin
