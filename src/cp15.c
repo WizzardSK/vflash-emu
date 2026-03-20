@@ -65,18 +65,22 @@ uint32_t cp15_read(CP15 *cp, uint32_t crn, uint32_t crm, uint32_t op2) {
 
 void cp15_write(CP15 *cp, uint32_t crn, uint32_t crm, uint32_t op2, uint32_t val) {
     switch (crn) {
-        case 1:  /* Control register */
+        case 1: { /* Control register */
+            int was_mmu = cp->mmu_enabled;
             cp->control        = (val & ~0x00000078u) | 0x00000078u; /* bits 3-6 RAO */
             cp->mmu_enabled    = (val & CP15_CTRL_MMU)    ? 1 : 0;
             cp->dcache_enabled = (val & CP15_CTRL_DCACHE) ? 1 : 0;
             cp->icache_enabled = (val & CP15_CTRL_ICACHE) ? 1 : 0;
             cp->write_buffer   = (val & CP15_CTRL_WBUF)   ? 1 : 0;
             cp->hivec          = (val & CP15_CTRL_HIVEC)  ? 1 : 0;
-            /* Suppress repeated Control writes (µMORE context switch spam) */
-            if (0) printf("[CP15] Control=0x%08X MMU=%d DC=%d IC=%d HIVEC=%d\n",
-                   cp->control, cp->mmu_enabled, cp->dcache_enabled,
-                   cp->icache_enabled, cp->hivec);
+            /* Log MMU enable transition (not repeated context switch writes) */
+            if (!was_mmu && cp->mmu_enabled) {
+                printf("[CP15] MMU ENABLED! TTB=0x%08X HIVEC=%d\n", cp->ttb, cp->hivec);
+                printf("[CP15] Control=0x%08X DC=%d IC=%d\n",
+                       cp->control, cp->dcache_enabled, cp->icache_enabled);
+            }
             break;
+        }
         case 2:  /* TTB */
             cp->ttb = val & ~0x3FFFu;
             printf("[CP15] TTB=0x%08X\n", cp->ttb);

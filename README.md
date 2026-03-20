@@ -22,19 +22,15 @@ No other emulator exists for this system.
 - SWI/IRQ/FIQ/UNDEF exceptions with correct register banking
 - CPI timing model; CP15 coprocessor (HIVEC, cache stubs)
 
-### Memory map (estimated ZEVIO 1020)
+### Physical memory map (ZEVIO 1020)
 | Address | Size | Region |
 |---------|------|--------|
-| `0x00000000` | 16MB | RAM mirror (alias of 0x10000000) |
+| `0x00000000` | 512KB | Boot ROM (read-only NOR flash, always present) |
 | `0x0FFE0000` | 128KB | Internal SRAM / TCM |
 | `0x10000000` | 16MB | Main SDRAM |
-| `0x80000000` | 512B | IRQ controller + Timer0/1 |
-| `0x80001000` | 4KB | CD-ROM DMA |
-| `0x80002000` | 4KB | Video DMA (framebuffer + JPEG decode) |
-| `0x80003000` | 4KB | Audio DMA |
-| `0x80004000` | 4KB | GPIO / buttons (active-low) |
-| `0x80005000` | 4KB | UART stub (TX→stderr as `[UART]`) |
 | `0xFFFF0000` | 64KB | High vector mirror (ARM HIVEC) |
+
+After MMU init, µMORE remaps virtual address 0 → SDRAM (same as TI-Nspire `INT_MMU_Initialize`).
 
 ### MMU
 - ARM926EJ-S two-level page table translation
@@ -145,14 +141,26 @@ The entire file is loaded at the specified load address. The entry point trampol
 The emulator supports real boot ROM (`70004.bin`, 2MB) from V.Flash/V.Smile Pro hardware. Place it in the working directory or alongside game disc images.
 
 With boot ROM present, the emulator performs a real hardware boot sequence instead of HLE:
-1. ARM reset → ROM init at address 0
-2. System control config (PLL, clocks)
-3. ROM self-copy to RAM via flash controller remap
-4. Timer/IRQ controller initialization
-5. CD-ROM disc detection → BOOT.BIN load
-6. µMORE RTOS init → game start
+1. ARM reset → PC=0, ROM executes from physical address 0
+2. System control config (PLL lock, clock setup via 0x900B0000)
+3. ROM copies init code to SDRAM via NOR flash controller DMA
+4. BL #1-#7 init functions: timer, IRQ, mode stacks, vector table
+5. SDRAM controller (0x8FFF0000) triggers BOOT.BIN load from CD
+6. MMU enabled → virtual address 0 remapped to SDRAM
+7. µMORE RTOS scheduler starts → game task dispatch
 
 Without boot ROM, HLE boot is used (limited — µMORE RTOS not fully functional).
+
+### Boot memory model
+
+The V.Flash uses the same boot model as the TI-Nspire (confirmed via [Firebird](https://github.com/nspire-emus/firebird) source):
+
+- **Physical address 0** = 512KB boot ROM (read-only, always present)
+- **Physical address 0x10000000** = 16MB SDRAM
+- **Before MMU**: CPU fetches from ROM at addr 0, writes go to SDRAM
+- **After MMU**: virtual addr 0 → SDRAM (writable vector table), ROM accessible only via 0xB8000000
+- The NOR flash controller at 0xB8000000 provides DMA/config, **not** address remapping
+- Address remapping is handled entirely by the ARM926EJ-S MMU page tables
 
 ### ZEVIO SoC — same as TI-Nspire!
 
@@ -162,7 +170,7 @@ The V.Flash uses the same LSI Logic ZEVIO SoC as the TI-Nspire calculator. All p
 
 | Address | Peripheral | Type |
 |---------|-----------|------|
-| `0x00000000` | Boot ROM (512KB mirror) | NOR flash |
+| `0x00000000` | Boot ROM (512KB, read-only) | NOR flash |
 | `0x8FFF0000` | SDRAM Controller | ARM DMC-340 |
 | `0x8FFF1000` | NAND Controller | ARM PL351 |
 | `0x90000000` | GPIO | |
@@ -211,17 +219,28 @@ Standard ARM dual-timer. Two timers per block at offsets +0x00 and +0x20:
 
 ## Current status
 
-- **Boot ROM boots fully** — cold boot, PLL, flash copy, BL #1-#7 init, BOOT.BIN load
+- **Boot ROM boots** — cold boot → PLL lock → flash DMA → BL init functions
+- **Flash controller model** — ROM copy loop writes to 0xB8000800+ window, remap triggers DMA to RAM, CPU executes from flash window
 - **SP804 timer fires** — proper ARM SP804 implementation, periodic IRQ via PL190 VIC
-- **µMORE RTOS scheduler runs** — mode stacks, MMU, context switch loop at 100% CPU
-- **IRQ enabled** — CPSR I=0 after flash remap disabled, SP stable
+- **µMORE RTOS scheduler runs** — init code executes from flash window at 0xB8000800+
+- **MMU translation** — L1 section + L2 coarse page table walk, VA→PA for all accesses
+- **APB peripherals** — GPIO, PL011 UART, SP805 watchdog, PL031 RTC, PMU stubs
+- **50 FPS** — CPU runs at full speed from flash window
 - **SDL window opens** — black (no video writes yet)
-- **Blocking**: scheduler idles (R8=0, no task dispatch) — task table pointer uninitialized due to flash remap cold boot offset mismatch
+- **Blocking**: scheduler loop cycling but no task dispatch (R8=0) — BL init functions execute but task table pointer not yet initialized
 - 6 games extracted and analyzed; all share identical 48KB µMORE init code
-- LCD controller is PL111 at `0xC0000000` (not yet implemented)
+- LCD controller (PL111 at `0xC0000000`) not yet implemented
 
 ## Notes
 
 - Games ship with µMORE v4.0 RTOS on disc — no boot ROM dump needed
 - No copy protection; games run from CD-R on real hardware
 - The ZEVIO 1020 SoC memory map is estimated from code analysis — corrections welcome
+
+## References
+
+- [Hackspire Wiki — Memory-mapped I/O ports (Classic)](https://hackspire.org/index.php/Memory-mapped_I/O_ports_on_Classic) — ZEVIO peripheral register map
+- [Hackspire Wiki — Memory-mapped I/O ports (CX)](https://hackspire.org/index.php/Memory-mapped_I/O_ports_on_CX) — CX variant registers
+- [Firebird emulator](https://github.com/nspire-emus/firebird) — TI-Nspire emulator (same ZEVIO SoC), reference implementation
+- [ARM926EJ-S TRM](https://ww1.microchip.com/downloads/en/DeviceDoc/ARM_926EJS_TRM.pdf) — ARM926EJ-S Technical Reference Manual
+- [ARM Integrator CM926EJ-S — Using REMAP](http://infocenter.arm.com/help/topic/com.arm.doc.dui0138e/Chdiehbj.html) — Boot ROM remap mechanism

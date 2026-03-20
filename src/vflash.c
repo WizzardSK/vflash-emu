@@ -125,8 +125,9 @@ struct VFlash {
     uint32_t  input_prev;
     int       debug;
     int       has_rom;    /* 1 if boot ROM loaded (real boot, no HLE) */
-    uint32_t  flash_remap; /* Flash controller: last written value to reg 0x800 */
-    int       boot_remap; /* 1 after system control write remaps addr 0 to SDRAM */
+    uint32_t  flash_remap; /* Flash controller: remap base written to reg 0x800 */
+    uint8_t   flash_buf[0x2000]; /* Flash controller write buffer (captures writes to 0xB8000800+) */
+    int       flash_buf_dirty;   /* 1 if flash_buf has been written to */
     uint32_t  dma_param_a, dma_param_b, dma_param_c;
     uint64_t  frame_count;
 
@@ -152,8 +153,11 @@ static inline uint32_t ram_r32(VFlash *vf, uint32_t addr) {
 
 /* Read a physical 32-bit word (for page table walks) — no MMU translation */
 static inline uint32_t phys_read32(VFlash *vf, uint32_t pa) {
-    if (pa < VFLASH_RAM_SIZE)
-        return *(uint32_t*)(vf->ram + pa);
+    if (pa < 0x00200000u) {
+        if (vf->has_rom && pa + 3 < vf->rom_size)
+            return *(uint32_t*)(vf->rom + pa);
+        return 0;
+    }
     if (pa >= VFLASH_RAM_BASE && pa + 3 < VFLASH_RAM_BASE + VFLASH_RAM_SIZE)
         return *(uint32_t*)(vf->ram + (pa - VFLASH_RAM_BASE));
     if (pa >= VFLASH_SRAM_BASE && pa + 3 < VFLASH_SRAM_BASE + VFLASH_SRAM_SIZE)
@@ -180,9 +184,15 @@ static uint32_t mmu_translate(VFlash *vf, uint32_t va) {
             return va;
         case 2: { /* Section (1MB) */
             uint32_t pa = (l1_desc & 0xFFF00000u) | (va & 0x000FFFFFu);
-            if (pa != va && vf->debug)
-                fprintf(stderr, "[MMU] VA 0x%08X → PA 0x%08X (section L1[%u]=0x%08X)\n",
-                        va, pa, l1_index, l1_desc);
+            /* Log first translation of VA 0 section — critical for boot model */
+            if (l1_index == 0) {
+                static int va0_logged = 0;
+                if (!va0_logged) {
+                    printf("[MMU] VA 0x%08X → PA 0x%08X (section L1[0]=0x%08X, TTB=0x%08X)\n",
+                           va, pa, l1_desc, cp->ttb);
+                    va0_logged = 1;
+                }
+            }
             return pa;
         }
         case 1: { /* Coarse page table (256 entries, 4KB pages) */
@@ -212,26 +222,24 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
 
-    /* Address 0: ROM overlay for boot, then SDRAM after remap.
-     * On real HW, system control write to 0x900A0F04 remaps addr 0
-     * from NOR flash to SDRAM. Before remap, reads return ROM content.
-     * After remap, reads return SDRAM (initially zeroed).
-     * We use boot_remap flag to track this transition. */
-    if (addr < VFLASH_RAM_SIZE) {
-        if (!vf->boot_remap && vf->has_rom && addr < vf->rom_size) {
-            /* Before remap: addr 0 = ROM (read-only flash) */
+    /* Physical address 0 = Boot ROM (512KB, read-only NOR flash).
+     * Same model as TI-Nspire (Firebird): ROM always at physical addr 0,
+     * SDRAM always at 0x10000000. The MMU remaps virtual addr 0 → SDRAM
+     * after page table setup (like Nspire INT_MMU_Initialize).
+     * After MMU translation, addr here is PHYSICAL — if MMU mapped
+     * VA 0 to PA 0x10000000, we'll hit the SDRAM handler below. */
+    if (addr < 0x00200000u) {  /* 0-2MB: boot ROM region */
+        if (vf->has_rom && addr < vf->rom_size)
             return *(uint32_t*)(vf->rom + addr);
-        }
-        return *(uint32_t*)(vf->ram + addr);
+        return 0;  /* unmapped ROM area */
     }
 
     /* High vector mirror at 0xFFFF0000–0xFFFFFFFF (ARM HIVEC, CR1.V=1)
-     * Mirror the first 64KB of RAM here. The upper bound check is omitted
-     * because 0xFFFF0000 + 0x10000 == 0 in uint32 (overflow). */
+     * Mirror of physical addr 0 (boot ROM). */
     if (addr >= 0xFFFF0000u) {
-        uint32_t off = addr - 0xFFFF0000u;  /* 0x0000..0xFFFF */
-        if (off + 3 < VFLASH_RAM_SIZE)
-            return *(uint32_t*)(vf->ram + off);
+        uint32_t off = addr - 0xFFFF0000u;
+        if (vf->has_rom && off + 3 < vf->rom_size)
+            return *(uint32_t*)(vf->rom + off);
         return 0;
     }
 
@@ -262,43 +270,36 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
-        /* Boot ROM at 0xB8000000 (full 2MB).
-         * Flash remap register at 0xB8000800: writing an address
-         * redirects reads from 0xB8000800+ to that RAM address. */
+        /* NOR Flash controller at 0xB8000000 (2MB).
+         * Offsets 0x000-0x7FF: controller registers + ROM data.
+         * Offsets 0x800+: flash window (buffered writes, remap to RAM). */
         if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
             uint32_t foff = off - 0x38000000u;
-            if (foff >= 0x800 && vf->flash_remap) {
-                /* Flash remap: 0xB8000800+N maps to remap_addr+N.
-                 * Init code self-modifies a small area (~64 bytes) at
-                 * RAM[0x118-0x160] (the BL sequence and main init code).
-                 * Everything else should come from original ROM.
-                 *
-                 * Use RAM for the self-modified region (N=0x00-0x50),
-                 * ROM for the rest (BL function bodies, handlers). */
-                /* Hybrid flash remap:
-                 * N < 0x20: BL call sequence → ROM (original BL calls)
-                 * N = 0x20: Main init LDR PC → RAM (self-modified target)
-                 * N > 0x20: BL function bodies → ROM
-                 * This ensures BL functions install handlers (ROM) while
-                 * main init can continue past first run (RAM modification). */
-                uint32_t N = foff - 0x800;
-                uint32_t remap_off = vf->flash_remap + N;
-                /* Flash remap: write to reg 0x800 sets RAM offset.
-                 * Subsequent reads from 0xB8000800+N return RAM[remap+N].
-                 * This is how ROM redirects execution from flash to RAM
-                 * after cold boot copy. */
-                if (foff >= 0x800 && vf->flash_remap) {
-                    uint32_t remap_off = vf->flash_remap + (foff - 0x800);
-                    if (remap_off < VFLASH_RAM_SIZE)
-                        return *(uint32_t*)(vf->ram + remap_off);
-                    return 0;
+            if (foff < 0x800) {
+                /* Controller status registers */
+                switch (foff) {
+                    case 0x00: return 0;
+                    case 0x08: return 0;      /* Operation complete */
+                    case 0x34: return 0x40;   /* Status: ready */
+                    case 0x40: return 1;
                 }
-                /* Without remap: return ROM content */
+                /* ROM data */
                 if (foff < vf->rom_size)
                     return *(uint32_t*)(vf->rom + foff);
                 return 0;
+            }
+            /* Flash window at 0xB8000800+N */
+            uint32_t boff = foff - 0x800;
+            if (vf->flash_remap) {
+                /* After remap: read from RAM[remap+N] (buffer was flushed there) */
+                uint32_t remap_off = vf->flash_remap + boff;
+                if (remap_off + 3 < VFLASH_RAM_SIZE)
+                    return *(uint32_t*)(vf->ram + remap_off);
                 return 0;
             }
+            /* Before remap: return buffered data or ROM */
+            if (vf->flash_buf_dirty && boff + 3 < sizeof(vf->flash_buf))
+                return *(uint32_t*)(vf->flash_buf + boff);
             if (foff < vf->rom_size)
                 return *(uint32_t*)(vf->rom + foff);
             return 0;
@@ -412,24 +413,108 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
-        /* System control at 0x900A0000-0x900BFFFF (off = 0x100A0000-0x100BFFFF) */
-        if (off >= 0x100A0000u && off < 0x100C0000u) {
+        /* Misc System Control at 0x900A0000 (off = 0x100A0000) */
+        if (off >= 0x100A0000u && off < 0x100A1000u) {
             uint32_t sreg = off - 0x100A0000u;
             switch (sreg) {
-                case 0x000C: return 0x00;    /* Boot status: bit1=0 (cold boot → copy ROM to RAM) */
-                case 0x10014: return 0x01;   /* PLL lock: bit0=1 (locked) */
-                default:     return 0xFFFFFFFF; /* All ready/done bits set */
+                case 0x00: return 0x01000010; /* Model ID (Nspire classic-like) */
+                case 0x04: return 0;
+                case 0x0C: return 0x00;       /* Boot status: cold boot */
+                case 0x28: return 0x00000000; /* ASIC ID low */
+                case 0x2C: return 0x00000000; /* ASIC ID high */
+                default:   return 0;
             }
         }
 
-        /* UART stub: 0x5000–0x5FFF
-         * Always report TX_READY so OS never gets stuck polling */
+        /* Power Management (PMU) at 0x900B0000 (off = 0x100B0000) */
+        if (off >= 0x100B0000u && off < 0x100B1000u) {
+            uint32_t preg = off - 0x100B0000u;
+            switch (preg) {
+                case 0x00: return 0x00141002; /* clocks_load */
+                case 0x04: return 0;          /* wake_mask */
+                case 0x08: return 0x2000;     /* PMU status (Nspire) */
+                case 0x0C: return 0;
+                case 0x14: return 0x01;       /* PLL lock: bit0=1 */
+                case 0x18: return 0;          /* disable */
+                case 0x20: return 0;          /* disable2 */
+                case 0x24: return 0x00141002; /* current clocks */
+                case 0x28: return 0x114;      /* ON key not pressed */
+                default:   return 0;
+            }
+        }
+
+        /* Timers at 0x900C0000-0x900DFFFF handled above */
+
+        /* UART stub: 0x5000–0x5FFF (HLE I/O region, not real APB) */
         if (off >= 0x5000 && off < 0x6000) {
             switch (off - 0x5000) {
-                case 0x00: return 0;            /* UART_TX (write-only, reads 0) */
-                case 0x04: return 0x1;          /* UART_STATUS: TX_READY always set */
-                case 0x08: return 0xFF;         /* UART_RX: no data */
-                case 0x0C: return 0x1;          /* UART_CTRL: enabled */
+                case 0x00: return 0;
+                case 0x04: return 0x1;   /* TX_READY */
+                case 0x08: return 0xFF;
+                case 0x0C: return 0x1;
+                default:   return 0;
+            }
+        }
+
+        /* GPIO at 0x90000000 (off = 0x10000000) */
+        if (off >= 0x10000000u && off < 0x10001000u) {
+            uint32_t greg = off - 0x10000000u;
+            int port = (greg >> 6) & 7;
+            switch (greg & 0x3F) {
+                case 0x10: return 0xFF;    /* direction: all output */
+                case 0x14: return 0;       /* output data */
+                case 0x18: return 0x1F;    /* input: all buttons released */
+                default:   return 0;
+            }
+        }
+
+        /* PL011 UART at 0x90020000 (off = 0x10020000) */
+        if (off >= 0x10020000u && off < 0x10021000u) {
+            uint32_t ureg = off - 0x10020000u;
+            switch (ureg) {
+                case 0x00: return 0;         /* UARTDR: no data */
+                case 0x18: return 0x90;      /* UARTFR: TX empty, RX empty */
+                case 0x24: return 0;         /* UARTIBRD */
+                case 0x28: return 0;         /* UARTFBRD */
+                case 0x2C: return 0;         /* UARTLCR_H */
+                case 0x30: return 0;         /* UARTCR */
+                case 0xFE0: return 0x11;     /* PL011 PeriphID0 */
+                case 0xFE4: return 0x10;     /* PL011 PeriphID1 */
+                default:    return 0;
+            }
+        }
+
+        /* Watchdog at 0x90060000 (off = 0x10060000) */
+        if (off >= 0x10060000u && off < 0x10061000u) {
+            uint32_t wreg = off - 0x10060000u;
+            switch (wreg) {
+                case 0x00: return 0xFFFFFFFF; /* WdogLoad */
+                case 0x04: return 0xFFFFFFFF; /* WdogValue */
+                case 0x08: return 0;          /* WdogControl */
+                default:   return 0;
+            }
+        }
+
+        /* RTC at 0x90090000 (off = 0x10090000) */
+        if (off >= 0x10090000u && off < 0x10091000u) {
+            uint32_t rreg = off - 0x10090000u;
+            switch (rreg) {
+                case 0x00:  return 0x67000000; /* RTCDR: time */
+                case 0x14:  return 0;          /* RTCRIS */
+                case 0xFE0: return 0x31;       /* PL031 PID0 */
+                case 0xFE4: return 0x10;       /* PL031 PID1 */
+                default:    return 0;
+            }
+        }
+
+        /* SDRAM controller at 0x8FFF0000 — PID registers */
+        if (off >= 0x0FFF0000u && off < 0x0FFF2000u) {
+            uint32_t dreg = off - 0x0FFF0000u;
+            switch (dreg) {
+                case 0x00: return 0x80;   /* memc_status: ready */
+                case 0x08: return 0x01;   /* DMA status: complete */
+                case 0x0FE0: return 0x40; /* DMC-340 PID0 */
+                case 0x0FE4: return 0x13; /* PID1 */
                 default:   return 0;
             }
         }
@@ -443,10 +528,17 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
 static uint16_t mem_read16(void *ctx, uint32_t addr) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
-    if (addr < VFLASH_RAM_SIZE)
-        return *(uint16_t*)(vf->ram + addr);
-    if (addr >= 0xFFFF0000u && addr - 0xFFFF0000u < VFLASH_RAM_SIZE)
-        return *(uint16_t*)(vf->ram + (addr - 0xFFFF0000u));
+    if (addr < 0x00200000u) {
+        if (vf->has_rom && addr + 1 < vf->rom_size)
+            return *(uint16_t*)(vf->rom + addr);
+        return 0;
+    }
+    if (addr >= 0xFFFF0000u) {
+        uint32_t off = addr - 0xFFFF0000u;
+        if (vf->has_rom && off + 1 < vf->rom_size)
+            return *(uint16_t*)(vf->rom + off);
+        return 0;
+    }
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE)
         return *(uint16_t*)(vf->ram + (addr - VFLASH_RAM_BASE));
     if (addr >= VFLASH_SRAM_BASE && addr < VFLASH_SRAM_BASE + VFLASH_SRAM_SIZE)
@@ -459,10 +551,17 @@ static uint16_t mem_read16(void *ctx, uint32_t addr) {
 static uint8_t mem_read8(void *ctx, uint32_t addr) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
-    if (addr < VFLASH_RAM_SIZE)
-        return vf->ram[addr];
-    if (addr >= 0xFFFF0000u && addr - 0xFFFF0000u < VFLASH_RAM_SIZE)
-        return vf->ram[addr - 0xFFFF0000u];
+    if (addr < 0x00200000u) {
+        if (vf->has_rom && addr < vf->rom_size)
+            return vf->rom[addr];
+        return 0;
+    }
+    if (addr >= 0xFFFF0000u) {
+        uint32_t off = addr - 0xFFFF0000u;
+        if (vf->has_rom && off < vf->rom_size)
+            return vf->rom[off];
+        return 0;
+    }
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE)
         return vf->ram[addr - VFLASH_RAM_BASE];
     if (addr >= VFLASH_SRAM_BASE && addr < VFLASH_SRAM_BASE + VFLASH_SRAM_SIZE)
@@ -476,10 +575,10 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
 
-    /* RAM mirror at 0x00000000 */
-    if (addr < VFLASH_RAM_SIZE) {
-        *(uint32_t*)(vf->ram + addr) = val;
-        return;
+    /* Physical addr 0-2MB = Boot ROM (read-only, writes silently ignored).
+     * On real HW, NOR flash ignores writes without a special command sequence. */
+    if (addr < 0x00200000u) {
+        return;  /* ROM is read-only */
     }
 
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
@@ -626,21 +725,31 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
             return;
         }
 
-        /* Flash controller write at 0xB8000800 (remap register) */
+        /* NOR Flash controller at 0xB8000000.
+         * ROM init copies code to the flash window at 0xB8000800+ (word-by-word),
+         * then writes a remap value to 0xB8000800, then jumps to 0xB8000804.
+         * We buffer all writes to 0xB8000800+ and flush to RAM on remap. */
         if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
             uint32_t foff = off - 0x38000000u;
-            if (foff == 0x800) {
-                vf->flash_remap = val;
-                /* After flash remap enable, addr 0 switches from ROM to SDRAM */
-                if (val != 0 && !vf->boot_remap) {
-                    vf->boot_remap = 1;
-                    /* Also copy cold boot data to remap target in RAM.
-                     * Cold boot copied ROM[0x800]→RAM[0x7F0]. But remap
-                     * is to 0x118. Copy ROM[0x800]→RAM[0x118] too. */
-                    if (val + 0xD00 < VFLASH_RAM_SIZE) {
-                        memcpy(vf->ram + val, vf->rom + 0x800, 0xD00);
-                        printf("[FLASH] Remap DMA: ROM[0x800]→RAM[0x%X] (0xD00 bytes)\n", val);
-                    }
+            if (foff >= 0x800 && foff < 0x800 + sizeof(vf->flash_buf)) {
+                uint32_t boff = foff - 0x800;
+                /* Buffer the write */
+                *(uint32_t*)(vf->flash_buf + boff) = val;
+                vf->flash_buf_dirty = 1;
+
+                /* Write to reg 0x800 = remap trigger */
+                if (foff == 0x800 && val != 0) {
+                    vf->flash_remap = val;
+                    /* Flush buffer to RAM at remap offset.
+                     * The buffer contains ROM init code that was
+                     * copied word-by-word from ROM[0x7F0..0xD00].
+                     * First word (offset 0) is now the remap value itself. */
+                    uint32_t flush_size = sizeof(vf->flash_buf);
+                    if (val + flush_size > VFLASH_RAM_SIZE)
+                        flush_size = VFLASH_RAM_SIZE - val;
+                    memcpy(vf->ram + val, vf->flash_buf, flush_size);
+                    printf("[FLASH] Remap=0x%X, flushed %u bytes to RAM[0x%X]\n",
+                           val, flush_size, val);
                 }
             }
             return;
@@ -828,10 +937,7 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
 static void mem_write16(void *ctx, uint32_t addr, uint16_t val) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
-    if (addr < VFLASH_RAM_SIZE) {
-        *(uint16_t*)(vf->ram + addr) = val;
-        return;
-    }
+    if (addr < 0x00200000u) return;  /* ROM read-only */
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
         *(uint16_t*)(vf->ram + (addr - VFLASH_RAM_BASE)) = val;
         return;
@@ -853,10 +959,7 @@ static void mem_write16(void *ctx, uint32_t addr, uint16_t val) {
 static void mem_write8(void *ctx, uint32_t addr, uint8_t val) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
-    if (addr < VFLASH_RAM_SIZE) {
-        vf->ram[addr] = val;
-        return;
-    }
+    if (addr < 0x00200000u) return;  /* ROM read-only */
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
         vf->ram[addr - VFLASH_RAM_BASE] = val;
         return;
