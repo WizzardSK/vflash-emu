@@ -269,8 +269,13 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                  * main init can continue past first run (RAM modification). */
                 uint32_t N = foff - 0x800;
                 uint32_t remap_off = vf->flash_remap + N;
-                {
-                    /* Everything else — use original ROM */
+                if (N < 0x98) {
+                    /* Self-modified C code + scheduler → RAM
+                     * BL functions start at N=0x98 (BL #1 at 0xB80008B0) */
+                    if (remap_off < VFLASH_RAM_SIZE)
+                        return *(uint32_t*)(vf->ram + remap_off);
+                } else {
+                    /* BL function bodies → original ROM */
                     if (remap_off < vf->rom_size)
                         return *(uint32_t*)(vf->rom + remap_off);
                 }
@@ -1587,10 +1592,18 @@ void vflash_run_frame(VFlash *vf) {
         memset(vf->framebuf, 0,
                VFLASH_SCREEN_W * VFLASH_SCREEN_H * sizeof(uint32_t));
 
-    /* No ARM IRQ delivery — µMORE uses polling-based scheduling.
-     * Just keep timer ticking and clear pending flags. */
     vf->timer.irq.status = 0;
     vf->timer.timer[0].irq_pending = 0;
+
+    /* Fix LR for µMORE scheduler. ROM uses LDR PC (not BL) to
+     * jump to scheduler at 0xB8000820. This doesn't set LR, so
+     * scheduler always returns to 0xB8000820 (re-entering itself).
+     * Patch: when CPU is in scheduler code area (0x10010234-0x10010284),
+     * set LR to 0xB8000824 (next ROM instruction after LDR PC). */
+    /* Patch ROM[0x138] (flash remap LDR PC) to include LR setup.
+     * Write BL-equivalent: MOV LR,PC then LDR PC at RAM[0x138-0x13C].
+     * This only needs to happen once. */
+    /* No LR patch needed — self-modified C code handles flow */
 
     if ((vf->frame_count % 60) == 0) {
         printf("[Frame %lu] PC=0x%08X CPSR=0x%08X SP=0x%08X LR=0x%08X\n",
