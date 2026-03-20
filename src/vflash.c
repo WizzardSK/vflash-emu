@@ -1020,23 +1020,91 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                  * 3. Idle loop (let timer IRQs drive scheduler)
                  *
                  * This simulates what µMORE's warm boot handler would do. */
-                uint32_t wb = 0xFFC8; /* RAM offset for warm boot entry */
-                /* MRS R0, CPSR */
-                *(uint32_t*)(vf->ram + wb +  0) = 0xE10F0000;
-                /* BIC R0, R0, #0xC0  (enable IRQ+FIQ) */
-                *(uint32_t*)(vf->ram + wb +  4) = 0xE3C000C0;
-                /* MSR CPSR_c, R0 */
-                *(uint32_t*)(vf->ram + wb +  8) = 0xE121F000;
-                /* WFI (MCR p15,0,R0,c7,c0,4) */
-                *(uint32_t*)(vf->ram + wb + 12) = 0xEE070F90;
-                /* B .-4 (loop back to WFI) */
-                *(uint32_t*)(vf->ram + wb + 16) = 0xEAFFFFFD;
+                /* Patch warm boot entry at RAM[0xFFC8] to re-run BOOT.BIN.
+                 * On the second run, init functions will detect the already-
+                 * initialized µMORE state. We also patch BOOT[0x20] (ROM
+                 * callback address) to point to our scheduler start stub
+                 * instead of 0x1880, so the code won't reboot again. */
 
-                /* Set up SP804 timer + VIC for scheduler ticks */
-                vf->timer.timer[0].load = 37500;  /* ~60Hz */
-                vf->timer.timer[0].count = 37500;
-                vf->timer.timer[0].ctrl = 0xE2;   /* enable, periodic, IntEnable */
-                vf->timer.irq.enable = (1 << IRQ_TIMER0);
+                /* Write scheduler stub at RAM[0xFF00].
+                 * BOOT.BIN disables MMU before calling this, so we must
+                 * re-enable it first (so IRQ vectors go through page table
+                 * to µMORE handlers). Then set up timer, VIC, enable IRQs. */
+                uint32_t ss = 0xFF00;
+                int si = 0;
+                /* Re-enable MMU: MCR p15,0,R0,C2,C0,0 (set TTB) */
+                *(uint32_t*)(vf->ram + ss + si) = 0xE59F0048; si += 4; /* LDR R0,[PC,#72] → dp[0] */
+                *(uint32_t*)(vf->ram + ss + si) = 0xEE020F10; si += 4; /* MCR p15,0,R0,C2,C0,0 */
+                /* Read CP15 C1, set MMU+cache bits, write back */
+                *(uint32_t*)(vf->ram + ss + si) = 0xEE110F10; si += 4; /* MRC p15,0,R0,C1,C0,0 */
+                *(uint32_t*)(vf->ram + ss + si) = 0xE59F1040; si += 4; /* LDR R1,[PC,#64] → dp[1] */
+                *(uint32_t*)(vf->ram + ss + si) = 0xE1800001; si += 4; /* ORR R0,R0,R1 */
+                *(uint32_t*)(vf->ram + ss + si) = 0xEE010F10; si += 4; /* MCR p15,0,R0,C1,C0,0 */
+                /* Set up SP804 timer */
+                *(uint32_t*)(vf->ram + ss + si) = 0xE59F0038; si += 4; /* LDR R0,[PC,#56] → dp[2] */
+                *(uint32_t*)(vf->ram + ss + si) = 0xE3A01C92; si += 4; /* MOV R1,#0x9200 */
+                *(uint32_t*)(vf->ram + ss + si) = 0xE381107C; si += 4; /* ORR R1,#0x7C (=0x927C=37500) */
+                *(uint32_t*)(vf->ram + ss + si) = 0xE5801000; si += 4; /* STR R1,[R0] timer load */
+                *(uint32_t*)(vf->ram + ss + si) = 0xE3A010E2; si += 4; /* MOV R1,#0xE2 timer ctrl */
+                *(uint32_t*)(vf->ram + ss + si) = 0xE5801008; si += 4; /* STR R1,[R0,#8] */
+                /* Enable VIC timer IRQ */
+                *(uint32_t*)(vf->ram + ss + si) = 0xE59F0024; si += 4; /* LDR R0,[PC,#36] → dp[3] */
+                *(uint32_t*)(vf->ram + ss + si) = 0xE3A01001; si += 4; /* MOV R1,#1 */
+                *(uint32_t*)(vf->ram + ss + si) = 0xE5801010; si += 4; /* STR R1,[R0,#0x10] */
+                /* Enable CPU IRQs */
+                *(uint32_t*)(vf->ram + ss + si) = 0xE10F0000; si += 4; /* MRS R0,CPSR */
+                *(uint32_t*)(vf->ram + ss + si) = 0xE3C000C0; si += 4; /* BIC R0,#0xC0 */
+                *(uint32_t*)(vf->ram + ss + si) = 0xE121F000; si += 4; /* MSR CPSR_c,R0 */
+                /* Idle loop */
+                *(uint32_t*)(vf->ram + ss + si) = 0xEE070F90; si += 4; /* WFI */
+                *(uint32_t*)(vf->ram + ss + si) = 0xEAFFFFFD; si += 4; /* B WFI */
+                /* Data pool (dp[0..3]) */
+                *(uint32_t*)(vf->ram + ss + si) = 0x10C08000; si += 4; /* dp[0] TTB */
+                *(uint32_t*)(vf->ram + ss + si) = 0x0000507D; si += 4; /* dp[1] CP15 C1 bits */
+                *(uint32_t*)(vf->ram + ss + si) = 0x90010000; si += 4; /* dp[2] SP804 */
+                *(uint32_t*)(vf->ram + ss + si) = 0xDC000000; si += 4; /* dp[3] VIC */
+
+                /* Patch BOOT.BIN[0x20] = callback address.
+                 * Change from 0x1880 (ROM reboot) to our scheduler stub.
+                 * BOOT entry at 0x10C0017C loads [0x10C00020] as target. */
+                uint32_t sched_va = 0x1000FF00; /* VA of scheduler stub */
+                *(uint32_t*)(vf->ram + 0xC00020) = sched_va;
+                printf("[REBOOT] Patched BOOT callback: 0x1880 → 0x%08X\n", sched_va);
+
+                /* Warm boot entry = jump to BOOT.BIN entry (second run) */
+                uint32_t wb = 0xFFC8;
+                *(uint32_t*)(vf->ram + wb + 0) = 0xE51FF004; /* LDR PC,[PC,-#4] */
+                *(uint32_t*)(vf->ram + wb + 4) = 0x10C00010; /* BOOT.BIN entry */
+
+                /* Write IRQ handler at RAM[0xFF98] — this is where the ROM's
+                 * vector table dispatches IRQs (ROM[0xD44] = 0x1000FF98).
+                 * Handler: save regs, clear timer IRQ, restore, return. */
+                {
+                    uint32_t ih = 0xFF98;
+                    int ii = 0;
+                    /* PUSH {R0-R3,R12,LR} */
+                    *(uint32_t*)(vf->ram + ih + ii) = 0xE92D500F; ii += 4;
+                    /* LDR R0, [PC, #12] → timer IntClr addr at +24
+                     * PC at +4 execute = +12, target at +24, offset=12 */
+                    *(uint32_t*)(vf->ram + ih + ii) = 0xE59F000C; ii += 4;
+                    /* MOV R1, #1 */
+                    *(uint32_t*)(vf->ram + ih + ii) = 0xE3A01001; ii += 4;
+                    /* STR R1, [R0] → clear timer IRQ */
+                    *(uint32_t*)(vf->ram + ih + ii) = 0xE5801000; ii += 4;
+                    /* POP {R0-R3,R12,LR} */
+                    *(uint32_t*)(vf->ram + ih + ii) = 0xE8BD500F; ii += 4;
+                    /* SUBS PC, LR, #4 → return from IRQ */
+                    *(uint32_t*)(vf->ram + ih + ii) = 0xE25EF004; ii += 4;
+                    /* Data: SP804 timer IntClr = 0x9001000C */
+                    *(uint32_t*)(vf->ram + ih + ii) = 0x9001000C; ii += 4;
+                    printf("[REBOOT] IRQ handler at RAM[0xFF98] (timer clear + return)\n");
+                }
+
+                /* DON'T enable timer here — it would fire during BOOT.BIN
+                 * init (second run) while MMU is off. Timer will be enabled
+                 * when the scheduler stub at 0xFF00 actually runs. */
+                vf->timer.timer[0].ctrl = 0;  /* disable timer */
+                vf->timer.irq.enable = 0;     /* disable all IRQs */
 
                 /* Set warm boot flag and restart from ROM */
                 vf->misc_regs[0x0C >> 2] |= 0x02;
@@ -2034,9 +2102,12 @@ void vflash_run_frame(VFlash *vf) {
     /* No remap disable needed — flash reads always from ROM. */
 
     if ((vf->frame_count % 10) == 0) {
-        printf("[Frame %lu] PC=0x%08X CPSR=0x%08X R7=0x%08X R8=0x%08X R9=0x%08X\n",
+        printf("[Frame %lu] PC=0x%08X CPSR=0x%08X R7=0x%08X R8=0x%08X R9=0x%08X"
+               " T0:load=%u ctrl=0x%X cnt=%u IRQen=0x%X IRQst=0x%X\n",
                 (unsigned long)vf->frame_count, vf->cpu.r[15],
-                vf->cpu.cpsr, vf->cpu.r[7], vf->cpu.r[8], vf->cpu.r[9]);
+                vf->cpu.cpsr, vf->cpu.r[7], vf->cpu.r[8], vf->cpu.r[9],
+                vf->timer.timer[0].load, vf->timer.timer[0].ctrl,
+                vf->timer.timer[0].count, vf->timer.irq.enable, vf->timer.irq.status);
     }
     /* Fix task table pointer if it's garbage (contains ROM code instead of pointer) */
     if (vf->frame_count == 2 && vf->has_rom) {
