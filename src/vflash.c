@@ -570,36 +570,9 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                             /* Install HLE vector table + IRQ handler.
                              * ROM BL init may not install them in normal mode
                              * due to flash remap hybrid code path differences. */
-                            {
-                                /* Write vector table: LDR PC,[PC,#0x70] at 0x00-0x1C */
-                                for (int v = 0; v < 8; v++)
-                                    *(uint32_t*)(vf->ram + v * 4) = 0xE59FF070u;
-                                /* Handler addresses at 0x78-0x9C */
-                                uint32_t h = 0x1A00; /* IRQ handler location */
-                                *(uint32_t*)(vf->ram + 0x90) = 0x10000000 + h; /* IRQ */
-                                *(uint32_t*)(vf->ram + 0x78) = 0x10001BB4u; /* reset */
-                                *(uint32_t*)(vf->ram + 0x7C) = 0x10001C00u; /* undef */
-                                *(uint32_t*)(vf->ram + 0x80) = 0x1000192Cu; /* swi */
-                                *(uint32_t*)(vf->ram + 0x84) = 0x1000194Cu; /* pabt */
-                                *(uint32_t*)(vf->ram + 0x88) = 0x10001974u; /* dabt */
-                                *(uint32_t*)(vf->ram + 0x94) = 0x10001A40u; /* fiq */
-
-                                /* Install minimal IRQ handler at RAM[h].
-                                 * Force-overwrite even if BL init wrote something —
-                                 * the init handler depends on uninitialized data. */
-                                {
-                                *(uint32_t*)(vf->ram + h +  0) = 0xE24EE004u; /* SUB LR,LR,#4 */
-                                *(uint32_t*)(vf->ram + h +  4) = 0xE92D500Fu; /* STMFD SP!,{R0-R3,R12,LR} */
-                                *(uint32_t*)(vf->ram + h +  8) = 0xE59F0010u; /* LDR R0,[PC,#16] */
-                                *(uint32_t*)(vf->ram + h + 12) = 0xE5901000u; /* LDR R1,[R0] (read IRQ status) */
-                                *(uint32_t*)(vf->ram + h + 16) = 0xE59F0008u; /* LDR R0,[PC,#8] */
-                                *(uint32_t*)(vf->ram + h + 20) = 0xE5801000u; /* STR R1,[R0] (clear IRQ) */
-                                *(uint32_t*)(vf->ram + h + 24) = 0xE8FD500Fu; /* LDMFD SP!,{R0-R3,R12,PC}^ */
-                                *(uint32_t*)(vf->ram + h + 28) = 0x80000000u; /* IRQ status addr */
-                                *(uint32_t*)(vf->ram + h + 32) = 0x80000008u; /* IRQ clear addr */
-                                printf("[DMA] Installed HLE vector table + IRQ handler\n");
-                            }
-                            }
+                            /* Don't overwrite vectors — let BL init set them.
+                             * With pure ROM remap, BL #1 installs proper handlers. */
+                            printf("[DMA] Using ROM-installed vectors and handlers\n");
                         }
                     }
                     break;
@@ -1617,9 +1590,18 @@ void vflash_run_frame(VFlash *vf) {
     }
 
     if ((vf->frame_count % 60) == 0) {
-        printf("[Frame %lu] PC=0x%08X CPSR=0x%08X SP=0x%08X\n",
+        printf("[Frame %lu] PC=0x%08X CPSR=0x%08X SP=0x%08X LR=0x%08X\n",
                 (unsigned long)vf->frame_count, vf->cpu.r[15],
-                vf->cpu.cpsr, vf->cpu.r[13]);
+                vf->cpu.cpsr, vf->cpu.r[13], vf->cpu.r[14]);
+    }
+    /* One-shot: dump IRQ handler context on frame 3 */
+    if (vf->frame_count == 3 && vf->has_rom) {
+        printf("[IRQ-TRACE] Handler call target (BL from 0x1A10):\n");
+        for (int i = 0; i < 16; i++) {
+            uint32_t off = 0xEC0 + i * 4;
+            uint32_t v = *(uint32_t*)(vf->ram + off);
+            printf("  RAM[0x%04X] = 0x%08X\n", off, v);
+        }
     }
 
     vf->frame_count++;
