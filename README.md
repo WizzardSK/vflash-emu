@@ -165,11 +165,32 @@ The ZEVIO SoC flash controller maps boot ROM at `0xB8000000`. A remap register a
 | `0x900A000C` | Boot status (bit1: 0=cold boot, 1=warm boot) |
 | `0x900B0014` | PLL lock status (bit0: 1=locked) |
 
+### I/O register map (discovered)
+
+| Address | Function |
+|---------|----------|
+| `0x80000000` | Primary IRQ controller (status, enable, clear) |
+| `0x80002000` | Video DMA (framebuffer, JPEG decode) |
+| `0x80003000` | Audio DMA |
+| `0x80004000` | GPIO / buttons |
+| `0x80005000` | UART (TX→stderr) |
+| `0x8FFF0000` | Flash/memory DMA controller |
+| `0x90010000` | ZEVIO Timer A (ctrl at +0x38, status at +0x84) |
+| `0x900A0000` | System control (boot status, config) |
+| `0x900B0000` | PLL controller (lock status at +0x14) |
+| `0x900C0000` | ZEVIO Timer B |
+| `0xAA000000` | ATAPI CD-ROM controller (Sony CXD3059AR) |
+| `0xB8000000` | Boot ROM / Flash controller (remap at +0x800) |
+| `0xDC000000` | Secondary IRQ controller (VIC) |
+
 ## Current status
 
-- **Boot ROM loads and runs** — passes through hardware init, flash remap, timer/IRQ setup
-- **No video output yet** — ROM boot sequence still in early phase, hasn't loaded BOOT.BIN from disc
-- I/O register map is partially implemented; more stubs needed for ROM to complete boot
+- **Boot ROM loads and runs** — full cold boot: system control, PLL, flash remap, BL #1-#7 init, DMA
+- **BOOT.BIN loaded from CD** — via HLE DMA into RAM at load address (0x10C00000)
+- **µMORE RTOS init runs** — mode stacks (SVC/UND/ABT/IRQ/FIQ), page table, MMU enabled
+- **Timer IRQ fires** — one per frame via force-enabled CPSR
+- **SDL window opens** — but framebuffer empty (no video DMA writes yet)
+- **Blocking issue** — IRQ handler not installed by ROM init; exception handlers at 0x1000199C are empty
 - 6 games extracted and analyzed; all share identical 48KB µMORE init code
 
 ## Notes

@@ -571,10 +571,37 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                             /* Don't force CPSR here — too early, IRQ SP not set.
                              * IRQ enable happens in run_frame after init settles. */
                             printf("[DMA] Force-enabled timer0 + IRQ controller\n");
-                            /* Debug: check if IRQ handler was installed */
-                            uint32_t irq_code = *(uint32_t*)(vf->ram + 0x199C);
-                            printf("[DMA] IRQ handler at RAM[0x199C] = 0x%08X %s\n",
-                                   irq_code, irq_code ? "(installed)" : "(EMPTY!)");
+                            /* Install HLE vector table + IRQ handler.
+                             * ROM BL init may not install them in normal mode
+                             * due to flash remap hybrid code path differences. */
+                            {
+                                /* Write vector table: LDR PC,[PC,#0x70] at 0x00-0x1C */
+                                for (int v = 0; v < 8; v++)
+                                    *(uint32_t*)(vf->ram + v * 4) = 0xE59FF070u;
+                                /* Handler addresses at 0x78-0x9C */
+                                uint32_t h = 0x1A00; /* IRQ handler location */
+                                *(uint32_t*)(vf->ram + 0x90) = 0x10000000 + h; /* IRQ */
+                                *(uint32_t*)(vf->ram + 0x78) = 0x10001BB4u; /* reset */
+                                *(uint32_t*)(vf->ram + 0x7C) = 0x10001C00u; /* undef */
+                                *(uint32_t*)(vf->ram + 0x80) = 0x1000192Cu; /* swi */
+                                *(uint32_t*)(vf->ram + 0x84) = 0x1000194Cu; /* pabt */
+                                *(uint32_t*)(vf->ram + 0x88) = 0x10001974u; /* dabt */
+                                *(uint32_t*)(vf->ram + 0x94) = 0x10001A40u; /* fiq */
+
+                                /* Install minimal IRQ handler at RAM[h] */
+                                if (*(uint32_t*)(vf->ram + h) == 0) {
+                                *(uint32_t*)(vf->ram + h +  0) = 0xE24EE004u; /* SUB LR,LR,#4 */
+                                *(uint32_t*)(vf->ram + h +  4) = 0xE92D500Fu; /* STMFD SP!,{R0-R3,R12,LR} */
+                                *(uint32_t*)(vf->ram + h +  8) = 0xE59F0010u; /* LDR R0,[PC,#16] */
+                                *(uint32_t*)(vf->ram + h + 12) = 0xE5901000u; /* LDR R1,[R0] (read IRQ status) */
+                                *(uint32_t*)(vf->ram + h + 16) = 0xE59F0008u; /* LDR R0,[PC,#8] */
+                                *(uint32_t*)(vf->ram + h + 20) = 0xE5801000u; /* STR R1,[R0] (clear IRQ) */
+                                *(uint32_t*)(vf->ram + h + 24) = 0xE8FD500Fu; /* LDMFD SP!,{R0-R3,R12,PC}^ */
+                                *(uint32_t*)(vf->ram + h + 28) = 0x80000000u; /* IRQ status addr */
+                                *(uint32_t*)(vf->ram + h + 32) = 0x80000008u; /* IRQ clear addr */
+                                printf("[DMA] Installed HLE vector table + IRQ handler\n");
+                            }
+                            }
                         }
                     }
                     break;
