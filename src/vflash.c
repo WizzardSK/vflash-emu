@@ -289,20 +289,16 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                     return *(uint32_t*)(vf->rom + foff);
                 return 0;
             }
-            /* Flash window at 0xB8000800+N */
+            /* Flash window at 0xB8000800+N.
+             * Always read from flash_buf (ROM init code), NOT from RAM.
+             * The remap only controls where the DMA flush copies data to.
+             * The SDRAM calibration test writes patterns to RAM[0x10000000+]
+             * which overlaps with the flushed area — reading from RAM here
+             * would return corrupted data (test patterns instead of code). */
             uint32_t boff = foff - 0x800;
-            if (vf->flash_remap) {
-                /* After remap: read from RAM[remap+N] (buffer was flushed there) */
-                uint32_t remap_off = vf->flash_remap + boff;
-                if (remap_off + 3 < VFLASH_RAM_SIZE) {
-                    uint32_t val = *(uint32_t*)(vf->ram + remap_off);
-                    return val;
-                }
-                return 0;
-            }
-            /* Before remap: return buffered data or ROM */
             if (vf->flash_buf_dirty && boff + 3 < sizeof(vf->flash_buf))
                 return *(uint32_t*)(vf->flash_buf + boff);
+            /* Fallback: ROM data */
             if (foff < vf->rom_size)
                 return *(uint32_t*)(vf->rom + foff);
             return 0;
@@ -687,10 +683,12 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                 case 0x00: vf->dma_param_a = val; break;
                 case 0x04: vf->dma_param_b = val; break;
                 case 0x08:
-                    /* DMA enable — trigger CD-ROM sector read into RAM.
-                     * Params: A = LBA start, B = sector count, C = dest/config
-                     * First call loads BOOT.BIN, subsequent calls load game data. */
-                    if (val == 1 && vf->cd && vf->cd->is_open) {
+                    /* DMA enable — HLE only: trigger BOOT.BIN load from disc.
+                     * In ROM boot mode, 0x8FFF0008 is the real SDRAM controller
+                     * and writes here are SDRAM calibration config — NOT DMA.
+                     * Loading BOOT.BIN here would overwrite the memory test area
+                     * and cause calibration to always fail (R8=0). */
+                    if (val == 1 && !vf->has_rom && vf->cd && vf->cd->is_open) {
                         static int dma_call = 0;
                         dma_call++;
                         /* DMA at 0x8FFF is likely NOT CD-ROM but memory/flash DMA.
