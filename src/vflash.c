@@ -356,13 +356,24 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
-        /* Timer A at 0x90010000 (off = 0x10010000) */
-        if (off >= 0x10010000u && off < 0x10010100u)
-            return ztimer_read(&vf->timer, 0x100 + (off - 0x10010000u));
+        /* ZEVIO Timer A at 0x90010000 (off = 0x10010000) */
+        if (off >= 0x10010000u && off < 0x10011000u) {
+            uint32_t treg = off - 0x10010000u;
+            switch (treg) {
+                case 0x84: /* Status: return IRQ pending flag */
+                    return vf->timer.timer[0].irq_pending ? 1 : 0;
+                default: return 0;
+            }
+        }
 
-        /* Timer B at 0x900C0000 (off = 0x100C0000) */
-        if (off >= 0x100C0000u && off < 0x100C0100u)
-            return ztimer_read(&vf->timer, 0x120 + (off - 0x100C0000u));
+        /* ZEVIO Timer B at 0x900C0000 (off = 0x100C0000) */
+        if (off >= 0x100C0000u && off < 0x100C1000u) {
+            uint32_t treg = off - 0x100C0000u;
+            switch (treg) {
+                case 0x84: return vf->timer.timer[1].irq_pending ? 1 : 0;
+                default: return 0;
+            }
+        }
 
         /* System control at 0x900A0000-0x900BFFFF (off = 0x100A0000-0x100BFFFF) */
         if (off >= 0x100A0000u && off < 0x100C0000u) {
@@ -466,14 +477,37 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
             return;
         }
 
-        /* Timer A write at 0x90010000 */
-        if (off >= 0x10010000u && off < 0x10010100u) {
-            ztimer_write(&vf->timer, 0x100 + (off - 0x10010000u), val);
+        /* ZEVIO Timer A write at 0x90010000 */
+        if (off >= 0x10010000u && off < 0x10011000u) {
+            uint32_t treg = off - 0x10010000u;
+            if (treg == 0x38) {
+                /* Timer control register: last write enables timer.
+                 * Bit 0 = enable. Value contains prescaler+config.
+                 * Use our ztimer with extracted parameters. */
+                Timer *t = &vf->timer.timer[0];
+                if (val & 1) {
+                    if (!t->load) t->load = 150000; /* 1ms default */
+                    t->count = t->load;
+                    t->ctrl = 0x77; /* enable+periodic+IRQ */
+                } else {
+                    t->ctrl = 0;
+                }
+            }
             return;
         }
-        /* Timer B write at 0x900C0000 */
-        if (off >= 0x100C0000u && off < 0x100C0100u) {
-            ztimer_write(&vf->timer, 0x120 + (off - 0x100C0000u), val);
+        /* ZEVIO Timer B write at 0x900C0000 */
+        if (off >= 0x100C0000u && off < 0x100C1000u) {
+            uint32_t treg = off - 0x100C0000u;
+            if (treg == 0x38) {
+                Timer *t = &vf->timer.timer[1];
+                if (val & 1) {
+                    if (!t->load) t->load = 150000;
+                    t->count = t->load;
+                    t->ctrl = 0x77;
+                } else {
+                    t->ctrl = 0;
+                }
+            }
             return;
         }
 
@@ -1522,9 +1556,14 @@ void vflash_run_frame(VFlash *vf) {
          * Also ensure IRQ mode SP is valid before first IRQ fires.
          * ROM BL #1 normally sets IRQ SP but self-modified code skips it. */
         if (vf->has_rom && vf->cpu.cycles > 1250000 && (vf->cpu.cpsr & 0x80)) {
-            /* Set IRQ SP if not yet set (check for suspicious values) */
+            static int irq_forced = 0;
+            if (!irq_forced) {
+                printf("[IRQ] Force-enabling IRQ at cycle %llu, PC=0x%08X, SP_irq=0x%08X\n",
+                       (unsigned long long)vf->cpu.cycles, vf->cpu.r[15], vf->cpu.r13_irq);
+                irq_forced = 1;
+            }
             if (vf->cpu.r13_irq == 0 || vf->cpu.r13_irq > 0xF0000000u)
-                vf->cpu.r13_irq = 0x10800000;  /* Safe IRQ stack in high RAM */
+                vf->cpu.r13_irq = 0x10800000;
             vf->cpu.cpsr &= ~0x80u;
         }
 
