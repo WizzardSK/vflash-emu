@@ -14,7 +14,16 @@ No other emulator exists for this system.
 | Audio | PCM WAV (.snd) |
 | OS | µMORE v4.0 RTOS (on-disc per game, no boot ROM needed) |
 
+## Screenshot
+
+![V.Flash Emulator — The Incredibles](screenshot.png)
+
+*The Incredibles: Mission Incredible — first decoded video frame displayed in the emulator*
+
 ## Status
+
+**Video output working** — all 5 available games display graphics (first MJP video frame).
+Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles.
 
 ### CPU — ARM926EJ-S (ARMv5TE)
 - Full ARM32 and Thumb instruction sets
@@ -37,10 +46,23 @@ After MMU init, µMORE remaps virtual address 0 → SDRAM (same as TI-Nspire `IN
 - L1 section (1MB) and coarse page table (4KB/64KB pages)
 - Automatically enabled when game code sets CP15 control register
 
+### ATAPI CD-ROM Controller
+- Full PACKET command protocol at `0xAA000000` (Sony CXD3059AR compatible)
+- Commands: INQUIRY, IDENTIFY PACKET DEVICE, READ(10), READ CD, READ TOC, READ CAPACITY, TEST UNIT READY, REQUEST SENSE, MODE SENSE, PREVENT/ALLOW MEDIUM REMOVAL
+- Data transfer via 16-bit and 32-bit data ports
+- ZEVIO IDE wrapper registers for DMA and interrupt control
+
+### Video — MJP (Motion JPEG)
+- MIAV container parser with interleaved audio/video chunks (`00dc`, `01wb`, `02wb`)
+- 16-bit byte-swap decoder (V.Flash DMA stores JPEG in swapped byte order)
+- Automatic byte-stuffing restoration (hardware encoder omits JPEG FF 00 stuffing)
+- SOS-only P-frame support (subsequent frames reuse I-frame's DHT/DQT tables)
+- libjpeg-based decode with partial frame tolerance
+
 ### Other subsystems
 - ISO 9660 with full subdirectory traversal and recursive disc-wide search
 - BIN/CUE disc image support (auto-detects raw 2352-byte sectors vs 2048-byte ISO)
-- Motion JPEG decoding (libjpeg), `.ptx` bitmap auto-detection
+- `.ptx` raw bitmap auto-detection
 - V.Flash BOOT format parser (magic, load address, entry point, REL table)
 - HLE boot: scans disc for `BOOT.BIN`/`GAME/BOOT.BIN`/etc., detects ELF / V.Flash BOOT / raw ARM
 - SDL2 display + audio output
@@ -131,25 +153,29 @@ V.Flash game discs contain a `BOOT.BIN` with a custom header:
 | 0x10 | 4 | `LDR PC,[PC,#-4]` trampoline |
 | 0x14 | 4 | Real entry point address |
 | 0x18 | 4 | `"REL\0"` relocation marker |
-| 0x1C | 4 | Relocation table address |
-| 0x20 | 4 | Relocation table size |
+| 0x1C | 4 | Pointer to callback address slot (→ offset 0x20) |
+| 0x20 | 4 | ROM callback address (0x1880 = PLL/reboot) |
 
-The entire file is loaded at the specified load address. The entry point trampoline at offset 0x10 jumps to the real init code. REL table processing is not yet implemented.
+The entire file is loaded at the specified load address. The entry point trampoline at offset 0x10 jumps to the real init code. After three init functions, BOOT.BIN calls the ROM callback at `[0x20]` which triggers a warm reboot on first run.
 
 ## Boot ROM
 
 The emulator supports real boot ROM (`70004.bin`, 2MB) from V.Flash/V.Smile Pro hardware. Place it in the working directory or alongside game disc images.
 
-With boot ROM present, the emulator performs a real hardware boot sequence instead of HLE:
+With boot ROM present, the emulator performs a real hardware boot sequence:
 1. ARM reset → PC=0, ROM executes from physical address 0
 2. System control config (PLL lock, clock setup via 0x900B0000)
-3. ROM copies init code to SDRAM via NOR flash controller DMA
-4. BL #1-#7 init functions: timer, IRQ, mode stacks, vector table
-5. SDRAM controller (0x8FFF0000) triggers BOOT.BIN load from CD
-6. MMU enabled → virtual address 0 remapped to SDRAM
-7. µMORE RTOS scheduler starts → game task dispatch
+3. ROM copies init code to SDRAM via NOR flash controller DMA (0xB8000800+)
+4. SDRAM calibration (71-entry table, patched for speed in emulation)
+5. BOOT.BIN pre-loaded to RAM[0xC00000] (bypasses ATAPI during early boot)
+6. UNDEF trap at ROM 0xA9D80 → recovery redirects to BOOT.BIN entry
+7. BOOT.BIN init: disable IRQs → 3 init functions → enable MMU (TTB=0x10C08000) → callback
+8. ROM callback at 0x1880 → warm reboot (sets 0x900A000C bit1)
+9. ROM warm path → PLL init → jump to RAM[0xFFC8] (µMORE idle loop)
+10. IRQ enabled → SP804 timer fires → µMORE IRQ handler at 0x100873D0
+11. **First MJP frame decoded from disc and displayed**
 
-Without boot ROM, HLE boot is used (limited — µMORE RTOS not fully functional).
+Without boot ROM, HLE boot is used (limited — loads BOOT.BIN directly, µMORE partially functional).
 
 ### Boot memory model
 
@@ -186,7 +212,7 @@ The V.Flash uses the same LSI Logic ZEVIO SoC as the TI-Nspire calculator. All p
 | `0x900D0000` | Second Timer | ARM SP804 (32 kHz) |
 | `0x900E0000` | Keypad Controller | |
 | `0x90110000` | LED Control | |
-| `0xAA000000` | ATAPI CD-ROM | Sony CXD3059AR |
+| `0xAA000000` | ATAPI CD-ROM | Sony CXD3059AR (emulated) |
 | `0xB0000000` | USB OTG Controller | ChipIdea |
 | `0xB8000000` | NOR Flash Controller | DMA to RAM |
 | `0xC0000000` | LCD Controller | ARM PL111 |
@@ -219,27 +245,42 @@ Standard ARM dual-timer. Two timers per block at offsets +0x00 and +0x20:
 
 ## Current status
 
-### HLE boot (without boot ROM)
-- **BOOT.BIN loads and runs** — V.Flash BOOT format parser, auto-detection
-- **ROM stub at 0x1880** — all 6 games call ROM function at addr 0x1880 for PLL/SDRAM config; HLE stub enables IRQs + WFI loop
-- **Three init functions execute** — 0x10C04368, 0x10C044A0, 0x10C043A0 set up µMORE internal state
-- **MMU ENABLED** — init code builds page tables at TTB=0x10C08000 and enables MMU
-- **SP804 timer pre-configured** — 60Hz periodic IRQ via PL190 VIC
-- **Blocking**: IRQ handler dispatch after MMU enable — vector table at VA 0x18 needs correct handler
-
-### Boot ROM mode
-- **Boot ROM boots** — cold boot → PLL lock → flash DMA → BL init functions
-- **Flash controller model** — ROM copy loop writes to 0xB8000800+ window, remap triggers DMA to RAM
-- **SDRAM calibration** — 71×71 iteration loop (very slow in emulation, patched for speed)
-- **Blocking**: calibration loop prevents reaching µMORE scheduler
-
-### Common
+### What works
+- **Video output** — first MJP video frame decoded and displayed for all 5 tested games
+- **ATAPI CD-ROM** — full PACKET command protocol, reads sectors from disc image
+- **Boot ROM mode** — cold boot → flash DMA → SDRAM calibration → MMU enable → BOOT.BIN load → µMORE init → warm reboot → IRQ-driven idle
+- **µMORE RTOS init** — exception vectors installed at RAM[0xFF80-0xFFE4], IRQ handler at 0x100873D0
+- **MJP video decode** — MIAV container parse, 16-bit byte-swap, byte-stuffing restore, libjpeg decode
 - **MMU translation** — L1 section + L2 coarse page table walk, VA→PA for all accesses
-- **APB peripherals** — GPIO, PL011 UART, SP805 watchdog, PL031 RTC, PMU (read/write)
-- **SP804 timer** — proper ARM dual-timer, periodic IRQ via PL190 VIC
-- **SDL window opens** — black (no video writes yet)
-- 6 games extracted and analyzed; all share identical load addr (0x10C00000), ROM callback (0x1880), entry (0x10C0011C)
-- LCD controller (PL111 at `0xC0000000`) not yet implemented
+- **SP804 timer** — periodic 60Hz IRQ via PL190 VIC, drives µMORE scheduler
+- **APB peripherals** — GPIO, PL011 UART, SP805 watchdog, PL031 RTC, PMU
+- 6 games extracted and analyzed; all share identical load addr (0x10C00000), ROM callback (0x1880)
+
+### What doesn't work yet
+- **Game code execution** — µMORE scheduler enters idle loop, game tasks not yet loaded via ATAPI
+- **LCD controller** (PL111 at `0xC0000000`) — not implemented; video uses DMA blit path
+- **Audio playback** — PCM WAV (.snd) not decoded from disc
+- **PTX static images** — decoder exists but not integrated into boot display
+
+## MJP video format
+
+V.Flash games use a custom MIAV (Motion Interleaved Audio/Video) container with JPEG frames:
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0x00 | 4 | `"MIAV"` magic |
+| 0x40 | 4 | Chunk tag: `"00dc"` (video), `"01wb"` / `"02wb"` (audio) |
+| 0x44 | 4 | Flags (0=I-frame, 1=P-frame) |
+| 0x48 | 4 | Data size (bytes) |
+| 0x4C | N | JPEG data (16-bit byte-swapped) |
+
+Key discoveries:
+- JPEG data is stored with **16-bit pair-swapped byte order** (ZEVIO SoC DMA artifact)
+- The hardware JPEG encoder **omits byte-stuffing** (FF 00 sequences in entropy coded data)
+- After pair-swap, byte-stuffing must be re-inserted before standard JPEG decoders can parse it
+- First frame (I-frame) contains full JPEG headers (SOI, DQT, DHT, SOF0, SOS)
+- Subsequent frames (P-frames) contain only SOS + entropy data, reusing I-frame tables
+- Audio/video chunks are interleaved: `00dc` → `01wb` → `02wb` → `00dc` → ...
 
 ## Notes
 
