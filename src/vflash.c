@@ -1464,36 +1464,45 @@ static int vflash_hle_boot(VFlash *vf) {
                      * The WFI + branch loop must be robust: IRQ returns to
                      * LR_irq-4 which should land back in the loop.
                      * Layout: config code, then NOP sled + branch back. */
-                    /* Stub layout at 0x1880:
-                     * +00: LDR R4, [PC, #+0x28]  → data at +30 = 0x900B0000
-                     * +04: MOV R5, #3
-                     * +08: STR R5, [R4]           ; write PLL config
-                     * +0C: MRS R0, CPSR
-                     * +10: BIC R0, R0, #0xC0      ; enable IRQ+FIQ
-                     * +14: MSR CPSR_c, R0
-                     * +18: NOP (idle loop)         ← IRQ returns here
+                    /* ROM stub at 0x1880:
+                     * 1. Enable IRQs
+                     * 2. Call VIC/task init at load_addr+0xC4A4 (programs VIC from task table)
+                     * 3. Idle loop with timer IRQ handling
+                     *
+                     * +00: MRS R0, CPSR
+                     * +04: BIC R0, R0, #0xC0       ; enable IRQ+FIQ
+                     * +08: MSR CPSR_c, R0
+                     * +0C: LDR LR, [PC, #+0x1C]    ; LR = idle_loop addr (+18)
+                     * +10: LDR PC, [PC, #+0x1C]    ; jump to VIC init
+                     * +14: NOP
+                     * +18: NOP (idle loop start)
                      * +1C: NOP
                      * +20: NOP
                      * +24: NOP
-                     * +28: B +18                   ; loop back
-                     * +2C: NOP (landing pad)
-                     * +30: 0x900B0000 (data pool)
+                     * +28: B +18
+                     * +2C: NOP
+                     * +30: idle_loop addr (0x1898)  ; data for LR load
+                     * +34: VIC init addr            ; data for PC load
                      */
+                    uint32_t idle_loop = 0x1898;
+                    uint32_t vic_init = load_addr + 0xC4A4;
                     uint32_t stub[] = {
-                        0xE59F4028,   /* +00: LDR R4, [PC, #+0x28] → [0x1880+8+0x28=0x18B0] */
-                        0xE3A05003,   /* +04: MOV R5, #3 */
-                        0xE5845000,   /* +08: STR R5, [R4] */
-                        0xE10F0000,   /* +0C: MRS R0, CPSR */
-                        0xE3C000C0,   /* +10: BIC R0, R0, #0xC0 */
-                        0xE121F000,   /* +14: MSR CPSR_c, R0 (enable IRQ+FIQ) */
-                        0xE1A00000,   /* +18: NOP (idle loop start) */
+                        0xE10F0000,   /* +00: MRS R0, CPSR */
+                        0xE3C000C0,   /* +04: BIC R0, R0, #0xC0 */
+                        0xE121F000,   /* +08: MSR CPSR_c, R0 */
+                        0xE59FE01C,   /* +0C: LDR LR, [PC, #+0x1C] → +30 */
+                        0xE59FF01C,   /* +10: LDR PC, [PC, #+0x1C] → +34 */
+                        0xE1A00000,   /* +14: NOP */
+                        0xE1A00000,   /* +18: NOP (idle loop) */
                         0xE1A00000,   /* +1C: NOP */
                         0xE1A00000,   /* +20: NOP */
                         0xE1A00000,   /* +24: NOP */
-                        0xEAFFFFFA,   /* +28: B -6 → +18 (0x1880+0x28+8-24=0x1898=+18) */
-                        0xE1A00000,   /* +2C: NOP (landing pad) */
-                        0x900B0000,   /* +30: data: PMU address */
+                        0xEAFFFFFA,   /* +28: B -6 → +18 */
+                        0xE1A00000,   /* +2C: NOP */
+                        idle_loop,    /* +30: data: idle loop addr */
+                        vic_init,     /* +34: data: VIC init addr */
                     };
+                    for (int i = 0; i < 14; i++)
                     for (int i = 0; i < 13; i++)
                         *(uint32_t*)(vf->ram + 0x1880 + i * 4) = stub[i];
                     printf("[HLE] Installed ROM stub at 0x1880 (PLL config + IRQ enable + WFI)\n");
