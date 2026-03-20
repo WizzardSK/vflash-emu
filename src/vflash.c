@@ -126,6 +126,7 @@ struct VFlash {
     int       debug;
     int       has_rom;    /* 1 if boot ROM loaded (real boot, no HLE) */
     uint32_t  flash_remap; /* Flash controller: remap address at 0xB8000800 */
+    uint32_t  dma_param_a, dma_param_b, dma_param_c;
     uint64_t  frame_count;
 
     VideoRegs vid;
@@ -253,10 +254,13 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
             uint32_t foff = off - 0x38000000u;
             if (foff >= 0x800 && vf->flash_remap) {
-                /* Flash remap active */
+                /* Flash remap active: redirect reads to ROM data at
+                 * the remap offset. Use ROM source (not RAM) because
+                 * BL init functions modify RAM but remap should still
+                 * return original ROM code for instruction fetch. */
                 uint32_t remap_off = vf->flash_remap + (foff - 0x800);
-                if (remap_off < VFLASH_RAM_SIZE)
-                    return *(uint32_t*)(vf->ram + remap_off);
+                if (remap_off < vf->rom_size)
+                    return *(uint32_t*)(vf->rom + remap_off);
                 return 0;
             }
             if (foff < vf->rom_size)
@@ -418,6 +422,38 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
         /* Secondary IRQ controller at 0xDC000000 */
         if (off >= 0x5C000000u && off < 0x5C000200u) {
             ztimer_write(&vf->timer, off - 0x5C000000u, val); return;
+        }
+
+        /* DMA controller write at 0x8FFF0000 */
+        if (off >= 0x0FFF0000u && off < 0x0FFF1000u) {
+            uint32_t dreg = off - 0x0FFF0000u;
+            switch (dreg) {
+                case 0x00: vf->dma_param_a = val; break;
+                case 0x04: vf->dma_param_b = val; break;
+                case 0x08:
+                    /* DMA enable — trigger CD-ROM read into RAM.
+                     * ROM writes this after setting params A/B/C.
+                     * HLE: find and load BOOT.BIN from disc to 0x10010000.
+                     * This is where ROM expects the game binary. */
+                    if (val == 1 && vf->cd && vf->cd->is_open) {
+                        CDEntry entry;
+                        if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &entry)) {
+                            uint32_t dest = 0x10000;  /* RAM offset for 0x10010000 */
+                            uint32_t max_sz = VFLASH_RAM_SIZE - dest;
+                            if (entry.size < max_sz) max_sz = entry.size;
+                            uint8_t *buf = vf->ram + dest;
+                            int rd = cdrom_read_file(vf->cd, &entry, buf, 0, max_sz);
+                            printf("[DMA] Loaded BOOT.BIN: %d bytes at RAM[0x%X] (0x%08X)\n",
+                                   rd, dest, VFLASH_RAM_BASE + dest);
+                        } else {
+                            printf("[DMA] BOOT.BIN not found on disc!\n");
+                        }
+                    }
+                    break;
+                case 0x0C: vf->dma_param_c = val; break;
+                case 0x10: break;  /* config */
+            }
+            return;
         }
 
         /* Flash controller write at 0xB8000800 (remap register) */
