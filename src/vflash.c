@@ -1301,15 +1301,32 @@ static void install_vector_table(VFlash *vf) {
 
     for (int i = 0; i < 7; i++) {
         uint32_t base = HLE_STUB_BASE + i * 20;
-        ram_w32(vf, base +  0, 0xE92D400Fu);          /* PUSH {r0-r3,lr} */
-        ram_w32(vf, base +  4, 0xE3A00000u | (uint32_t)i); /* MOV r0,#i */
-        ram_w32(vf, base +  8, 0xE320F000u);          /* NOP */
         if (stubs[i].fatal) {
-            ram_w32(vf, base + 12, 0xEAFFFFFDu);      /* B . (loop) */
-            ram_w32(vf, base + 16, 0xEAFFFFFCu);      /* B . (loop) */
+            /* Fatal: infinite loop */
+            ram_w32(vf, base +  0, 0xEAFFFFFEu);      /* B . (loop) */
+            ram_w32(vf, base +  4, 0xEAFFFFFEu);
+            ram_w32(vf, base +  8, 0xEAFFFFFEu);
+            ram_w32(vf, base + 12, 0xEAFFFFFEu);
+            ram_w32(vf, base + 16, 0xEAFFFFFEu);
+        } else if (i == 5) {
+            /* IRQ: clear SP804 timer interrupt, then return.
+             * LDR R0, [PC, #+8]  → data at base+16 = 0x9001000C
+             * MOV R1, #1
+             * STR R1, [R0]        ; write to SP804 IntClr
+             * SUBS PC, LR, #4    ; return from IRQ
+             * .word 0x9001000C   ; SP804 timer0 IntClr address */
+            ram_w32(vf, base +  0, 0xE59F0008u);      /* LDR R0, [PC, #+8] */
+            ram_w32(vf, base +  4, 0xE3A01001u);      /* MOV R1, #1 */
+            ram_w32(vf, base +  8, 0xE5801000u);      /* STR R1, [R0] */
+            ram_w32(vf, base + 12, 0xE25EF004u);      /* SUBS PC, LR, #4 */
+            ram_w32(vf, base + 16, 0x9001000Cu);      /* data: timer IntClr addr */
         } else {
-            ram_w32(vf, base + 12, 0xE8FD400Fu);      /* POP {r0-r3,pc}^ */
-            ram_w32(vf, base + 16, 0xE320F000u);      /* NOP (padding) */
+            /* SWI/FIQ/RESET: MOVS PC, LR (return from exception) */
+            ram_w32(vf, base +  0, 0xE1B0F00Eu);      /* MOVS PC, LR */
+            ram_w32(vf, base +  4, 0xE1A00000u);      /* NOP */
+            ram_w32(vf, base +  8, 0xE1A00000u);
+            ram_w32(vf, base + 12, 0xE1A00000u);
+            ram_w32(vf, base + 16, 0xE1A00000u);
         }
         (void)stubs[i].name;
     }
@@ -1443,20 +1460,48 @@ static int vflash_hle_boot(VFlash *vf) {
                      *   B    .loop
                      *   .word 0x900B0000          ; data pool
                      */
+                    /* ROM stub at 0x1880: PLL config, enable IRQ, idle loop.
+                     * The WFI + branch loop must be robust: IRQ returns to
+                     * LR_irq-4 which should land back in the loop.
+                     * Layout: config code, then NOP sled + branch back. */
+                    /* Stub layout at 0x1880:
+                     * +00: LDR R4, [PC, #+0x28]  → data at +30 = 0x900B0000
+                     * +04: MOV R5, #3
+                     * +08: STR R5, [R4]           ; write PLL config
+                     * +0C: MRS R0, CPSR
+                     * +10: BIC R0, R0, #0xC0      ; enable IRQ+FIQ
+                     * +14: MSR CPSR_c, R0
+                     * +18: NOP (idle loop)         ← IRQ returns here
+                     * +1C: NOP
+                     * +20: NOP
+                     * +24: NOP
+                     * +28: B +18                   ; loop back
+                     * +2C: NOP (landing pad)
+                     * +30: 0x900B0000 (data pool)
+                     */
                     uint32_t stub[] = {
-                        0xE59F401C,   /* LDR R4, [PC, #+0x1C] → [0x18A4] = 0x900B0000 */
-                        0xE3A05003,   /* MOV R5, #3 */
-                        0xE5845000,   /* STR R5, [R4] */
-                        0xE10F0000,   /* MRS R0, CPSR */
-                        0xE3C000C0,   /* BIC R0, R0, #0xC0 */
-                        0xE121F000,   /* MSR CPSR_c, R0 */
-                        0xEE070F90,   /* MCR p15, 0, R0, c7, c0, 4 (WFI) */
-                        0xEAFFFFFE,   /* B .-4 (loop on WFI) */
-                        0x900B0000,   /* data: PMU address */
+                        0xE59F4028,   /* +00: LDR R4, [PC, #+0x28] → [0x1880+8+0x28=0x18B0] */
+                        0xE3A05003,   /* +04: MOV R5, #3 */
+                        0xE5845000,   /* +08: STR R5, [R4] */
+                        0xE10F0000,   /* +0C: MRS R0, CPSR */
+                        0xE3C000C0,   /* +10: BIC R0, R0, #0xC0 */
+                        0xE121F000,   /* +14: MSR CPSR_c, R0 (enable IRQ+FIQ) */
+                        0xE1A00000,   /* +18: NOP (idle loop start) */
+                        0xE1A00000,   /* +1C: NOP */
+                        0xE1A00000,   /* +20: NOP */
+                        0xE1A00000,   /* +24: NOP */
+                        0xEAFFFFFA,   /* +28: B -6 → +18 (0x1880+0x28+8-24=0x1898=+18) */
+                        0xE1A00000,   /* +2C: NOP (landing pad) */
+                        0x900B0000,   /* +30: data: PMU address */
                     };
-                    for (int i = 0; i < 9; i++)
+                    for (int i = 0; i < 13; i++)
                         *(uint32_t*)(vf->ram + 0x1880 + i * 4) = stub[i];
                     printf("[HLE] Installed ROM stub at 0x1880 (PLL config + IRQ enable + WFI)\n");
+                    /* Verify stub */
+                    for (int si = 0; si < 13; si++) {
+                        printf("[HLE]   [0x%04X] = 0x%08X\n", 0x1880+si*4,
+                               *(uint32_t*)(vf->ram + 0x1880 + si*4));
+                    }
 
                     /* Also set up SP804 timer to fire periodic IRQ.
                      * µMORE scheduler needs timer ticks. */
@@ -1792,10 +1837,22 @@ void vflash_run_frame(VFlash *vf) {
         ztimer_tick(&vf->timer, actual);
         done += (int)actual;
 
-        /* Deliver IRQ if pending, CPSR allows, and remap is off (init done) */
+        /* Deliver IRQ if pending and CPSR allows */
         if (vf->frame_count > 1 && ztimer_irq_pending(&vf->timer)) {
             if (vf->cpu.r13_irq < 0x10000000u || vf->cpu.r13_irq > 0x10FFFFFFu)
                 vf->cpu.r13_irq = 0x10800000;
+            /* Log first IRQ delivery */
+            static int irq_logged = 0;
+            if (!irq_logged) {
+                uint32_t vec_addr = vf->cpu.cp15.hivec ? 0xFFFF0018 : 0x18;
+                uint32_t pa = mmu_translate(vf, vec_addr);
+                uint32_t vec_insn = mem_read32(vf, vec_addr);
+                printf("[IRQ] First IRQ! PC was 0x%08X, vector VA=0x%08X PA=0x%08X insn=0x%08X\n",
+                       vf->cpu.r[15], vec_addr, pa, vec_insn);
+                printf("[IRQ] SP_irq=0x%08X CPSR=0x%08X MMU=%d\n",
+                       vf->cpu.r13_irq, vf->cpu.cpsr, vf->cpu.cp15.mmu_enabled);
+                irq_logged = 1;
+            }
             arm9_irq(&vf->cpu);
         }
     }
