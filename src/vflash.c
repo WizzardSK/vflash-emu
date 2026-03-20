@@ -323,6 +323,19 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
+        /* ATAPI CD-ROM controller at 0xAA000000 (off = 0x2A000000) */
+        if (off >= 0x2A000000u && off < 0x2A001000u) {
+            uint32_t areg = off - 0x2A000000u;
+            switch (areg) {
+                case 0x02: return 0;     /* Sector count */
+                case 0x03: return 0;     /* LBA low */
+                case 0x05: return 0;     /* LBA mid/high */
+                case 0x07: return 0x40;  /* Status: DRDY (drive ready) */
+                case 0x17: return 0x40;  /* Alt status: DRDY */
+                default:   return 0;
+            }
+        }
+
         /* DMA / CD-ROM controller at 0x8FFF0000 (off = 0x0FFF0000) */
         if (off >= 0x0FFF0000u && off < 0x0FFF1000u) {
             uint32_t dreg = off - 0x0FFF0000u;
@@ -432,6 +445,16 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
             ztimer_write(&vf->timer, off - 0x5C000000u, val); return;
         }
 
+        /* ATAPI CD-ROM write at 0xAA000000 */
+        if (off >= 0x2A000000u && off < 0x2A001000u) {
+            uint32_t areg = off - 0x2A000000u;
+            if (areg == 0x07) {
+                /* Command register — ATAPI command issued */
+                printf("[ATAPI] Command: 0x%02X\n", val & 0xFF);
+            }
+            return;
+        }
+
         /* Timer A write at 0x90010000 */
         if (off >= 0x10010000u && off < 0x10010100u) {
             ztimer_write(&vf->timer, 0x100 + (off - 0x10010000u), val);
@@ -454,26 +477,34 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                      * Params: A = LBA start, B = sector count, C = dest/config
                      * First call loads BOOT.BIN, subsequent calls load game data. */
                     if (val == 1 && vf->cd && vf->cd->is_open) {
-                        uint32_t lba = vf->dma_param_a;
-                        uint32_t count = vf->dma_param_b;
                         static int dma_call = 0;
                         dma_call++;
-
-                        /* Read raw CD sectors into RAM at 0x10010000.
-                         * ROM DMA params: A=LBA, B=sector_count.
-                         * Destination is fixed at 0x10010000 (after ROM copy area). */
-                        uint32_t dest = 0x10000;  /* RAM offset for 0x10010000 */
-                        uint32_t bytes = count * 2048;
-                        if (dest + bytes <= VFLASH_RAM_SIZE) {
-                            for (uint32_t i = 0; i < count; i++) {
-                                cdrom_read_sector(vf->cd, lba + i,
-                                    vf->ram + dest + i * 2048);
+                        /* DMA at 0x8FFF is likely NOT CD-ROM but memory/flash DMA.
+                         * HLE: load BOOT.BIN from disc on first call.
+                         * Params A/B/C are flash controller config, not LBA. */
+                        if (dma_call == 1) {
+                            /* Copy full ROM to RAM[0x10000] (0x10010000) and
+                             * also load BOOT.BIN at its load address. ROM expects
+                             * its own code at 0x10010000+ for µMORE init. */
+                            if (vf->rom && vf->rom_size > 0) {
+                                uint32_t dest = 0x10000;
+                                uint32_t sz = vf->rom_size;
+                                if (dest + sz > VFLASH_RAM_SIZE) sz = VFLASH_RAM_SIZE - dest;
+                                memcpy(vf->ram + dest, vf->rom, sz);
+                                printf("[DMA#%d] ROM: %u bytes → RAM[0x%X]\n",
+                                       dma_call, sz, dest);
                             }
-                            printf("[DMA#%d] LBA=%u(%u sectors) → RAM[0x%X] (%u bytes)\n",
-                                   dma_call, lba, count, dest, bytes);
-                        } else {
-                            printf("[DMA#%d] LBA=%u cnt=%u → out of range\n",
-                                   dma_call, lba, count);
+                            /* Also load BOOT.BIN at its load address */
+                            CDEntry entry;
+                            if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &entry)) {
+                                uint32_t dest = 0xC00000;
+                                uint32_t max_sz = VFLASH_RAM_SIZE - dest;
+                                if (entry.size < max_sz) max_sz = entry.size;
+                                int rd = cdrom_read_file(vf->cd, &entry,
+                                    vf->ram + dest, 0, max_sz);
+                                printf("[DMA#%d] BOOT.BIN: %d bytes → RAM[0x%X]\n",
+                                       dma_call, rd, dest);
+                            }
                         }
                     }
                     break;
@@ -1369,10 +1400,10 @@ VFlash* vflash_create(const char *disc_path) {
                 vf->rom = malloc((size_t)rom_sz);
                 vf->rom_size = (uint32_t)rom_sz;
                 fread(vf->rom, 1, (size_t)rom_sz, rom_fp);
-                /* Map first 512KB of ROM at physical address 0 (boot mirror).
-                 * Full 2MB ROM accessible at 0xB8000000 via I/O handler.
-                 * MAME maps only 512KB at address 0 (0x00000000-0x0007FFFF). */
-                uint32_t boot_size = rom_sz < 0x80000 ? (uint32_t)rom_sz : 0x80000;
+                /* Map full ROM at physical address 0 (boot mirror).
+                 * ROM code copies itself to RAM and expects data at 0x10000+.
+                 * Full 2MB also accessible at 0xB8000000 via I/O handler. */
+                uint32_t boot_size = (uint32_t)rom_sz;
                 memcpy(vf->ram, vf->rom, boot_size);
                 printf("[ROM] Loaded boot ROM: %ld bytes (512KB at 0x0, full at 0xB8000000)\n", rom_sz);
                 vf->has_rom = 1;
