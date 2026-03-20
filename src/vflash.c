@@ -125,7 +125,8 @@ struct VFlash {
     uint32_t  input_prev;
     int       debug;
     int       has_rom;    /* 1 if boot ROM loaded (real boot, no HLE) */
-    uint32_t  flash_remap; /* Flash controller: remap address at 0xB8000800 */
+    uint32_t  flash_remap; /* Flash controller: last written value to reg 0x800 */
+    int       boot_remap; /* 1 after system control write remaps addr 0 to SDRAM */
     uint32_t  dma_param_a, dma_param_b, dma_param_c;
     uint64_t  frame_count;
 
@@ -211,12 +212,18 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
 
-    /* RAM mirror at 0x00000000 (aliased from VFLASH_RAM_BASE).
-     * ZEVIO 1020 maps SDRAM at both 0x00000000 and 0x10000000.
-     * This is essential: ARM exception vectors (0x00–0x1C) and
-     * HIVEC vectors (0xFFFF0000+) must be readable from these addresses. */
-    if (addr < VFLASH_RAM_SIZE)
+    /* Address 0: ROM overlay for boot, then SDRAM after remap.
+     * On real HW, system control write to 0x900A0F04 remaps addr 0
+     * from NOR flash to SDRAM. Before remap, reads return ROM content.
+     * After remap, reads return SDRAM (initially zeroed).
+     * We use boot_remap flag to track this transition. */
+    if (addr < VFLASH_RAM_SIZE) {
+        if (!vf->boot_remap && vf->has_rom && addr < vf->rom_size) {
+            /* Before remap: addr 0 = ROM (read-only flash) */
+            return *(uint32_t*)(vf->rom + addr);
+        }
         return *(uint32_t*)(vf->ram + addr);
+    }
 
     /* High vector mirror at 0xFFFF0000–0xFFFFFFFF (ARM HIVEC, CR1.V=1)
      * Mirror the first 64KB of RAM here. The upper bound check is omitted
@@ -276,17 +283,16 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                  * main init can continue past first run (RAM modification). */
                 uint32_t N = foff - 0x800;
                 uint32_t remap_off = vf->flash_remap + N;
-                if (N < 0x98 || (N >= 0x2C0 && N < 0x680)) {
-                    /* Self-modified C code (N<0x98) and BL data pools
-                     * (N=0x2C0-0x67F at ROM[0xBD8-0xD97]) → RAM.
-                     * BL functions modify data pool values during init. */
-                    if (remap_off < VFLASH_RAM_SIZE)
-                        return *(uint32_t*)(vf->ram + remap_off);
-                } else {
-                    /* BL function BODIES → original ROM */
-                    if (remap_off < vf->rom_size)
-                        return *(uint32_t*)(vf->rom + remap_off);
-                }
+                /* NOR flash controller:
+                 * Register 0x00: config register (read returns last written value)
+                 * All other offsets: NOR flash content (ROM data)
+                 * After cold boot, ROM writes 0x118 to reg 0x00, then reads
+                 * it back via LDR → gets 0x118 → MOV PC,0x118 → RAM code. */
+                if (foff == 0x800 && vf->flash_remap)
+                    return vf->flash_remap;  /* Return last written config value */
+                if (foff < vf->rom_size)
+                    return *(uint32_t*)(vf->rom + foff);
+                return 0;
                 return 0;
             }
             if (foff < vf->rom_size)
@@ -621,7 +627,10 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
             uint32_t foff = off - 0x38000000u;
             if (foff == 0x800) {
                 vf->flash_remap = val;
-                printf("[ROM] Flash remap: 0x%08X\n", val);
+                /* After cold boot copy + flash reg write, addr 0 remaps
+                 * from ROM to SDRAM. This happens when ROM writes 0x118. */
+                if (val != 0)
+                    vf->boot_remap = 1;
             }
             return;
         }
@@ -1502,10 +1511,12 @@ VFlash* vflash_create(const char *disc_path) {
                 vf->rom = malloc((size_t)rom_sz);
                 vf->rom_size = (uint32_t)rom_sz;
                 fread(vf->rom, 1, (size_t)rom_sz, rom_fp);
-                /* Map full ROM at physical address 0 (boot mirror).
-                 * ROM code copies itself to RAM and expects data at 0x10000+.
-                 * Full 2MB also accessible at 0xB8000000 via I/O handler. */
-                uint32_t boot_size = (uint32_t)rom_sz;
+                /* DON'T load ROM to RAM[0]! On real HW, addr 0 is ROM (read-only)
+                 * during boot, then remaps to SDRAM (zeroed). Our RAM[0] = SDRAM.
+                 * ROM content is accessible via 0xB8000000 (flash controller).
+                 * Boot code reads from addr 0 (ROM mirror) — we handle this
+                 * by checking if addr < rom_size in mem_read. */
+                uint32_t boot_size = 0; /* Don't copy ROM to RAM */
                 memcpy(vf->ram, vf->rom, boot_size);
                 printf("[ROM] Loaded boot ROM: %ld bytes (512KB at 0x0, full at 0xB8000000)\n", rom_sz);
                 vf->has_rom = 1;
@@ -1601,7 +1612,7 @@ void vflash_run_frame(VFlash *vf) {
         done += (int)actual;
 
         /* Deliver IRQ if pending, CPSR allows, and remap is off (init done) */
-        if (!vf->flash_remap && ztimer_irq_pending(&vf->timer)) {
+        if (vf->frame_count > 1 && ztimer_irq_pending(&vf->timer)) {
             if (vf->cpu.r13_irq < 0x10000000u || vf->cpu.r13_irq > 0x10FFFFFFu)
                 vf->cpu.r13_irq = 0x10800000;
             arm9_irq(&vf->cpu);
@@ -1625,12 +1636,7 @@ void vflash_run_frame(VFlash *vf) {
     /* Patch ROM[0x138] (flash remap LDR PC) to include LR setup.
      * Write BL-equivalent: MOV LR,PC then LDR PC at RAM[0x138-0x13C].
      * This only needs to happen once. */
-    /* Disable flash remap after init completes (frame 1+).
-     * On real HW, CPU runs from RAM after boot, not flash remap. */
-    if (vf->has_rom && vf->frame_count == 1 && vf->flash_remap) {
-        vf->flash_remap = 0;
-        printf("[BOOT] Flash remap disabled at frame 1\n");
-    }
+    /* No remap disable needed — flash reads always from ROM. */
 
     if ((vf->frame_count % 10) == 0) {
         printf("[Frame %lu] PC=0x%08X CPSR=0x%08X R7=0x%08X R8=0x%08X R9=0x%08X\n",
