@@ -276,12 +276,14 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                  * main init can continue past first run (RAM modification). */
                 uint32_t N = foff - 0x800;
                 uint32_t remap_off = vf->flash_remap + N;
-                if (N < 0x98) {
-                    /* Self-modified C code + data pool → RAM */
+                if (N < 0x98 || (N >= 0x2C0 && N < 0x680)) {
+                    /* Self-modified C code (N<0x98) and BL data pools
+                     * (N=0x2C0-0x67F at ROM[0xBD8-0xD97]) → RAM.
+                     * BL functions modify data pool values during init. */
                     if (remap_off < VFLASH_RAM_SIZE)
                         return *(uint32_t*)(vf->ram + remap_off);
                 } else {
-                    /* BL function bodies → original ROM */
+                    /* BL function BODIES → original ROM */
                     if (remap_off < vf->rom_size)
                         return *(uint32_t*)(vf->rom + remap_off);
                 }
