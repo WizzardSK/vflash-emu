@@ -525,10 +525,9 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                             vf->timer.timer[0].count = 150000;
                             vf->timer.timer[0].ctrl = 0x77; /* enable+periodic+IRQ */
                             vf->timer.irq.enable = 0xFFFFFFFF; /* all IRQs enabled */
-                            /* Force IRQ enable in CPSR — ROM BL #1 normally
-                             * does this but self-modified code may skip it */
-                            vf->cpu.cpsr &= ~0xC0u; /* clear I+F bits */
-                            printf("[DMA] Force-enabled timer0 + IRQ + CPSR\n");
+                            /* Don't force CPSR here — too early, IRQ SP not set.
+                             * IRQ enable happens in run_frame after init settles. */
+                            printf("[DMA] Force-enabled timer0 + IRQ controller\n");
                         }
                     }
                     break;
@@ -1517,9 +1516,17 @@ void vflash_run_frame(VFlash *vf) {
         done += (int)actual;   /* advance by what CPU actually consumed */
 
         /* Force-clear I bit so IRQ can be delivered.
+         * Only after init completes (~5M cycles = ~2 frames).
          * µMORE RTOS never enables IRQ itself (ROM normally does). */
-        if (vf->has_rom && (vf->cpu.cpsr & 0x80))
+        /* Force IRQ delivery after init settles (~500K cycles = 200ms).
+         * Also ensure IRQ mode SP is valid before first IRQ fires.
+         * ROM BL #1 normally sets IRQ SP but self-modified code skips it. */
+        if (vf->has_rom && vf->cpu.cycles > 1250000 && (vf->cpu.cpsr & 0x80)) {
+            /* Set IRQ SP if not yet set (check for suspicious values) */
+            if (vf->cpu.r13_irq == 0 || vf->cpu.r13_irq > 0xF0000000u)
+                vf->cpu.r13_irq = 0x10800000;  /* Safe IRQ stack in high RAM */
             vf->cpu.cpsr &= ~0x80u;
+        }
 
         if (ztimer_fiq_pending(&vf->timer))
             arm9_fiq(&vf->cpu);
