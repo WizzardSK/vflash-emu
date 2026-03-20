@@ -254,26 +254,23 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
             uint32_t foff = off - 0x38000000u;
             if (foff >= 0x800 && vf->flash_remap) {
-                /* Flash remap: 0xB8000800+N reads from RAM[remap+N]
-                 * for the cold-boot copied region (0xD00 bytes from
-                 * ROM[0x800] to RAM[0x7F0]). Beyond that, reads from
-                 * original ROM. Self-modified code only exists in the
-                 * copied region; rest is untouched flash content.
+                /* Flash remap: 0xB8000800+N maps to remap_addr+N.
+                 * Init code self-modifies a small area (~64 bytes) at
+                 * RAM[0x118-0x160] (the BL sequence and main init code).
+                 * Everything else should come from original ROM.
                  *
-                 * Cold boot copies ROM[0x800..0x14FF] → RAM[0x7F0..0x14EF]
-                 * remap_addr = 0x118
-                 * RAM[0x118+N] is in copied region if N < 0xD00+0x7F0-0x118 = 0xDD8
-                 * Simplified: use RAM for N < 0x1000, ROM for N >= 0x1000 */
+                 * Use RAM for the self-modified region (N=0x00-0x50),
+                 * ROM for the rest (BL function bodies, handlers). */
                 uint32_t N = foff - 0x800;
-                if (N < 0x1000) {
-                    uint32_t remap_off = vf->flash_remap + N;
+                uint32_t remap_off = vf->flash_remap + N;
+                if (N < 0x50) {
+                    /* Self-modified BL sequence area → RAM */
                     if (remap_off < VFLASH_RAM_SIZE)
                         return *(uint32_t*)(vf->ram + remap_off);
                 } else {
-                    /* Beyond copied region: read from original ROM */
-                    uint32_t rom_off = vf->flash_remap + N;
-                    if (rom_off < vf->rom_size)
-                        return *(uint32_t*)(vf->rom + rom_off);
+                    /* BL function bodies → original ROM */
+                    if (remap_off < vf->rom_size)
+                        return *(uint32_t*)(vf->rom + remap_off);
                 }
                 return 0;
             }
