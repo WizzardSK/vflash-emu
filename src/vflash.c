@@ -283,13 +283,17 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                  * main init can continue past first run (RAM modification). */
                 uint32_t N = foff - 0x800;
                 uint32_t remap_off = vf->flash_remap + N;
-                /* NOR flash controller:
-                 * Register 0x00: config register (read returns last written value)
-                 * All other offsets: NOR flash content (ROM data)
-                 * After cold boot, ROM writes 0x118 to reg 0x00, then reads
-                 * it back via LDR → gets 0x118 → MOV PC,0x118 → RAM code. */
-                if (foff == 0x800 && vf->flash_remap)
-                    return vf->flash_remap;  /* Return last written config value */
+                /* Flash remap: write to reg 0x800 sets RAM offset.
+                 * Subsequent reads from 0xB8000800+N return RAM[remap+N].
+                 * This is how ROM redirects execution from flash to RAM
+                 * after cold boot copy. */
+                if (foff >= 0x800 && vf->flash_remap) {
+                    uint32_t remap_off = vf->flash_remap + (foff - 0x800);
+                    if (remap_off < VFLASH_RAM_SIZE)
+                        return *(uint32_t*)(vf->ram + remap_off);
+                    return 0;
+                }
+                /* Without remap: return ROM content */
                 if (foff < vf->rom_size)
                     return *(uint32_t*)(vf->rom + foff);
                 return 0;
@@ -627,10 +631,17 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
             uint32_t foff = off - 0x38000000u;
             if (foff == 0x800) {
                 vf->flash_remap = val;
-                /* After cold boot copy + flash reg write, addr 0 remaps
-                 * from ROM to SDRAM. This happens when ROM writes 0x118. */
-                if (val != 0)
+                /* After flash remap enable, addr 0 switches from ROM to SDRAM */
+                if (val != 0 && !vf->boot_remap) {
                     vf->boot_remap = 1;
+                    /* Also copy cold boot data to remap target in RAM.
+                     * Cold boot copied ROM[0x800]→RAM[0x7F0]. But remap
+                     * is to 0x118. Copy ROM[0x800]→RAM[0x118] too. */
+                    if (val + 0xD00 < VFLASH_RAM_SIZE) {
+                        memcpy(vf->ram + val, vf->rom + 0x800, 0xD00);
+                        printf("[FLASH] Remap DMA: ROM[0x800]→RAM[0x%X] (0xD00 bytes)\n", val);
+                    }
+                }
             }
             return;
         }
