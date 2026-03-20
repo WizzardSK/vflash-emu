@@ -219,16 +219,26 @@ Standard ARM dual-timer. Two timers per block at offsets +0x00 and +0x20:
 
 ## Current status
 
+### HLE boot (without boot ROM)
+- **BOOT.BIN loads and runs** — V.Flash BOOT format parser, auto-detection
+- **ROM stub at 0x1880** — all 6 games call ROM function at addr 0x1880 for PLL/SDRAM config; HLE stub enables IRQs + WFI loop
+- **Three init functions execute** — 0x10C04368, 0x10C044A0, 0x10C043A0 set up µMORE internal state
+- **MMU ENABLED** — init code builds page tables at TTB=0x10C08000 and enables MMU
+- **SP804 timer pre-configured** — 60Hz periodic IRQ via PL190 VIC
+- **Blocking**: IRQ handler dispatch after MMU enable — vector table at VA 0x18 needs correct handler
+
+### Boot ROM mode
 - **Boot ROM boots** — cold boot → PLL lock → flash DMA → BL init functions
-- **Flash controller model** — ROM copy loop writes to 0xB8000800+ window, remap triggers DMA to RAM, CPU executes from flash window
-- **SP804 timer fires** — proper ARM SP804 implementation, periodic IRQ via PL190 VIC
-- **µMORE RTOS scheduler runs** — init code executes from flash window at 0xB8000800+
+- **Flash controller model** — ROM copy loop writes to 0xB8000800+ window, remap triggers DMA to RAM
+- **SDRAM calibration** — 71×71 iteration loop (very slow in emulation, patched for speed)
+- **Blocking**: calibration loop prevents reaching µMORE scheduler
+
+### Common
 - **MMU translation** — L1 section + L2 coarse page table walk, VA→PA for all accesses
-- **APB peripherals** — GPIO, PL011 UART, SP805 watchdog, PL031 RTC, PMU stubs
-- **50 FPS** — CPU runs at full speed from flash window
+- **APB peripherals** — GPIO, PL011 UART, SP805 watchdog, PL031 RTC, PMU (read/write)
+- **SP804 timer** — proper ARM dual-timer, periodic IRQ via PL190 VIC
 - **SDL window opens** — black (no video writes yet)
-- **Blocking**: scheduler loop cycling but no task dispatch (R8=0) — BL init functions execute but task table pointer not yet initialized
-- 6 games extracted and analyzed; all share identical 48KB µMORE init code
+- 6 games extracted and analyzed; all share identical load addr (0x10C00000), ROM callback (0x1880), entry (0x10C0011C)
 - LCD controller (PL111 at `0xC0000000`) not yet implemented
 
 ## Notes
