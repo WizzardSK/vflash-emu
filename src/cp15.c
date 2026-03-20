@@ -72,7 +72,8 @@ void cp15_write(CP15 *cp, uint32_t crn, uint32_t crm, uint32_t op2, uint32_t val
             cp->icache_enabled = (val & CP15_CTRL_ICACHE) ? 1 : 0;
             cp->write_buffer   = (val & CP15_CTRL_WBUF)   ? 1 : 0;
             cp->hivec          = (val & CP15_CTRL_HIVEC)  ? 1 : 0;
-            printf("[CP15] Control=0x%08X MMU=%d DC=%d IC=%d HIVEC=%d\n",
+            /* Suppress repeated Control writes (µMORE context switch spam) */
+            if (0) printf("[CP15] Control=0x%08X MMU=%d DC=%d IC=%d HIVEC=%d\n",
                    cp->control, cp->mmu_enabled, cp->dcache_enabled,
                    cp->icache_enabled, cp->hivec);
             break;
@@ -91,15 +92,14 @@ void cp15_write(CP15 *cp, uint32_t crn, uint32_t crm, uint32_t op2, uint32_t val
             break;
         case 7:  /* Cache operations */
             switch ((crm << 4) | op2) {
-                case 0x00: printf("[CP15] Wait for interrupt\n"); break;
-                case 0x40: printf("[CP15] Invalidate I-cache\n"); break;
-                case 0x60: printf("[CP15] Invalidate D-cache\n"); break;
-                case 0x6A: printf("[CP15] Clean D-cache by MVA\n"); break;
-                case 0x6B: printf("[CP15] Invalidate D-cache by index\n"); break;
-                case 0xEA: printf("[CP15] Clean+invalidate D-cache by MVA\n"); break;
-                case 0x5A: printf("[CP15] Drain write buffer\n"); break;
-                default:
-                    printf("[CP15] Cache op CRm=%u op2=%u val=0x%08X\n", crm, op2, val);
+                case 0x00: break; /* WFI */
+                case 0x40: break; /* Invalidate I-cache */
+                case 0x60: break; /* Invalidate D-cache */
+                case 0x6A: break; /* Clean D-cache by MVA */
+                case 0x6B: break; /* Invalidate D-cache by index */
+                case 0xEA: break; /* Clean+invalidate D-cache by MVA */
+                case 0x5A: break; /* Drain write buffer */
+                default: break;
             }
             break;
         case 8:  /* TLB operations */

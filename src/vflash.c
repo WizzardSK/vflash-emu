@@ -456,38 +456,24 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                     if (val == 1 && vf->cd && vf->cd->is_open) {
                         uint32_t lba = vf->dma_param_a;
                         uint32_t count = vf->dma_param_b;
-                        uint32_t dest_off = vf->dma_param_c;
                         static int dma_call = 0;
                         dma_call++;
 
-                        if (dma_call == 1) {
-                            /* First DMA: load BOOT.BIN to 0x10010000 */
-                            CDEntry entry;
-                            if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &entry)) {
-                                uint32_t dest = 0x10000;
-                                uint32_t max_sz = VFLASH_RAM_SIZE - dest;
-                                if (entry.size < max_sz) max_sz = entry.size;
-                                int rd = cdrom_read_file(vf->cd, &entry,
-                                    vf->ram + dest, 0, max_sz);
-                                printf("[DMA#%d] BOOT.BIN: %d bytes → RAM[0x%X]\n",
-                                       dma_call, rd, dest);
+                        /* Read raw CD sectors into RAM at 0x10010000.
+                         * ROM DMA params: A=LBA, B=sector_count.
+                         * Destination is fixed at 0x10010000 (after ROM copy area). */
+                        uint32_t dest = 0x10000;  /* RAM offset for 0x10010000 */
+                        uint32_t bytes = count * 2048;
+                        if (dest + bytes <= VFLASH_RAM_SIZE) {
+                            for (uint32_t i = 0; i < count; i++) {
+                                cdrom_read_sector(vf->cd, lba + i,
+                                    vf->ram + dest + i * 2048);
                             }
+                            printf("[DMA#%d] LBA=%u(%u sectors) → RAM[0x%X] (%u bytes)\n",
+                                   dma_call, lba, count, dest, bytes);
                         } else {
-                            /* Subsequent DMA: read sectors by LBA */
-                            uint32_t dest = dest_off;
-                            if (dest >= VFLASH_RAM_BASE)
-                                dest -= VFLASH_RAM_BASE;
-                            if (dest + count * 2048 <= VFLASH_RAM_SIZE) {
-                                for (uint32_t i = 0; i < count; i++) {
-                                    cdrom_read_sector(vf->cd, lba + i,
-                                        vf->ram + dest + i * 2048);
-                                }
-                                printf("[DMA#%d] LBA=%u cnt=%u → RAM[0x%X]\n",
-                                       dma_call, lba, count, dest);
-                            } else {
-                                printf("[DMA#%d] LBA=%u cnt=%u dest=0x%X (out of range)\n",
-                                       dma_call, lba, count, dest);
-                            }
+                            printf("[DMA#%d] LBA=%u cnt=%u → out of range\n",
+                                   dma_call, lba, count);
                         }
                     }
                     break;
