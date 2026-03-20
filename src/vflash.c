@@ -243,10 +243,17 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         if (off < 0x200)
             return ztimer_read(&vf->timer, off);
 
-        /* Secondary IRQ controller at 0xDC000000 (VIC)
-         * mapped to same ztimer — games use this via MMU */
-        if (off >= 0x5C000000u && off < 0x5C000200u)
-            return ztimer_read(&vf->timer, off - 0x5C000000u);
+        /* PL190 VIC at 0xDC000000 (off = 0x5C000000) */
+        if (off >= 0x5C000000u && off < 0x5C001000u) {
+            uint32_t vreg = off - 0x5C000000u;
+            switch (vreg) {
+                case 0x000: return vf->timer.irq.status & vf->timer.irq.enable; /* IRQStatus */
+                case 0x004: return vf->timer.irq.status & vf->timer.irq.fiq_sel; /* FIQStatus */
+                case 0x008: return vf->timer.irq.status;  /* RawIntr */
+                case 0x010: return vf->timer.irq.enable;   /* IntEnable */
+                default: return 0;
+            }
+        }
 
         /* Boot ROM at 0xB8000000 (full 2MB).
          * Flash remap register at 0xB8000800: writing an address
@@ -362,18 +369,35 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
-        /* ZEVIO Timer A at 0x90010000 (off = 0x10010000) */
+        /* SP804 Fast Timer at 0x90010000 (off = 0x10010000) */
         if (off >= 0x10010000u && off < 0x10011000u) {
             uint32_t treg = off - 0x10010000u;
-            /* Return incrementing cycle-based count for ALL timer reads.
-             * µMORE polls various timer regs; returning monotonic count
-             * simulates a running timer regardless of which reg is read. */
-            return (uint32_t)(vf->cpu.cycles >> 8);
+            int idx = (treg >= 0x20) ? 1 : 0;
+            uint32_t reg = (treg >= 0x20) ? treg - 0x20 : treg;
+            Timer *t = &vf->timer.timer[idx];
+            switch (reg) {
+                case 0x00: return t->load;
+                case 0x04: return t->count;
+                case 0x08: return t->ctrl;
+                case 0x10: return t->irq_pending ? 1 : 0;  /* RIS */
+                case 0x14: return (t->irq_pending && (t->ctrl & 0x20)) ? 1 : 0; /* MIS */
+                default: return 0;
+            }
         }
 
-        /* ZEVIO Timer B at 0x900C0000 (off = 0x100C0000) */
+        /* SP804 Timer 1 at 0x900C0000 (off = 0x100C0000) */
         if (off >= 0x100C0000u && off < 0x100C1000u) {
-            return (uint32_t)(vf->cpu.cycles >> 8);
+            uint32_t treg = off - 0x100C0000u;
+            /* Map to timer[0] — use same structure */
+            Timer *t = &vf->timer.timer[0];
+            switch (treg) {
+                case 0x00: return t->load;
+                case 0x04: return t->count;
+                case 0x08: return t->ctrl;
+                case 0x10: return t->irq_pending ? 1 : 0;
+                case 0x14: return (t->irq_pending && (t->ctrl & 0x20)) ? 1 : 0;
+                default: return 0;
+            }
         }
 
         /* System control at 0x900A0000-0x900BFFFF (off = 0x100A0000-0x100BFFFF) */
@@ -463,9 +487,17 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
         /* Primary IRQ + timers */
         if (off < 0x200) { ztimer_write(&vf->timer, off, val); return; }
 
-        /* Secondary IRQ controller at 0xDC000000 */
-        if (off >= 0x5C000000u && off < 0x5C000200u) {
-            ztimer_write(&vf->timer, off - 0x5C000000u, val); return;
+        /* PL190 VIC write at 0xDC000000 */
+        if (off >= 0x5C000000u && off < 0x5C001000u) {
+            uint32_t vreg = off - 0x5C000000u;
+            switch (vreg) {
+                case 0x00C: vf->timer.irq.fiq_sel = val; break;    /* IntSelect */
+                case 0x010: vf->timer.irq.enable |= val; break;    /* IntEnable (set) */
+                case 0x014: vf->timer.irq.enable &= ~val; break;   /* IntEnClr */
+                case 0x018: vf->timer.irq.status |= val; break;    /* SoftInt */
+                case 0x01C: vf->timer.irq.status &= ~val; break;   /* SoftIntClr */
+            }
+            return;
         }
 
         /* ATAPI CD-ROM write at 0xAA000000 */
@@ -478,36 +510,33 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
             return;
         }
 
-        /* ZEVIO Timer A write at 0x90010000 */
+        /* SP804 Fast Timer write at 0x90010000 */
         if (off >= 0x10010000u && off < 0x10011000u) {
             uint32_t treg = off - 0x10010000u;
-            if (treg == 0x38) {
-                /* Timer control register: last write enables timer.
-                 * Bit 0 = enable. Value contains prescaler+config.
-                 * Use our ztimer with extracted parameters. */
-                Timer *t = &vf->timer.timer[0];
-                if (val & 1) {
-                    if (!t->load) t->load = 150000; /* 1ms default */
-                    t->count = t->load;
-                    t->ctrl = 0x77; /* enable+periodic+IRQ */
-                } else {
-                    t->ctrl = 0;
-                }
+            int idx = (treg >= 0x20) ? 1 : 0;
+            uint32_t reg = (treg >= 0x20) ? treg - 0x20 : treg;
+            Timer *t = &vf->timer.timer[idx];
+            switch (reg) {
+                case 0x00: t->load = val; t->count = val; break;  /* Load */
+                case 0x08: t->ctrl = val; break;                   /* Control */
+                case 0x0C: t->irq_pending = 0;                     /* IntClr */
+                           ztimer_clear_irq(&vf->timer, IRQ_TIMER0 + idx);
+                           break;
+                case 0x18: t->load = val; break;                    /* BGLoad */
             }
             return;
         }
-        /* ZEVIO Timer B write at 0x900C0000 */
+        /* SP804 Timer 1 write at 0x900C0000 */
         if (off >= 0x100C0000u && off < 0x100C1000u) {
             uint32_t treg = off - 0x100C0000u;
-            if (treg == 0x38) {
-                Timer *t = &vf->timer.timer[1];
-                if (val & 1) {
-                    if (!t->load) t->load = 150000;
-                    t->count = t->load;
-                    t->ctrl = 0x77;
-                } else {
-                    t->ctrl = 0;
-                }
+            Timer *t = &vf->timer.timer[0];
+            switch (treg) {
+                case 0x00: t->load = val; t->count = val; break;
+                case 0x08: t->ctrl = val; break;
+                case 0x0C: t->irq_pending = 0;
+                           ztimer_clear_irq(&vf->timer, IRQ_TIMER0);
+                           break;
+                case 0x18: t->load = val; break;
             }
             return;
         }
@@ -565,13 +594,10 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                              * On real HW, ROM BL #1 enables these, but with
                              * self-modifying code the enable sequence may
                              * not execute properly in emulation. */
-                            vf->timer.timer[0].load = 150000; /* 1ms @ 150MHz */
-                            vf->timer.timer[0].count = 150000;
-                            vf->timer.timer[0].ctrl = 0x77; /* enable+periodic+IRQ */
-                            vf->timer.irq.enable = 0xFFFFFFFF; /* all IRQs enabled */
-                            /* Don't force CPSR here — too early, IRQ SP not set.
-                             * IRQ enable happens in run_frame after init settles. */
-                            printf("[DMA] Force-enabled timer0 + IRQ controller\n");
+                            /* SP804 timer and PL190 VIC now handle timer/IRQ
+                             * properly — no need to force-enable here. ROM BL
+                             * functions configure timers via SP804 registers. */
+                            printf("[DMA] ROM uses SP804+PL190 for timer/IRQ\n");
                             /* Install HLE vector table + IRQ handler.
                              * ROM BL init may not install them in normal mode
                              * due to flash remap hybrid code path differences. */
