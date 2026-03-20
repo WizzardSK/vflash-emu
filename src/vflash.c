@@ -263,8 +263,8 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                  * ROM for the rest (BL function bodies, handlers). */
                 uint32_t N = foff - 0x800;
                 uint32_t remap_off = vf->flash_remap + N;
-                if (N < 0x50) {
-                    /* Self-modified BL sequence area → RAM */
+                if (N >= 0x20 && N < 0x50) {
+                    /* Self-modified main init area (after BL sequence) → RAM */
                     if (remap_off < VFLASH_RAM_SIZE)
                         return *(uint32_t*)(vf->ram + remap_off);
                 } else {
@@ -528,15 +528,24 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                          * HLE: load BOOT.BIN from disc on first call.
                          * Params A/B/C are flash controller config, not LBA. */
                         if (dma_call == 1) {
-                            /* Copy full ROM to RAM[0x10000] (0x10010000) and
-                             * also load BOOT.BIN at its load address. ROM expects
-                             * its own code at 0x10010000+ for µMORE init. */
+                            /* Debug: check IRQ handler BEFORE DMA copy */
+                            uint32_t pre_irq = *(uint32_t*)(vf->ram + 0x199C);
+                            printf("[DMA] Pre-DMA: RAM[0x199C]=0x%08X\n", pre_irq);
+                            /* Copy ROM to RAM[0x10000] but ONLY areas that are
+                             * still zero. BL init functions have already written
+                             * exception handlers etc. to low RAM — don't overwrite. */
                             if (vf->rom && vf->rom_size > 0) {
                                 uint32_t dest = 0x10000;
                                 uint32_t sz = vf->rom_size;
                                 if (dest + sz > VFLASH_RAM_SIZE) sz = VFLASH_RAM_SIZE - dest;
-                                memcpy(vf->ram + dest, vf->rom, sz);
-                                printf("[DMA#%d] ROM: %u bytes → RAM[0x%X]\n",
+                                /* Only copy non-zero ROM words to unwritten RAM */
+                                for (uint32_t i = 0; i < sz; i += 4) {
+                                    uint32_t rom_val = *(uint32_t*)(vf->rom + i);
+                                    uint32_t ram_val = *(uint32_t*)(vf->ram + dest + i);
+                                    if (ram_val == 0 && rom_val != 0)
+                                        *(uint32_t*)(vf->ram + dest + i) = rom_val;
+                                }
+                                printf("[DMA#%d] ROM: %u bytes → RAM[0x%X] (merge)\n",
                                        dma_call, sz, dest);
                             }
                             /* Also load BOOT.BIN at its load address */
@@ -562,6 +571,10 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                             /* Don't force CPSR here — too early, IRQ SP not set.
                              * IRQ enable happens in run_frame after init settles. */
                             printf("[DMA] Force-enabled timer0 + IRQ controller\n");
+                            /* Debug: check if IRQ handler was installed */
+                            uint32_t irq_code = *(uint32_t*)(vf->ram + 0x199C);
+                            printf("[DMA] IRQ handler at RAM[0x199C] = 0x%08X %s\n",
+                                   irq_code, irq_code ? "(installed)" : "(EMPTY!)");
                         }
                     }
                     break;
