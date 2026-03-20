@@ -2152,9 +2152,35 @@ static int vflash_hle_boot(VFlash *vf) {
                                     }
 
                                     if (soi >= 0) {
-                                        uint32_t jsz = eoi >= 0 ? (uint32_t)(eoi + 2 - soi) : (jpeg_sz - soi);
-                                        printf("[HLE-VIDEO] JPEG SOI at offset %d size=%u, decoding...\n", soi + 76, jsz);
-                                        if (mjp_decode_frame(vf->video, jpeg + soi, jsz)) {
+                                        uint8_t *jstart = jpeg + soi;
+                                        uint32_t jlen = jpeg_sz - soi;
+                                        /* Find SOS for byte-stuffing */
+                                        uint32_t sos_data = jlen;
+                                        uint32_t hp = 2;
+                                        while (hp + 3 < jlen && jstart[hp] == 0xFF) {
+                                            uint8_t m = jstart[hp+1];
+                                            uint16_t mlen = ((uint16_t)jstart[hp+2]<<8)|jstart[hp+3];
+                                            if (m == 0xDA) { sos_data = hp + 2 + mlen; break; }
+                                            hp += 2 + mlen;
+                                        }
+                                        /* Re-insert byte-stuffing in entropy data */
+                                        uint8_t *fixed = malloc(jlen + jlen/4 + 16);
+                                        uint32_t fi = 0;
+                                        memcpy(fixed, jstart, sos_data);
+                                        fi = sos_data;
+                                        for (uint32_t ei = sos_data; ei < jlen; ei++) {
+                                            fixed[fi++] = jstart[ei];
+                                            if (jstart[ei] == 0xFF && ei+1 < jlen) {
+                                                uint8_t nxt = jstart[ei+1];
+                                                if (nxt==0x00||(nxt>=0xD0&&nxt<=0xD7)||nxt==0xD9)
+                                                    { fixed[fi++]=nxt; ei++; }
+                                                else { fixed[fi++]=0x00; }
+                                            }
+                                        }
+                                        if (fi<2||fixed[fi-2]!=0xFF||fixed[fi-1]!=0xD9)
+                                            { fixed[fi++]=0xFF; fixed[fi++]=0xD9; }
+                                        printf("[HLE-VIDEO] JPEG: raw=%u stuffed=%u\n", jlen, fi);
+                                        if (mjp_decode_frame(vf->video, fixed, fi)) {
                                             memcpy(vf->framebuf, mjp_get_framebuf(vf->video),
                                                    VFLASH_SCREEN_W * VFLASH_SCREEN_H * 4);
                                             vf->vid.fb_dirty = 1;
@@ -2162,6 +2188,7 @@ static int vflash_hle_boot(VFlash *vf) {
                                         } else {
                                             printf("[HLE-VIDEO] JPEG decode failed\n");
                                         }
+                                        free(fixed);
                                     } else {
                                         printf("[HLE-VIDEO] No JPEG SOI marker found in MJP data\n");
                                     }
@@ -2572,7 +2599,9 @@ void vflash_run_frame(VFlash *vf) {
                     if (frame_sz == 0)
                         frame_sz = rd - 0x4C;
 
-                    /* Byte-swap frame data (V.Flash stores JPEG in 16-bit swapped order) */
+                    /* Byte-swap frame data (V.Flash stores JPEG in 16-bit swapped order).
+                     * The hardware JPEG encoder omits byte-stuffing (FF 00 → just FF)
+                     * in entropy data, so we must re-insert it after swapping. */
                     uint8_t *jpeg = mjpbuf + 0x4C;
 
                     for (uint32_t bi = 0; bi + 1 < frame_sz; bi += 2) {
@@ -2588,16 +2617,51 @@ void vflash_run_frame(VFlash *vf) {
                     }
 
                     if (soi >= 0) {
-                        uint32_t jpeg_sz = frame_sz - soi;
-                        printf("[ROM-VIDEO] JPEG frame: SOI=%d size=%u (frame_sz=%u)\n", soi, jpeg_sz, frame_sz);
-                        if (mjp_decode_frame(vf->video, jpeg + soi, jpeg_sz)) {
+                        uint8_t *jstart = jpeg + soi;
+                        uint32_t jlen = frame_sz - soi;
+
+                        /* Find SOS marker to locate entropy data start */
+                        uint32_t sos_data = jlen;
+                        uint32_t hp = 2;
+                        while (hp + 3 < jlen && jstart[hp] == 0xFF) {
+                            uint8_t m = jstart[hp + 1];
+                            uint16_t mlen = ((uint16_t)jstart[hp+2] << 8) | jstart[hp+3];
+                            if (m == 0xDA) { sos_data = hp + 2 + mlen; break; }
+                            hp += 2 + mlen;
+                        }
+
+                        /* Re-insert byte-stuffing in entropy data:
+                         * Every FF not followed by 00/D0-D7/D9 needs 00 inserted. */
+                        uint8_t *fixed = malloc(jlen + jlen / 4 + 16);
+                        uint32_t fi = 0;
+                        memcpy(fixed, jstart, sos_data); /* copy header as-is */
+                        fi = sos_data;
+                        for (uint32_t ei = sos_data; ei < jlen; ei++) {
+                            fixed[fi++] = jstart[ei];
+                            if (jstart[ei] == 0xFF && ei + 1 < jlen) {
+                                uint8_t nxt = jstart[ei + 1];
+                                if (nxt == 0x00 || (nxt >= 0xD0 && nxt <= 0xD7) || nxt == 0xD9) {
+                                    fixed[fi++] = nxt; ei++; /* keep existing marker */
+                                } else {
+                                    fixed[fi++] = 0x00; /* insert stuffing byte */
+                                }
+                            }
+                        }
+                        /* Append EOI if not present */
+                        if (fi < 2 || fixed[fi-2] != 0xFF || fixed[fi-1] != 0xD9) {
+                            fixed[fi++] = 0xFF; fixed[fi++] = 0xD9;
+                        }
+
+                        printf("[ROM-VIDEO] JPEG frame: SOI=%d raw=%u stuffed=%u\n", soi, jlen, fi);
+                        if (mjp_decode_frame(vf->video, fixed, fi)) {
                             memcpy(vf->framebuf, mjp_get_framebuf(vf->video),
                                    VFLASH_SCREEN_W * VFLASH_SCREEN_H * 4);
                             vf->vid.fb_dirty = 1;
                             printf("[ROM-VIDEO] First MJP frame displayed!\n");
                         } else {
-                            printf("[ROM-VIDEO] JPEG decode failed (frame_sz=%u)\n", jpeg_sz);
+                            printf("[ROM-VIDEO] JPEG decode failed (stuffed=%u)\n", fi);
                         }
+                        free(fixed);
                     } else {
                         printf("[ROM-VIDEO] No JPEG SOI found in first frame\n");
                     }
