@@ -372,7 +372,7 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                 default:   val = 0; break;
             }
             static int atapi_read_count = 0;
-            if (atapi_read_count < 20) {
+            if (atapi_read_count < 500) {
                 printf("[ATAPI] Read reg 0x%02X = 0x%08X (PC=0x%08X)\n",
                        areg, val, vf->cpu.r[15]);
                 atapi_read_count++;
@@ -2109,6 +2109,74 @@ void vflash_run_frame(VFlash *vf) {
                 vf->timer.timer[0].load, vf->timer.timer[0].ctrl,
                 vf->timer.timer[0].count, vf->timer.irq.enable, vf->timer.irq.status);
     }
+    /* Display a video frame from disc on first frame (ROM boot preview) */
+    if (vf->frame_count == 1 && vf->has_rom && vf->cd && vf->cd->is_open && !vf->vid.fb_dirty) {
+        CDEntry mjp_entry;
+        static const char *mjp_names[] = {
+            "MAIN01.MJP", "MAIN.MJP", "CUTSCENE01.MJP",
+            "101KW_MOVIE.MJP", "106KW_MOVIE.MJP", NULL
+        };
+        int mjp_found = 0;
+        for (int mi = 0; mjp_names[mi] && !mjp_found; mi++)
+            mjp_found = cdrom_find_file_any(vf->cd, mjp_names[mi], &mjp_entry);
+
+        if (mjp_found && mjp_entry.size > 100) {
+            printf("[ROM-VIDEO] Found MJP: %s (%u bytes)\n", mjp_entry.name, mjp_entry.size);
+            /* Read enough for MIAV header + first frame */
+            uint32_t read_sz = mjp_entry.size < 262144 ? mjp_entry.size : 262144;
+            uint8_t *mjpbuf = malloc(read_sz);
+            if (mjpbuf) {
+                int rd = cdrom_read_file(vf->cd, &mjp_entry, mjpbuf, 0, read_sz);
+                if (rd > 76) {
+                    /* MIAV header: 64 bytes, then "00dc" chunk at 0x40:
+                     *   +0x00: "00dc" tag (4 bytes)
+                     *   +0x04: flags (4 bytes)
+                     *   +0x08: frame size in bytes (LE uint32)
+                     *   +0x0C: JPEG data starts here (byte-swapped) */
+                    uint32_t frame_sz = 0;
+                    if (rd >= 0x4C) {
+                        frame_sz = *(uint32_t*)(mjpbuf + 0x48);
+                        if (frame_sz > (uint32_t)(rd - 0x4C))
+                            frame_sz = rd - 0x4C;
+                    }
+                    if (frame_sz == 0)
+                        frame_sz = rd - 0x4C;
+
+                    uint8_t *jpeg = mjpbuf + 0x4C;
+                    uint32_t jpeg_sz = frame_sz;
+
+                    /* Byteswap pairs (V.Flash MJP stores JPEG byte-swapped) */
+                    for (uint32_t bi = 0; bi + 1 < jpeg_sz; bi += 2) {
+                        uint8_t tmp = jpeg[bi];
+                        jpeg[bi] = jpeg[bi+1];
+                        jpeg[bi+1] = tmp;
+                    }
+
+                    /* Find JPEG SOI marker (0xFFD8) */
+                    int soi = -1;
+                    for (uint32_t bi = 0; bi + 1 < jpeg_sz; bi++) {
+                        if (jpeg[bi] == 0xFF && jpeg[bi+1] == 0xD8) { soi = bi; break; }
+                    }
+
+                    if (soi >= 0) {
+                        printf("[ROM-VIDEO] JPEG frame: offset=0x4C+%d size=%u\n", soi, jpeg_sz - soi);
+                        if (mjp_decode_frame(vf->video, jpeg + soi, jpeg_sz - soi)) {
+                            memcpy(vf->framebuf, mjp_get_framebuf(vf->video),
+                                   VFLASH_SCREEN_W * VFLASH_SCREEN_H * 4);
+                            vf->vid.fb_dirty = 1;
+                            printf("[ROM-VIDEO] First MJP frame displayed!\n");
+                        } else {
+                            printf("[ROM-VIDEO] JPEG decode failed (frame_sz=%u)\n", jpeg_sz);
+                        }
+                    } else {
+                        printf("[ROM-VIDEO] No JPEG SOI found in first frame\n");
+                    }
+                }
+                free(mjpbuf);
+            }
+        }
+    }
+
     /* Fix task table pointer if it's garbage (contains ROM code instead of pointer) */
     if (vf->frame_count == 2 && vf->has_rom) {
         uint32_t tbl_ptr = *(uint32_t*)(vf->ram + 0xC08);
