@@ -764,6 +764,23 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                     memcpy(vf->ram + val, vf->flash_buf, flush_size);
                     printf("[FLASH] Remap=0x%X, flushed %u bytes to RAM[0x%X]\n",
                            val, flush_size, val);
+
+                    /* Speed hack: patch SDRAM calibration table.
+                     * The table at flash offset 0x2D0 (RAM[remap+0x2D0]) has 71 identical
+                     * entries (all 0x16) followed by 0xFF terminator. Since emulated SDRAM
+                     * always works, put terminator at entry 1 (skip entire calibration). */
+                    uint32_t tbl_off = val + 0x2D0;  /* SDRAM config table in RAM */
+                    if (tbl_off + 8 < VFLASH_RAM_SIZE) {
+                        printf("[FLASH] Table before: [0x%X]=0x%08X [0x%X]=0x%08X [0x%X]=0x%08X\n",
+                               tbl_off, *(uint32_t*)(vf->ram + tbl_off),
+                               tbl_off+4, *(uint32_t*)(vf->ram + tbl_off+4),
+                               tbl_off+8, *(uint32_t*)(vf->ram + tbl_off+8));
+                        /* Put terminator right at first entry */
+                        *(uint32_t*)(vf->ram + tbl_off) = 0x000000FF;
+                        printf("[FLASH] Patched SDRAM table: 0xFF at RAM[0x%X]\n", tbl_off);
+                        printf("[FLASH] Verify: RAM[0x%X]=0x%08X\n", tbl_off,
+                               *(uint32_t*)(vf->ram + tbl_off));
+                    }
                 }
             }
             return;
