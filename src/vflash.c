@@ -319,6 +319,15 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
+        /* DMA / CD-ROM controller at 0x8FFF0000 (off = 0x0FFF0000) */
+        if (off >= 0x0FFF0000u && off < 0x0FFF1000u) {
+            uint32_t dreg = off - 0x0FFF0000u;
+            switch (dreg) {
+                case 0x08: return 0x01;  /* DMA status: complete */
+                default:   return 0;
+            }
+        }
+
         /* System control at 0x900A0000-0x900BFFFF (off = 0x100A0000-0x100BFFFF) */
         if (off >= 0x100A0000u && off < 0x100C0000u) {
             uint32_t sreg = off - 0x100A0000u;
@@ -341,10 +350,6 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
-        /* Silently return 0 for all unmapped I/O — many ZEVIO SoC
-         * peripherals are accessed through MMU-mapped addresses that
-         * don't correspond to our physical I/O layout. Returning 0
-         * (all interrupts clear, all status idle) is safe. */
         return 0;
     }
 
@@ -599,10 +604,8 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
             return;
         }
 
-        /* Silently accept writes to unmapped I/O */
         return;
     }
-    /* Silently ignore writes to unmapped memory */
 }
 
 
