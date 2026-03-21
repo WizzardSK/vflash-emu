@@ -723,6 +723,20 @@ static void undef_rom_copy(void *ctx) {
     }
     printf("[UNDEF-COPY] ROM → RAM[0x%X+]: %u KB (merge)\n",
            start, (copy_sz - start) / 1024);
+
+    /* Copy µMORE kernel modules from BOOT.BIN to where ROM init expects them.
+     * ROM init normally reads ~1MB from disc (BOOT.BIN offset 0xAE010)
+     * and loads it to RAM[0xAC000]. Without working ATAPI disc read,
+     * the function pointer table at RAM[0xAC000+] stays NULL → UNDEF.
+     * We pre-copy the data from our already-loaded BOOT.BIN. */
+    uint32_t src_off  = 0xC00000 + 0xAE010; /* BOOT.BIN[0xAE010] in RAM */
+    uint32_t dst_off  = 0xAC000;            /* where ROM expects it */
+    uint32_t mod_size = 0xF95B0;            /* ~1MB of µMORE modules */
+    if (src_off + mod_size <= VFLASH_RAM_SIZE && dst_off + mod_size <= VFLASH_RAM_SIZE) {
+        memcpy(vf->ram + dst_off, vf->ram + src_off, mod_size);
+        printf("[UNDEF-COPY] BOOT.BIN[0xAE010] → RAM[0xAC000]: %u KB (µMORE modules)\n",
+               mod_size / 1024);
+    }
 }
 
 #define TLB_SIZE 4096

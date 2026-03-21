@@ -537,8 +537,8 @@ void arm9_undef(ARM9 *cpu) {
     if (undef_count < 3) {
         uint32_t bad_pc = PC - 8;
         uint32_t insn = cpu->mem_read32(cpu->mem_ctx, bad_pc);
-        fprintf(stderr, "[UNDEF] #%d at PC=0x%08X insn=0x%08X CPSR=0x%08X\n",
-                undef_count, bad_pc, insn, CPSR);
+        fprintf(stderr, "[UNDEF] #%d at PC=0x%08X insn=0x%08X CPSR=0x%08X LR=0x%08X R0=0x%08X\n",
+                undef_count, bad_pc, insn, CPSR, cpu->r[14], cpu->r[0]);
     }
     undef_count++;
 
