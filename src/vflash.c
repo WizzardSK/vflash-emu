@@ -1693,9 +1693,19 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                     *(uint32_t*)(vf->ram + 0xFFDC) = 0x1000FF40;
                     printf("[REBOOT] IRQ wrapper at 0x1000FF40 → µMORE 0x100872A4\n");
 
-                    /* Don't set dummy tasks — let BOOT.BIN init register real ones.
-                     * With ROM→RAM copy at UNDEF time, µMORE API should work. */
-                    printf("[REBOOT] Waiting for µMORE tasks from BOOT.BIN init...\n");
+                    /* After warm boot, redirect to BOOT.BIN entry so it runs
+                     * its init functions again. This second run should register
+                     * tasks since µMORE kernel is now in RAM.
+                     * Patch callback to idle stub (prevent infinite reboot). */
+                    *(uint32_t*)(vf->ram + 0xC00020) = 0x1000FF60;
+
+                    /* Set warm boot entry to BOOT.BIN instead of idle loop */
+                    {
+                        uint32_t wb = 0xFFC8;
+                        *(uint32_t*)(vf->ram + wb + 0) = 0xE51FF004; /* LDR PC,[PC,-#4] */
+                        *(uint32_t*)(vf->ram + wb + 4) = 0x10C00010; /* BOOT.BIN entry */
+                    }
+                    printf("[REBOOT] Warm boot → BOOT.BIN init (callback patched to idle)\n");
 
                     /* Set up SP804 timer for periodic IRQs */
                     vf->timer.timer[0].load = 37500;
