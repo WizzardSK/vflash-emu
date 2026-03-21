@@ -274,15 +274,18 @@ Standard ARM dual-timer. Two timers per block at offsets +0x00 and +0x20:
 - 6 games extracted and analyzed; all share identical load addr (0x10C00000), ROM callback (0x1880)
 
 ### µMORE RTOS progress
+- **Full ROM init** — ROM boots completely without UNDEF (ROM code in RAM above 64KB)
 - **Scheduler loop running** — µMORE dispatch loop at ROM[0x7FFC8] iterates task list
-- **IRQ handler working** — proper wrapper with register save, timer clear, CPSR restore
-- **ROM→RAM copy** — µMORE kernel code copied to SDRAM at boot (1.5MB above 512KB)
-- **Scheduler state** — set to 3 ("running"), handler passes state check
-- **Task dispatch** — dummy task registered and dispatched successfully
-- **Blocking**: scheduler finds no active game tasks — BOOT.BIN init calls µMORE task registration at 0x10C04598 with init table (4 entries at 0x10C0C008), but task struct pointers in BSS (e.g. 0x10B2A004) are uninitialized
+- **IRQ handler** — proper wrapper with register save/restore, timer clear, SUBS PC,LR,#4 return
+- **ARM LDM S-bit** — CPSR restored from SPSR on interrupt return (was missing)
+- **ROM→RAM copy** — triggered at UNDEF time via callback; µMORE kernel (1.9MB) in SDRAM
+- **Identity mapping** — MMU page table confirmed VA=PA for all 16MB RAM
+- **Two-phase boot**: ROM init → UNDEF → ROM→RAM copy → BOOT.BIN init → reboot → warm boot → scheduler
+- **BOOT.BIN init**: 3 functions execute, MMU enabled (TTB=0x10C08000), task init table at 0x10C0C014 with 2 entries (µMORE core + game module)
+- **Blocking**: BOOT.BIN init calls µMORE API but task_table[0x1A9440] remains empty. Init functions prepare data structures (linked lists, memzero) but don't write task registrations. The µMORE task_create API path needs deeper RE.
 
 ### What doesn't work yet
-- **Game task execution** — µMORE scheduler runs but no game tasks registered yet
+- **Game task execution** — µMORE scheduler runs but no game tasks registered by BOOT.BIN init
 - **LCD controller** (PL111 at `0xC0000000`) — not implemented; video uses DMA blit path
 - **In-game audio** — `.snd` PCM WAV files not decoded (cutscene audio works)
 
