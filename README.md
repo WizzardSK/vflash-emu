@@ -273,8 +273,16 @@ Standard ARM dual-timer. Two timers per block at offsets +0x00 and +0x20:
 - **APB peripherals** — GPIO, PL011 UART, SP805 watchdog, PL031 RTC, PMU
 - 6 games extracted and analyzed; all share identical load addr (0x10C00000), ROM callback (0x1880)
 
+### µMORE RTOS progress
+- **Scheduler loop running** — µMORE dispatch loop at ROM[0x7FFC8] iterates task list
+- **IRQ handler working** — proper wrapper with register save, timer clear, CPSR restore
+- **ROM→RAM copy** — µMORE kernel code copied to SDRAM at boot (1.5MB above 512KB)
+- **Scheduler state** — set to 3 ("running"), handler passes state check
+- **Task dispatch** — dummy task registered and dispatched successfully
+- **Blocking**: scheduler finds no active game tasks — BOOT.BIN init calls µMORE task registration at 0x10C04598 with init table (4 entries at 0x10C0C008), but task struct pointers in BSS (e.g. 0x10B2A004) are uninitialized
+
 ### What doesn't work yet
-- **Game code execution** — µMORE scheduler enters idle loop, game tasks not yet loaded via ATAPI
+- **Game task execution** — µMORE scheduler runs but no game tasks registered yet
 - **LCD controller** (PL111 at `0xC0000000`) — not implemented; video uses DMA blit path
 - **In-game audio** — `.snd` PCM WAV files not decoded (cutscene audio works)
 
