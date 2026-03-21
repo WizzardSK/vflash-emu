@@ -2737,16 +2737,20 @@ void vflash_run_frame(VFlash *vf) {
             if (phase == 0 && (pc >= 0x1007FFC0 && pc <= 0x10080060)) {
                 phase = 1;
                 /* Re-copy modules erased by BSS clear */
-                uint32_t ms = vf->rom_size - 0xAE010;
-                if (0xAC000 + ms > VFLASH_RAM_SIZE) ms = VFLASH_RAM_SIZE - 0xAC000;
-                memcpy(vf->ram + 0xAC000, vf->rom + 0xAE010, ms);
-                printf("[SCHED] Phase 1: re-copied modules (%u KB), → BOOT.BIN\n", ms/1024);
-                vf->cpu.r[15] = 0x10C00010;
+                memcpy(vf->ram + 0xAC000, vf->rom + 0xAE010, 0xF95B0);
+                memcpy(vf->ram + 0x9FFD4, vf->rom + 0xC02C, 0xA1FE4);
+                /* Call µMORE kernel entry directly (0x100A0FA0).
+                 * This initializes µMORE, registers tasks, sets up scheduler.
+                 * The kernel entry expects to be called in SVC mode. */
+                printf("[SCHED] Phase 1: calling µMORE kernel entry at 0x100A0FA0\n");
+                vf->cpu.r[14] = 0x10FFF000; /* return to idle stub */
+                vf->cpu.r[15] = 0x100A0FA0;
                 vf->cpu.r[13] = 0x10FFE000;
             }
 
-            /* Phase 2: idle stub reached → BOOT.BIN init done, set up IRQs */
-            if (phase == 1 && (pc >= 0x10FFF000 && pc <= 0x10FFF010)) {
+            /* Phase 2: kernel entry returned to scheduler loop or idle */
+            if (phase == 1 && ((pc >= 0x10FFF000 && pc <= 0x10FFF010) ||
+                               (pc >= 0x1007FFC0 && pc <= 0x10080060))) {
                 phase = 2;
                 printf("[SCHED] Phase 2: BOOT.BIN init done, installing IRQ handler\n");
 
