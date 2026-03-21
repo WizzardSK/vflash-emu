@@ -1407,17 +1407,15 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                             printf("[ROM-PRELOAD] BOOT.BIN: %d bytes at RAM[0x%X] (0x%08X)\n",
                                    rd, dest, VFLASH_RAM_BASE + dest);
                         }
-                        /* Pre-load ROM modules + kernel so ROM init runs fully.
-                         * BSS clear will erase some — we re-copy in Phase 1. */
+                        /* Pre-load everything: kernel + modules + ROM code */
                         {
-                            uint32_t ms = vf->rom_size - 0xAE010;
-                            if (0xAC000 + ms > VFLASH_RAM_SIZE) ms = VFLASH_RAM_SIZE - 0xAC000;
-                            memcpy(vf->ram + 0xAC000, vf->rom + 0xAE010, ms);
+                            memcpy(vf->ram + 0x9FFD4, vf->rom + 0xC02C, 0xA1FE4);
+                            memcpy(vf->ram + 0xAC000, vf->rom + 0xAE010, 0xF95B0);
                             for (uint32_t ci = 0x80000; ci < vf->rom_size; ci += 4) {
                                 uint32_t rv = *(uint32_t*)(vf->rom + ci);
                                 if (rv != 0) *(uint32_t*)(vf->ram + ci) = rv;
                             }
-                            printf("[ROM-PRELOAD] Modules + kernel loaded\n");
+                            printf("[ROM-PRELOAD] Kernel+modules+code loaded\n");
                         }
                     }
                 }
@@ -2719,6 +2717,11 @@ void vflash_run_frame(VFlash *vf) {
         uint64_t cyc_before = vf->cpu.cycles;
         arm9_run(&vf->cpu, slice);
         uint32_t actual = (uint32_t)(vf->cpu.cycles - cyc_before);
+
+        /* Trace boot flow: log when PC enters key regions */
+        {
+            static uint32_t last_region = 0;
+        }
 
         ztimer_tick(&vf->timer, actual);
         done += (int)actual;
