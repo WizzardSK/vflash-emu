@@ -702,6 +702,17 @@ static void atapi_write_reg(VFlash *vf, uint32_t reg, uint32_t val) {
     }
 }
 
+/* Simple 4096-entry direct-mapped TLB for 1MB section mappings.
+ * Indexed by VA bits [31:20]. Each entry stores the PA base (bits[31:20])
+ * with bit 0 set as valid flag. Flushed when TTB or MMU control changes. */
+#define TLB_SIZE 4096
+static uint32_t tlb_cache[TLB_SIZE]; /* PA base | 1(valid). 0=invalid. */
+static uint32_t tlb_ttb = 0;        /* TTB value when TLB was filled */
+
+static inline void tlb_flush(void) {
+    memset(tlb_cache, 0, sizeof(tlb_cache));
+}
+
 /* MMU virtual→physical address translation (ARM926EJ-S two-level page table)
  * Supports: section (1MB), coarse page table (4KB/64KB pages), fault.
  * Called on every memory access when MMU is enabled. */
@@ -710,8 +721,19 @@ static uint32_t mmu_translate(VFlash *vf, uint32_t va) {
     if (!cp->mmu_enabled)
         return va;
 
-    /* L1 descriptor lookup */
+    /* TLB lookup (section-only cache) */
     uint32_t l1_index = va >> 20;
+    uint32_t tlb_entry = tlb_cache[l1_index];
+    if (tlb_entry & 1) {
+        /* TLB hit — reconstruct PA from cached section base */
+        return (tlb_entry & 0xFFF00000u) | (va & 0x000FFFFFu);
+    }
+
+    /* Invalidate TLB if TTB changed (covers MCR c2/c8 writes) */
+    if (__builtin_expect(cp->ttb != tlb_ttb, 0)) {
+        tlb_flush();
+        tlb_ttb = cp->ttb;
+    }
     uint32_t l1_addr  = cp->ttb + (l1_index << 2);
     uint32_t l1_desc  = phys_read32(vf, l1_addr);
     uint32_t type     = l1_desc & 3;
@@ -730,6 +752,8 @@ static uint32_t mmu_translate(VFlash *vf, uint32_t va) {
                     va0_logged = 1;
                 }
             }
+            /* Cache in TLB */
+            tlb_cache[l1_index] = (l1_desc & 0xFFF00000u) | 1;
             return pa;
         }
         case 1: { /* Coarse page table (256 entries, 4KB pages) */
@@ -758,6 +782,10 @@ static uint32_t mmu_translate(VFlash *vf, uint32_t va) {
 static uint32_t mem_read32(void *ctx, uint32_t addr) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
+
+    /* Fast path: RAM (most common — ~90% of all accesses) */
+    if (__builtin_expect(addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE, 1))
+        return *(uint32_t*)(vf->ram + (addr - VFLASH_RAM_BASE));
 
     /* Physical address 0:
      * With boot ROM: 512KB read-only NOR flash (always present)
@@ -1119,6 +1147,12 @@ static uint8_t mem_read8(void *ctx, uint32_t addr) {
 static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
+
+    /* Fast path: RAM write (most common) */
+    if (__builtin_expect(addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE, 1)) {
+        *(uint32_t*)(vf->ram + (addr - VFLASH_RAM_BASE)) = val;
+        return;
+    }
 
     /* Physical addr 0-2MB:
      * With ROM: read-only, writes ignored.
