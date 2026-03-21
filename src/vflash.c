@@ -1368,6 +1368,10 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                             printf("[ROM-PRELOAD] BOOT.BIN: %d bytes at RAM[0x%X] (0x%08X)\n",
                                    rd, dest, VFLASH_RAM_BASE + dest);
                         }
+                        /* NOTE: ROM→RAM copy is done at warm reboot time, not here.
+                         * Early copy breaks the boot flow (corrupts flash remap code). */
+                        {
+                        }
                     }
                 }
             }
