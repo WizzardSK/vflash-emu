@@ -195,6 +195,18 @@ struct VFlash {
     CDRomRegs cdr;
     ATAPIState atapi;
 
+    /* MJP video player state */
+    struct {
+        uint8_t  *data;        /* full MJP file data */
+        uint32_t  data_size;
+        uint8_t  *hdr;         /* I-frame JPEG header (SOI+tables, before SOS) */
+        uint32_t  hdr_len;
+        uint32_t  chunk_off;   /* current chunk offset in data */
+        int       playing;
+        int       frame_rate;  /* frames to skip between decodes (throttle) */
+        int       frame_skip;
+    } mjp_player;
+
     /* Debugger state */
     uint32_t bp[16];   /* breakpoint addresses (0 = unused) */
     int      bp_hit;   /* set by vflash_step() when BP hit */
@@ -455,6 +467,70 @@ static void atapi_exec_packet(VFlash *vf) {
             atapi_complete_err(a, 0x05, 0x20, 0x00); /* ILLEGAL REQUEST, invalid opcode */
             break;
     }
+}
+
+/* ---- MJP decode helper ----
+ * Pair-swap + byte-stuffing restore + JPEG decode.
+ * Input: raw MIAV chunk data (16-bit swapped, no byte-stuffing).
+ * If 'header' is non-NULL, prepend it (for P-frames that lack SOI/tables).
+ * Returns 1 on success (framebuf updated), 0 on failure. */
+static int mjp_decode_raw(MJPDecoder *dec, const uint8_t *raw, uint32_t raw_sz,
+                          const uint8_t *header, uint32_t hdr_len) {
+    if (raw_sz < 4) return 0;
+    /* Pair-swap */
+    uint8_t *swapped = malloc(hdr_len + raw_sz + 2);
+    if (!swapped) return 0;
+    uint32_t off = 0;
+
+    /* Copy header if P-frame */
+    int need_header = (raw_sz < 2 || raw[1] != 0xD8 || raw[0] != 0xFF);
+    /* After swap, check: swapped[0]=raw[1], swapped[1]=raw[0] */
+    int has_soi = (raw_sz >= 2 && raw[1] == 0xFF && raw[0] == 0xD8);
+    if (!has_soi && header && hdr_len > 0) {
+        memcpy(swapped, header, hdr_len);
+        off = hdr_len;
+    }
+
+    /* Pair-swap raw data */
+    for (uint32_t i = 0; i + 1 < raw_sz; i += 2) {
+        swapped[off + i]     = raw[i + 1];
+        swapped[off + i + 1] = raw[i];
+    }
+    if (raw_sz & 1) swapped[off + raw_sz - 1] = raw[raw_sz - 1];
+    uint32_t total = off + raw_sz;
+
+    /* Find SOS to locate entropy start */
+    uint32_t sos_data = total;
+    uint32_t hp = 2;
+    while (hp + 3 < total && swapped[hp] == 0xFF) {
+        uint8_t m = swapped[hp + 1];
+        uint16_t mlen = ((uint16_t)swapped[hp+2] << 8) | swapped[hp+3];
+        if (m == 0xDA) { sos_data = hp + 2 + mlen; break; }
+        hp += 2 + mlen;
+    }
+
+    /* Re-insert byte-stuffing in entropy data */
+    uint8_t *fixed = malloc(total + total / 4 + 16);
+    if (!fixed) { free(swapped); return 0; }
+    memcpy(fixed, swapped, sos_data);
+    uint32_t fi = sos_data;
+    for (uint32_t ei = sos_data; ei < total; ei++) {
+        fixed[fi++] = swapped[ei];
+        if (swapped[ei] == 0xFF && ei + 1 < total) {
+            uint8_t nxt = swapped[ei + 1];
+            if (nxt == 0x00 || (nxt >= 0xD0 && nxt <= 0xD7) || nxt == 0xD9)
+                { fixed[fi++] = nxt; ei++; }
+            else
+                { fixed[fi++] = 0x00; }
+        }
+    }
+    if (fi < 2 || fixed[fi-2] != 0xFF || fixed[fi-1] != 0xD9)
+        { fixed[fi++] = 0xFF; fixed[fi++] = 0xD9; }
+
+    int ok = mjp_decode_frame(dec, fixed, fi);
+    free(fixed);
+    free(swapped);
+    return ok;
 }
 
 /* Write to ATAPI command register (reg 0x07) */
@@ -2457,6 +2533,8 @@ void vflash_destroy(VFlash *vf) {
     audio_destroy(vf->audio);
     free(vf->atapi.data_buf);
     free(vf->ram);
+    free(vf->mjp_player.data);
+    free(vf->mjp_player.hdr);
     free(vf->sram);
     free(vf->rom);
     free(vf);
@@ -2550,8 +2628,10 @@ void vflash_run_frame(VFlash *vf) {
                 vf->timer.timer[0].load, vf->timer.timer[0].ctrl,
                 vf->timer.timer[0].count, vf->timer.irq.enable, vf->timer.irq.status);
     }
-    /* Display a video frame from disc on first frame (ROM boot preview) */
-    if (vf->frame_count == 1 && vf->has_rom && vf->cd && vf->cd->is_open && !vf->vid.fb_dirty) {
+    /* MJP video player — load on first frame, then play frame-by-frame */
+    if (vf->frame_count == 1 && vf->has_rom && vf->cd && vf->cd->is_open
+        && !vf->mjp_player.playing) {
+        /* Find and load MJP file from disc */
         CDEntry mjp_entry;
         static const char *mjp_names[] = {
             "EN.MJP", "MAIN01.MJP", "MAIN.MJP", "CUTSCENE01.MJP",
@@ -2559,11 +2639,9 @@ void vflash_run_frame(VFlash *vf) {
             "101KW_MOVIE.MJP", "106KW_MOVIE.MJP", NULL
         };
         int mjp_found = 0;
-        /* Try known names first, then search for any .MJP file */
         for (int mi = 0; mjp_names[mi] && !mjp_found; mi++)
             mjp_found = cdrom_find_file_any(vf->cd, mjp_names[mi], &mjp_entry);
         if (!mjp_found) {
-            /* Scan root directory for any .MJP file */
             CDEntry entries[64];
             uint8_t pvd[2048];
             if (cdrom_read_sector(vf->cd, 16, pvd)) {
@@ -2572,102 +2650,83 @@ void vflash_run_frame(VFlash *vf) {
                 int n = cdrom_list_dir(vf->cd, root_lba, root_size, entries, 64);
                 for (int ei = 0; ei < n && !mjp_found; ei++) {
                     char *dot = strrchr(entries[ei].name, '.');
-                    if (dot && (strcmp(dot, ".MJP") == 0 || strcmp(dot, ".mjp") == 0)) {
-                        mjp_entry = entries[ei];
-                        mjp_found = 1;
-                    }
+                    if (dot && (strcmp(dot, ".MJP") == 0 || strcmp(dot, ".mjp") == 0))
+                        { mjp_entry = entries[ei]; mjp_found = 1; }
                 }
             }
         }
-
         if (mjp_found && mjp_entry.size > 100) {
-            printf("[ROM-VIDEO] Found MJP: %s (%u bytes)\n", mjp_entry.name, mjp_entry.size);
-            /* Read first frame from MIAV container (I-frame with full JPEG tables) */
-            uint32_t read_sz = mjp_entry.size < 262144 ? mjp_entry.size : 262144;
-            uint8_t *mjpbuf = malloc(read_sz);
-            if (mjpbuf) {
-                int rd = cdrom_read_file(vf->cd, &mjp_entry, mjpbuf, 0, read_sz);
-                if (rd > 76) {
-                    /* MIAV header (64 bytes) + first "00dc" chunk at 0x40 */
-                    uint32_t frame_sz = 0;
-                    uint32_t data_off = 0x4C;
-                    if (rd >= 0x4C && memcmp(mjpbuf + 0x40, "00dc", 4) == 0) {
-                        frame_sz = *(uint32_t*)(mjpbuf + 0x48);
-                        if (frame_sz > (uint32_t)(rd - data_off))
-                            frame_sz = rd - data_off;
+            printf("[MJP-PLAY] Loading %s (%u bytes)...\n", mjp_entry.name, mjp_entry.size);
+            uint32_t load_sz = mjp_entry.size < 16*1024*1024 ? mjp_entry.size : 16*1024*1024;
+            vf->mjp_player.data = malloc(load_sz);
+            if (vf->mjp_player.data) {
+                int rd = cdrom_read_file(vf->cd, &mjp_entry, vf->mjp_player.data, 0, load_sz);
+                vf->mjp_player.data_size = (uint32_t)rd;
+                vf->mjp_player.chunk_off = 0x40; /* first chunk after MIAV header */
+                vf->mjp_player.frame_rate = 1; /* decode every emulator frame */
+                vf->mjp_player.frame_skip = 0;
+
+                /* Extract I-frame header (SOI + DQT + DHT + SOF0, before SOS) */
+                if (rd >= 0x4C && memcmp(vf->mjp_player.data + 0x40, "00dc", 4) == 0) {
+                    uint32_t f0sz = *(uint32_t*)(vf->mjp_player.data + 0x48);
+                    if (f0sz > (uint32_t)(rd - 0x4C)) f0sz = rd - 0x4C;
+                    /* Pair-swap to parse header */
+                    uint8_t *tmp = malloc(f0sz + 2);
+                    for (uint32_t i = 0; i + 1 < f0sz; i += 2)
+                        { tmp[i] = vf->mjp_player.data[0x4C+i+1]; tmp[i+1] = vf->mjp_player.data[0x4C+i]; }
+                    uint32_t hp = 2, sos_pos = f0sz;
+                    while (hp + 3 < f0sz && tmp[hp] == 0xFF) {
+                        uint8_t m = tmp[hp+1];
+                        uint16_t ml = ((uint16_t)tmp[hp+2]<<8)|tmp[hp+3];
+                        if (m == 0xDA) { sos_pos = hp; break; }
+                        hp += 2 + ml;
                     }
-                    if (frame_sz == 0)
-                        frame_sz = rd - data_off;
-
-                    /* Byte-swap frame data (V.Flash stores JPEG in 16-bit swapped order).
-                     * The hardware JPEG encoder omits byte-stuffing (FF 00 → just FF)
-                     * in entropy data, so we must re-insert it after swapping. */
-                    uint8_t *jpeg = mjpbuf + data_off;
-
-                    for (uint32_t bi = 0; bi + 1 < frame_sz; bi += 2) {
-                        uint8_t tmp = jpeg[bi];
-                        jpeg[bi] = jpeg[bi+1];
-                        jpeg[bi+1] = tmp;
-                    }
-
-                    /* Find JPEG SOI marker (FFD8) */
-                    int soi = -1;
-                    for (uint32_t bi = 0; bi + 1 < frame_sz; bi++) {
-                        if (jpeg[bi] == 0xFF && jpeg[bi+1] == 0xD8) { soi = bi; break; }
-                    }
-
-                    if (soi >= 0) {
-                        uint8_t *jstart = jpeg + soi;
-                        uint32_t jlen = frame_sz - soi;
-
-                        /* Find SOS marker to locate entropy data start */
-                        uint32_t sos_data = jlen;
-                        uint32_t hp = 2;
-                        while (hp + 3 < jlen && jstart[hp] == 0xFF) {
-                            uint8_t m = jstart[hp + 1];
-                            uint16_t mlen = ((uint16_t)jstart[hp+2] << 8) | jstart[hp+3];
-                            if (m == 0xDA) { sos_data = hp + 2 + mlen; break; }
-                            hp += 2 + mlen;
-                        }
-
-                        /* Re-insert byte-stuffing in entropy data:
-                         * Every FF not followed by 00/D0-D7/D9 needs 00 inserted. */
-                        uint8_t *fixed = malloc(jlen + jlen / 4 + 16);
-                        uint32_t fi = 0;
-                        memcpy(fixed, jstart, sos_data); /* copy header as-is */
-                        fi = sos_data;
-                        for (uint32_t ei = sos_data; ei < jlen; ei++) {
-                            fixed[fi++] = jstart[ei];
-                            if (jstart[ei] == 0xFF && ei + 1 < jlen) {
-                                uint8_t nxt = jstart[ei + 1];
-                                if (nxt == 0x00 || (nxt >= 0xD0 && nxt <= 0xD7) || nxt == 0xD9) {
-                                    fixed[fi++] = nxt; ei++; /* keep existing marker */
-                                } else {
-                                    fixed[fi++] = 0x00; /* insert stuffing byte */
-                                }
-                            }
-                        }
-                        /* Append EOI if not present */
-                        if (fi < 2 || fixed[fi-2] != 0xFF || fixed[fi-1] != 0xD9) {
-                            fixed[fi++] = 0xFF; fixed[fi++] = 0xD9;
-                        }
-
-                        printf("[ROM-VIDEO] JPEG frame: SOI=%d raw=%u stuffed=%u\n", soi, jlen, fi);
-                        if (mjp_decode_frame(vf->video, fixed, fi)) {
-                            memcpy(vf->framebuf, mjp_get_framebuf(vf->video),
-                                   VFLASH_SCREEN_W * VFLASH_SCREEN_H * 4);
-                            vf->vid.fb_dirty = 1;
-                            printf("[ROM-VIDEO] First MJP frame displayed!\n");
-                        } else {
-                            printf("[ROM-VIDEO] JPEG decode failed (stuffed=%u)\n", fi);
-                        }
-                        free(fixed);
-                    } else {
-                        printf("[ROM-VIDEO] No JPEG SOI found in first frame\n");
-                    }
+                    vf->mjp_player.hdr = malloc(sos_pos);
+                    memcpy(vf->mjp_player.hdr, tmp, sos_pos);
+                    vf->mjp_player.hdr_len = sos_pos;
+                    free(tmp);
+                    printf("[MJP-PLAY] Header: %u bytes (tables before SOS)\n", sos_pos);
                 }
-                free(mjpbuf);
+                vf->mjp_player.playing = 1;
+                printf("[MJP-PLAY] Playing %u bytes of video\n", vf->mjp_player.data_size);
             }
+        }
+    }
+
+    /* Decode next MJP frame if player is active */
+    if (vf->mjp_player.playing) {
+        if (++vf->mjp_player.frame_skip >= vf->mjp_player.frame_rate) {
+            vf->mjp_player.frame_skip = 0;
+            uint8_t *d = vf->mjp_player.data;
+            uint32_t dsz = vf->mjp_player.data_size;
+            uint32_t co = vf->mjp_player.chunk_off;
+
+            /* Skip non-video chunks (audio: 01wb, 02wb) */
+            while (co + 12 < dsz && memcmp(d + co, "00dc", 4) != 0) {
+                uint32_t csz = *(uint32_t*)(d + co + 8);
+                if (csz == 0 || csz > 2000000) break;
+                co += 12 + csz;
+                if (co & 1) co++;
+            }
+
+            if (co + 12 < dsz && memcmp(d + co, "00dc", 4) == 0) {
+                uint32_t csz = *(uint32_t*)(d + co + 8);
+                if (csz > 0 && csz < 2000000 && co + 12 + csz <= dsz) {
+                    if (mjp_decode_raw(vf->video, d + co + 12, csz,
+                                       vf->mjp_player.hdr, vf->mjp_player.hdr_len)) {
+                        memcpy(vf->framebuf, mjp_get_framebuf(vf->video),
+                               VFLASH_SCREEN_W * VFLASH_SCREEN_H * 4);
+                        vf->vid.fb_dirty = 1;
+                    }
+                    co += 12 + csz;
+                    if (co & 1) co++;
+                }
+            }
+
+            vf->mjp_player.chunk_off = co;
+            /* Loop video if we reached the end */
+            if (co + 12 >= dsz)
+                vf->mjp_player.chunk_off = 0x40;
         }
     }
 
