@@ -2760,7 +2760,13 @@ void vflash_run_frame(VFlash *vf) {
                     vf->timer.timer[0].count=37500;
                     vf->timer.timer[0].ctrl=0xE2;
                     vf->timer.irq.enable|=0x01;
-                    printf("[SCHED] IRQ wrapper installed\n");
+                    /* ROM init reached scheduler but no tasks registered.
+                     * Redirect CPU to BOOT.BIN entry to run its init
+                     * which registers game tasks via µMORE API.
+                     * BOOT.BIN callback is patched to our idle stub. */
+                    vf->cpu.r[15] = 0x10C00010;
+                    vf->cpu.r[13] = 0x10FFE000;
+                    printf("[SCHED] Redirecting to BOOT.BIN init at 0x10C00010\n");
                 }
                 vf->cpu.cpsr &= ~0x80; /* enable IRQs */
             }
@@ -2788,7 +2794,20 @@ void vflash_run_frame(VFlash *vf) {
 
     ztimer_raise_irq(&vf->timer, IRQ_TIMER0);   /* vsync */
 
-    /* (IRQ setup moved to scheduler loop detection above) */
+    /* Dump µMORE state after BOOT.BIN init (one-time at frame 10) */
+    if (vf->frame_count == 10 && vf->has_rom) {
+        printf("[POST-INIT] task_table[0..3] = %08X %08X %08X %08X\n",
+               *(uint32_t*)(vf->ram+0x1A9440), *(uint32_t*)(vf->ram+0x1A9444),
+               *(uint32_t*)(vf->ram+0x1A9448), *(uint32_t*)(vf->ram+0x1A944C));
+        printf("[POST-INIT] sched_state=%08X task_list=%08X task_mgr=%08X\n",
+               *(uint32_t*)(vf->ram+0x3585E0), *(uint32_t*)(vf->ram+0x3585C0),
+               *(uint32_t*)(vf->ram+0xACC78));
+        /* Also scan RAM for non-zero near task areas */
+        int nz = 0;
+        for (uint32_t a = 0x3585A0; a < 0x358700; a += 4)
+            if (*(uint32_t*)(vf->ram+a)) nz++;
+        printf("[POST-INIT] Non-zero words in 0x3585A0-0x358700: %d\n", nz);
+    }
 
     /* Don't clear framebuffer every frame — keep last displayed content.
      * On real hardware, the display controller holds the last frame.
