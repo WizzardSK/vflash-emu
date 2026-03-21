@@ -2628,6 +2628,48 @@ void vflash_run_frame(VFlash *vf) {
                 vf->timer.timer[0].load, vf->timer.timer[0].ctrl,
                 vf->timer.timer[0].count, vf->timer.irq.enable, vf->timer.irq.status);
     }
+    /* Display PTX image from disc on frame 0 (instant splash screen) */
+    if (vf->frame_count == 0 && vf->has_rom && vf->cd && vf->cd->is_open) {
+        CDEntry ptx_entry;
+        static const char *ptx_names[] = {
+            "_101KW_CHEETAH.PTX", "_101KW_PIC.PTX", "_KWF101.PTX",
+            "_FG_CHI_E01.PTX", "_KWF301.PTX", NULL
+        };
+        int ptx_found = 0;
+        for (int pi = 0; ptx_names[pi] && !ptx_found; pi++)
+            ptx_found = cdrom_find_file_any(vf->cd, ptx_names[pi], &ptx_entry);
+
+        if (ptx_found && ptx_entry.size > 100) {
+            uint8_t *ptx_buf = malloc(ptx_entry.size);
+            if (ptx_buf) {
+                int rd = cdrom_read_file(vf->cd, &ptx_entry, ptx_buf, 0, ptx_entry.size);
+                if (rd > 44) {
+                    uint32_t hdr_sz = *(uint32_t*)ptx_buf;
+                    if (hdr_sz >= 12 && hdr_sz <= 256 && hdr_sz < (uint32_t)rd) {
+                        uint32_t npix = ((uint32_t)rd - hdr_sz) / 2;
+                        uint32_t pw = 512;
+                        for (uint32_t tw = 512; tw >= 128; tw >>= 1)
+                            if (npix % tw == 0 && npix / tw <= 512) { pw = tw; break; }
+                        uint32_t ph = npix / pw;
+                        const uint16_t *px = (const uint16_t*)(ptx_buf + hdr_sz);
+                        for (uint32_t y = 0; y < ph && y < VFLASH_SCREEN_H; y++)
+                            for (uint32_t x = 0; x < pw && x < VFLASH_SCREEN_W; x++) {
+                                uint16_t p = px[y * pw + x];
+                                uint8_t b = ((p >> 10) & 0x1F) << 3;
+                                uint8_t g = ((p >> 5)  & 0x1F) << 3;
+                                uint8_t r = ( p        & 0x1F) << 3;
+                                vf->framebuf[y * VFLASH_SCREEN_W + x] =
+                                    0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+                            }
+                        printf("[PTX] Displayed %s (%ux%u XBGR1555)\n",
+                               ptx_entry.name, pw, ph);
+                    }
+                }
+                free(ptx_buf);
+            }
+        }
+    }
+
     /* MJP video player — load on first frame, then play frame-by-frame */
     if (vf->frame_count == 1 && vf->has_rom && vf->cd && vf->cd->is_open
         && !vf->mjp_player.playing) {
