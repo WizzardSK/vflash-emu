@@ -547,15 +547,17 @@ void arm9_undef(ARM9 *cpu) {
      * entry at 0x10C00010 (V.Flash BOOT format trampoline).
      * Also trigger ROM→RAM copy callback if set (for µMORE kernel). */
     if (undef_count == 1 && (CPSR & 0x1F) == ARM9_MODE_SVC) {
-        uint32_t boot_magic = cpu->mem_read32(cpu->mem_ctx, 0x10C00000);
-        if (boot_magic == 0x544F4F42) { /* "BOOT" in LE */
-            /* Call ROM→RAM copy callback if set */
-            if (cpu->undef_callback)
-                cpu->undef_callback(cpu->mem_ctx);
-            fprintf(stderr, "[UNDEF] ROM boot recovery: redirecting to BOOT.BIN at 0x10C00010\n");
-            PC = 0x10C00010;
-            return;
-        }
+        /* ROM init hit a NULL function pointer (garbage from SDRAM calibration).
+         * Copy ROM kernel code to RAM to fix this, then RESUME ROM init
+         * (don't redirect to BOOT.BIN). This allows ROM init's task
+         * registration code to run after disc load + BSS clear. */
+        if (cpu->undef_callback)
+            cpu->undef_callback(cpu->mem_ctx);
+        /* NOP the faulting instruction area so it becomes harmless */
+        cpu->mem_write32(cpu->mem_ctx, PC - 8, 0xE1A00000); /* NOP at fault addr */
+        fprintf(stderr, "[UNDEF] Patched + resuming ROM init at 0x%08X\n", PC - 8);
+        PC = PC - 8; /* re-execute the (now NOP'd) instruction */
+        return;
     }
 
     save_bank(cpu,CPSR&0x1F);
