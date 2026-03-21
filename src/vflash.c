@@ -1368,9 +1368,20 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                             printf("[ROM-PRELOAD] BOOT.BIN: %d bytes at RAM[0x%X] (0x%08X)\n",
                                    rd, dest, VFLASH_RAM_BASE + dest);
                         }
-                        /* NOTE: ROM→RAM copy is done at warm reboot time, not here.
-                         * Early copy breaks the boot flow (corrupts flash remap code). */
+                        /* Copy ROM to high RAM (above 512KB) so µMORE kernel code
+                         * is available. Skip first 512KB to avoid overwriting
+                         * flash window and calibration code. */
                         {
+                            uint32_t start = 0x80000; /* above 512KB boot area */
+                            uint32_t copy_sz = vf->rom_size;
+                            if (copy_sz > VFLASH_RAM_SIZE) copy_sz = VFLASH_RAM_SIZE;
+                            for (uint32_t ci = start; ci < copy_sz; ci += 4) {
+                                uint32_t rv = *(uint32_t*)(vf->rom + ci);
+                                if (rv != 0)
+                                    *(uint32_t*)(vf->ram + ci) = rv;
+                            }
+                            printf("[ROM-PRELOAD] ROM → RAM[0x%X+]: %u KB\n",
+                                   start, (copy_sz - start) / 1024);
                         }
                     }
                 }
