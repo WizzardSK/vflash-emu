@@ -274,18 +274,18 @@ Standard ARM dual-timer. Two timers per block at offsets +0x00 and +0x20:
 - 6 games extracted and analyzed; all share identical load addr (0x10C00000), ROM callback (0x1880)
 
 ### µMORE RTOS progress
-- **Full ROM init** — ROM boots completely without UNDEF (ROM code in RAM above 64KB)
-- **Scheduler loop running** — µMORE dispatch loop at ROM[0x7FFC8] iterates task list
-- **IRQ handler** — proper wrapper with register save/restore, timer clear, SUBS PC,LR,#4 return
-- **ARM LDM S-bit** — CPSR restored from SPSR on interrupt return (was missing)
-- **ROM→RAM copy** — triggered at UNDEF time via callback; µMORE kernel (1.9MB) in SDRAM
+- **Full ROM init decoded** — config table at ROM[0x6A0] with kernel/module addresses, sizes, entry offsets
+- **ROM boot sequence**: flash remap → SDRAM cal → memcpy kernel (662KB) → memcpy modules (1MB) → BSS clear (1.7MB) → data init → kernel entry → scheduler
+- **µMORE kernel entry** at 0x100A0FA0 (kernel base 0x9FFD4 + offset 0xFCC) — confirmed executing
+- **2-phase boot**: Phase 1 (ROM init → scheduler loop → call kernel entry) + Phase 2 (install IRQ wrapper → enable IRQs → idle at 57 FPS)
+- **IRQ handler** — wrapper at 0xFFF040 with register save/restore, timer clear, SUBS PC,LR,#4
+- **ARM LDM S-bit** — CPSR restored from SPSR on interrupt return
 - **Identity mapping** — MMU page table confirmed VA=PA for all 16MB RAM
-- **Two-phase boot**: ROM init → UNDEF → ROM→RAM copy → BOOT.BIN init → reboot → warm boot → scheduler
-- **BOOT.BIN init**: 3 functions execute, MMU enabled (TTB=0x10C08000), task init table at 0x10C0C014 with 2 entries (µMORE core + game module)
-- **Blocking**: BOOT.BIN init calls µMORE API but task_table[0x1A9440] remains empty. Init functions prepare data structures (linked lists, memzero) but don't write task registrations. The µMORE task_create API path needs deeper RE.
+- **Preload**: kernel ROM[0xC02C]→RAM[0x9FFD4], modules ROM[0xAE010]→RAM[0xAC000], ROM code above 512KB
+- **Blocking**: µMORE kernel entry (0xA0FA0) runs but doesn't register tasks — execution context (registers, internal state) doesn't match what kernel expects from normal ROM init call chain
 
 ### What doesn't work yet
-- **Game task execution** — µMORE scheduler runs but no game tasks registered by BOOT.BIN init
+- **Game task registration** — kernel entry runs but task_table at 0x1A9440 stays empty; needs correct call context from ROM init (register values, stack state, µMORE internal flags)
 - **LCD controller** (PL111 at `0xC0000000`) — not implemented; video uses DMA blit path
 - **In-game audio** — `.snd` PCM WAV files not decoded (cutscene audio works)
 
