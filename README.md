@@ -18,11 +18,11 @@ No other emulator exists for this system.
 
 ![V.Flash Emulator — The Incredibles](screenshot.png)
 
-*The Incredibles: Mission Incredible — first decoded video frame displayed in the emulator*
+*The Incredibles: Mission Incredible — PTX splash screen with cutscene video + audio playback*
 
 ## Status
 
-**Video output working** — all 5 available games display graphics (first MJP video frame).
+**Video + audio working** — all 5 available games play cutscene video with sound, scaled fullscreen.
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles.
 
 ### CPU — ARM926EJ-S (ARMv5TE)
@@ -54,15 +54,31 @@ After MMU init, µMORE remaps virtual address 0 → SDRAM (same as TI-Nspire `IN
 
 ### Video — MJP (Motion JPEG)
 - MIAV container parser with interleaved audio/video chunks (`00dc`, `01wb`, `02wb`)
+- Real-time cutscene playback: video frames decoded and displayed every emulator frame
 - 16-bit byte-swap decoder (V.Flash DMA stores JPEG in swapped byte order)
 - Automatic byte-stuffing restoration (hardware encoder omits JPEG FF 00 stuffing)
 - SOS-only P-frame support (subsequent frames reuse I-frame's DHT/DQT tables)
+- Nearest-neighbor scaling to fill 320×240 display (source: 224×112 to 352×160)
+- Video loops automatically at end of file
 - libjpeg-based decode with partial frame tolerance
+
+### Audio — IMA ADPCM
+- Decode `01wb` audio chunks from MIAV container
+- IMA ADPCM: 4-byte header (predictor + step_index) + nibble-packed samples
+- 16-bit byte-swap before decode (same as video data)
+- 22050Hz mono → 44100Hz stereo upsample for SDL output
+- Synchronized with video playback
+
+### PTX — Static Images
+- XBGR1555 pixel format, 44-byte header, 512px stride
+- Interleaved scene/sprite layout (even rows = scene, odd rows = sprite)
+- Auto-discovery via `cdrom_find_file_any` recursive disc search
+- Scaled to fill 320×240 display
+- Displayed as splash screen on boot (frame 0), before video starts
 
 ### Other subsystems
 - ISO 9660 with full subdirectory traversal and recursive disc-wide search
 - BIN/CUE disc image support (auto-detects raw 2352-byte sectors vs 2048-byte ISO)
-- `.ptx` raw bitmap auto-detection
 - V.Flash BOOT format parser (magic, load address, entry point, REL table)
 - HLE boot: scans disc for `BOOT.BIN`/`GAME/BOOT.BIN`/etc., detects ELF / V.Flash BOOT / raw ARM
 - SDL2 display + audio output
@@ -246,41 +262,72 @@ Standard ARM dual-timer. Two timers per block at offsets +0x00 and +0x20:
 ## Current status
 
 ### What works
-- **Video output** — first MJP video frame decoded and displayed for all 5 tested games
+- **Cutscene video playback** — real-time MJP decode, scaled fullscreen, looping, all 5 games
+- **Cutscene audio playback** — IMA ADPCM from MIAV `01wb` chunks, synchronized with video
+- **PTX splash screens** — XBGR1555 images displayed on boot, scaled fullscreen
 - **ATAPI CD-ROM** — full PACKET command protocol, reads sectors from disc image
-- **Boot ROM mode** — cold boot → flash DMA → SDRAM calibration → MMU enable → BOOT.BIN load → µMORE init → warm reboot → IRQ-driven idle
-- **µMORE RTOS init** — exception vectors installed at RAM[0xFF80-0xFFE4], IRQ handler at 0x100873D0
-- **MJP video decode** — MIAV container parse, 16-bit byte-swap, byte-stuffing restore, libjpeg decode
+- **Boot ROM mode** — cold boot → flash DMA → SDRAM calibration → MMU → BOOT.BIN → µMORE init → warm reboot → IRQ idle
+- **µMORE RTOS init** — exception vectors at RAM[0xFF80-0xFFE4], IRQ handler at 0x100873D0
 - **MMU translation** — L1 section + L2 coarse page table walk, VA→PA for all accesses
-- **SP804 timer** — periodic 60Hz IRQ via PL190 VIC, drives µMORE scheduler
+- **SP804 timer** — periodic 60Hz IRQ via PL190 VIC
 - **APB peripherals** — GPIO, PL011 UART, SP805 watchdog, PL031 RTC, PMU
 - 6 games extracted and analyzed; all share identical load addr (0x10C00000), ROM callback (0x1880)
 
 ### What doesn't work yet
 - **Game code execution** — µMORE scheduler enters idle loop, game tasks not yet loaded via ATAPI
 - **LCD controller** (PL111 at `0xC0000000`) — not implemented; video uses DMA blit path
-- **Audio playback** — PCM WAV (.snd) not decoded from disc
-- **PTX static images** — decoder exists but not integrated into boot display
+- **In-game audio** — `.snd` PCM WAV files not decoded (cutscene audio works)
 
-## MJP video format
+## MJP / MIAV format
 
-V.Flash games use a custom MIAV (Motion Interleaved Audio/Video) container with JPEG frames:
+V.Flash games use a custom MIAV (Motion Interleaved Audio/Video) container:
 
+### MIAV header (64 bytes)
 | Offset | Size | Field |
 |--------|------|-------|
 | 0x00 | 4 | `"MIAV"` magic |
-| 0x40 | 4 | Chunk tag: `"00dc"` (video), `"01wb"` / `"02wb"` (audio) |
-| 0x44 | 4 | Flags (0=I-frame, 1=P-frame) |
-| 0x48 | 4 | Data size (bytes) |
-| 0x4C | N | JPEG data (16-bit byte-swapped) |
+| 0x04 | 4 | Header size (64) |
+| 0x10 | 2 | Total frame count |
+| 0x14 | 2 | Frame rate (typically 30 fps) |
+| 0x16 | 2 | Audio track count (1 or 2) |
+| 0x18 | 2 | Video width (e.g. 224, 320, 352) |
+| 0x1A | 2 | Video height (e.g. 112, 144, 160) |
 
-Key discoveries:
+### Chunks (after header)
+| Field | Size | Description |
+|-------|------|-------------|
+| Tag | 4 | `"00dc"` (video), `"01wb"` / `"02wb"` (audio) |
+| Flags | 4 | Frame index (0=I-frame for video) |
+| Size | 4 | Data size in bytes |
+| Data | N | Payload (byte-swapped) |
+
+### Video key discoveries
 - JPEG data is stored with **16-bit pair-swapped byte order** (ZEVIO SoC DMA artifact)
 - The hardware JPEG encoder **omits byte-stuffing** (FF 00 sequences in entropy coded data)
 - After pair-swap, byte-stuffing must be re-inserted before standard JPEG decoders can parse it
 - First frame (I-frame) contains full JPEG headers (SOI, DQT, DHT, SOF0, SOS)
 - Subsequent frames (P-frames) contain only SOS + entropy data, reusing I-frame tables
-- Audio/video chunks are interleaved: `00dc` → `01wb` → `02wb` → `00dc` → ...
+
+### Audio format
+- **IMA ADPCM**, 16-bit byte-swapped (same as video)
+- 4-byte header: predictor (int16) + step_index (uint8) + reserved (uint8)
+- Followed by nibble-packed ADPCM samples (4-bit per sample)
+- Sample rate: 22050 Hz mono
+- ~408 bytes per chunk → ~808 samples → ~36ms per audio frame
+- Interleaved: `00dc` → `01wb` → `02wb` → `00dc` → ...
+
+### PTX image format
+| Offset | Size | Field |
+|--------|------|-------|
+| 0x00 | 4 | Header size (typically 44) |
+| 0x08 | 2 | Stride in bytes (e.g. 1024 = 512 pixels) |
+| 0x0A | 2 | Height per plane (e.g. 128) |
+| 0x0C | 4 | Bits per pixel (8 or 16) |
+| 0x24 | 4 | Pixel data size |
+
+- Pixel format: **XBGR1555** (16-bit: bit15=X, bits14-10=B, bits9-5=G, bits4-0=R)
+- Two interleaved planes at stride 512: even rows = scene, odd rows = sprite overlay
+- Texture atlas layout (multiple sub-images packed side by side)
 
 ## Notes
 
