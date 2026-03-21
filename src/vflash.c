@@ -2721,6 +2721,51 @@ void vflash_run_frame(VFlash *vf) {
         ztimer_tick(&vf->timer, actual);
         done += (int)actual;
 
+        /* Detect µMORE scheduler loop and set up IRQ infrastructure */
+        if (vf->has_rom && (vf->cpu.cpsr & 0x80) && vf->frame_count > 2) {
+            uint32_t pc = vf->cpu.r[15];
+            if (pc >= 0x1007FFC0 && pc <= 0x10080060) {
+                static int sched_setup = 0;
+                if (!sched_setup) {
+                    sched_setup = 1;
+                    /* Dump page table to understand VA→PA mapping */
+                    uint32_t ttb = vf->cpu.cp15.ttb;
+                    printf("[SCHED] PC=0x%08X TTB=0x%08X MMU=%d\n",
+                           pc, ttb, vf->cpu.cp15.mmu_enabled);
+                    for (uint32_t mb = 0; mb <= 0x110; mb++) {
+                        uint32_t l1 = phys_read32(vf, ttb + mb*4);
+                        if ((l1 & 3) == 2) {
+                            uint32_t pa = l1 & 0xFFF00000;
+                            if (mb <= 2 || (mb >= 0xFF && mb <= 0x110))
+                                printf("[SCHED] VA %08X → PA %08X\n", mb<<20, pa);
+                        }
+                    }
+                    /* Install IRQ wrapper at physical RAM[0xFF40] */
+                    uint32_t w = 0xFF40;
+                    *(uint32_t*)(vf->ram+w)=0xE92D500F; w+=4; /* PUSH */
+                    *(uint32_t*)(vf->ram+w)=0xE3A00001; w+=4; /* MOV R0,#1 */
+                    *(uint32_t*)(vf->ram+w)=0xE3A01000; w+=4; /* MOV R1,#0 */
+                    { int32_t bo=(int32_t)(0x872A4-(w+8))>>2;
+                      *(uint32_t*)(vf->ram+w)=0xEB000000|(bo&0xFFFFFF); w+=4; }
+                    *(uint32_t*)(vf->ram+w)=0xE59F000C; w+=4; /* LDR R0,[PC,#12] */
+                    *(uint32_t*)(vf->ram+w)=0xE3A01001; w+=4; /* MOV R1,#1 */
+                    *(uint32_t*)(vf->ram+w)=0xE5801000; w+=4; /* STR R1,[R0] */
+                    *(uint32_t*)(vf->ram+w)=0xE8BD500F; w+=4; /* POP */
+                    *(uint32_t*)(vf->ram+w)=0xE25EF004; w+=4; /* SUBS PC,LR,#4 */
+                    *(uint32_t*)(vf->ram+w)=0x9001000C; w+=4; /* pool */
+                    *(uint32_t*)(vf->ram+0xFF98)=0xE59FF03C; /* trampoline */
+                    *(uint32_t*)(vf->ram+0xFFDC)=0x1000FF40; /* wrapper addr */
+                    *(uint32_t*)(vf->ram+0x3585E0)=3; /* sched state */
+                    vf->timer.timer[0].load=37500;
+                    vf->timer.timer[0].count=37500;
+                    vf->timer.timer[0].ctrl=0xE2;
+                    vf->timer.irq.enable|=0x01;
+                    printf("[SCHED] IRQ wrapper installed\n");
+                }
+                vf->cpu.cpsr &= ~0x80; /* enable IRQs */
+            }
+        }
+
         /* Deliver IRQ if pending and CPSR allows */
         if (vf->frame_count > 1 && ztimer_irq_pending(&vf->timer)) {
             if (vf->cpu.r13_irq < 0x10000000u || vf->cpu.r13_irq > 0x10FFFFFFu)
@@ -2742,6 +2787,8 @@ void vflash_run_frame(VFlash *vf) {
     }
 
     ztimer_raise_irq(&vf->timer, IRQ_TIMER0);   /* vsync */
+
+    /* (IRQ setup moved to scheduler loop detection above) */
 
     /* Don't clear framebuffer every frame — keep last displayed content.
      * On real hardware, the display controller holds the last frame.
