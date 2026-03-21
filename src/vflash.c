@@ -1567,6 +1567,11 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                 printf("[REBOOT] Warm reboot #%d triggered (write 1 to 0x900A0008)\n",
                        vf->atapi.reboot_count);
 
+                /* Log µMORE kernel state in RAM */
+                printf("[REBOOT] IRQ handler RAM[0x873D0] = 0x%08X (expect 0x1A000002)\n",
+                       *(uint32_t*)(vf->ram + 0x873D0));
+                printf("[REBOOT] µMORE data RAM[0xACC78] = 0x%08X (task ptr)\n",
+                       *(uint32_t*)(vf->ram + 0xACC78));
                 /* Log what BOOT.BIN init wrote to key RAM locations */
                 printf("[REBOOT] RAM[0xFFC8] = 0x%08X 0x%08X 0x%08X 0x%08X\n",
                        *(uint32_t*)(vf->ram + 0xFFC8),
@@ -1607,6 +1612,21 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                 }
 
                 if (vf->atapi.reboot_count == 1) {
+                    /* Copy ROM to RAM so µMORE kernel code is accessible.
+                     * On real HW, BOOT.BIN init copies ROM to RAM via DMA.
+                     * Without this, RAM[0x873D0] (IRQ handler) is all zeros. */
+                    if (vf->rom && vf->rom_size > 0) {
+                        uint32_t copy_sz = vf->rom_size;
+                        if (copy_sz > VFLASH_RAM_SIZE) copy_sz = VFLASH_RAM_SIZE;
+                        for (uint32_t i = 0; i < copy_sz; i += 4) {
+                            uint32_t rv = *(uint32_t*)(vf->rom + i);
+                            uint32_t mv = *(uint32_t*)(vf->ram + i);
+                            if (mv == 0 && rv != 0)
+                                *(uint32_t*)(vf->ram + i) = rv;
+                        }
+                        printf("[REBOOT] Copied ROM → RAM (%u KB, merge)\n", copy_sz / 1024);
+                    }
+
                     /* First reboot: BOOT.BIN init has set up µMORE vectors and
                      * handler addresses at RAM[0xFF80-0xFFE4].
                      * ROM warm boot will jump to RAM[0xFFC8] (currently B .).
