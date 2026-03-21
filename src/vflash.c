@@ -2783,10 +2783,13 @@ void vflash_run_frame(VFlash *vf) {
                     vf->timer.irq.enable |= 0x01;
                 }
 
+                /* Set scheduler state (BOOT.BIN init reset it to 0) */
+                *(uint32_t*)(vf->ram + 0x3585E0) = 3;
+
                 /* Switch to SVC mode with IRQs enabled for idle loop */
                 vf->cpu.cpsr = 0x00000013; /* SVC, IRQ+FIQ enabled */
                 vf->cpu.r[15] = 0x10FFF00C; /* B . in idle stub */
-                printf("[SCHED] IRQs enabled, idle at 0x10FFF00C\n");
+                printf("[SCHED] sched_state=3, IRQs enabled, idle at 0x10FFF00C\n");
             }
         }
 
