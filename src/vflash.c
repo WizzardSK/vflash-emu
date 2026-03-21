@@ -1407,24 +1407,17 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                             printf("[ROM-PRELOAD] BOOT.BIN: %d bytes at RAM[0x%X] (0x%08X)\n",
                                    rd, dest, VFLASH_RAM_BASE + dest);
                         }
-                        /* Pre-load µMORE: ROM modules + kernel code to RAM.
-                         * Without this, ROM init hits NULL pointer at 0xA9D80.
-                         * 1. Copy ROM data segment to RAM (module tables)
-                         * 2. Copy ROM code above 512KB (kernel functions)
-                         * This allows ROM init to run completely. */
+                        /* Pre-load ROM modules + kernel so ROM init runs fully.
+                         * BSS clear will erase some — we re-copy in Phase 1. */
                         {
-                            /* Modules: ROM[0xAE010] → RAM[0xAC000] */
                             uint32_t ms = vf->rom_size - 0xAE010;
                             if (0xAC000 + ms > VFLASH_RAM_SIZE) ms = VFLASH_RAM_SIZE - 0xAC000;
                             memcpy(vf->ram + 0xAC000, vf->rom + 0xAE010, ms);
-                            /* ROM kernel code above 512KB */
                             for (uint32_t ci = 0x80000; ci < vf->rom_size; ci += 4) {
                                 uint32_t rv = *(uint32_t*)(vf->rom + ci);
-                                if (rv != 0)
-                                    *(uint32_t*)(vf->ram + ci) = rv;
+                                if (rv != 0) *(uint32_t*)(vf->ram + ci) = rv;
                             }
-                            printf("[ROM-PRELOAD] Modules + kernel: %u KB\n",
-                                   (ms + vf->rom_size - 0x80000) / 1024);
+                            printf("[ROM-PRELOAD] Modules + kernel loaded\n");
                         }
                     }
                 }
@@ -2737,10 +2730,14 @@ void vflash_run_frame(VFlash *vf) {
             uint32_t pc = vf->cpu.r[15];
             static int phase = 0;
 
-            /* Phase 1: scheduler loop detected → redirect to BOOT.BIN */
+            /* Phase 1: scheduler loop detected → re-copy modules + redirect */
             if (phase == 0 && (pc >= 0x1007FFC0 && pc <= 0x10080060)) {
                 phase = 1;
-                printf("[SCHED] Phase 1: scheduler loop at PC=0x%08X → BOOT.BIN init\n", pc);
+                /* Re-copy modules erased by BSS clear */
+                uint32_t ms = vf->rom_size - 0xAE010;
+                if (0xAC000 + ms > VFLASH_RAM_SIZE) ms = VFLASH_RAM_SIZE - 0xAC000;
+                memcpy(vf->ram + 0xAC000, vf->rom + 0xAE010, ms);
+                printf("[SCHED] Phase 1: re-copied modules (%u KB), → BOOT.BIN\n", ms/1024);
                 vf->cpu.r[15] = 0x10C00010;
                 vf->cpu.r[13] = 0x10FFE000;
             }
