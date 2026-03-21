@@ -544,10 +544,14 @@ void arm9_undef(ARM9 *cpu) {
 
     /* ROM boot recovery: if UNDEF fires with BOOT.BIN pre-loaded,
      * the ROM failed to load BOOT.BIN via ATAPI. Redirect to BOOT.BIN
-     * entry at 0x10C00010 (V.Flash BOOT format trampoline). */
+     * entry at 0x10C00010 (V.Flash BOOT format trampoline).
+     * Also trigger ROM→RAM copy callback if set (for µMORE kernel). */
     if (undef_count == 1 && (CPSR & 0x1F) == ARM9_MODE_SVC) {
         uint32_t boot_magic = cpu->mem_read32(cpu->mem_ctx, 0x10C00000);
         if (boot_magic == 0x544F4F42) { /* "BOOT" in LE */
+            /* Call ROM→RAM copy callback if set */
+            if (cpu->undef_callback)
+                cpu->undef_callback(cpu->mem_ctx);
             fprintf(stderr, "[UNDEF] ROM boot recovery: redirecting to BOOT.BIN at 0x10C00010\n");
             PC = 0x10C00010;
             return;

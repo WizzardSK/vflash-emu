@@ -705,6 +705,26 @@ static void atapi_write_reg(VFlash *vf, uint32_t reg, uint32_t val) {
 /* Simple 4096-entry direct-mapped TLB for 1MB section mappings.
  * Indexed by VA bits [31:20]. Each entry stores the PA base (bits[31:20])
  * with bit 0 set as valid flag. Flushed when TTB or MMU control changes. */
+/* UNDEF callback: copy ROM to RAM when BOOT.BIN redirect triggers.
+ * At this point flash remap and SDRAM calibration are complete,
+ * so copying ROM to RAM above 0x10000 is safe. This gives BOOT.BIN
+ * init access to µMORE kernel code for task registration. */
+static void undef_rom_copy(void *ctx) {
+    VFlash *vf = ctx;
+    if (!vf->rom || vf->rom_size == 0) return;
+    uint32_t start = 0x10000; /* skip first 64KB (boot code area) */
+    uint32_t copy_sz = vf->rom_size;
+    if (copy_sz > VFLASH_RAM_SIZE) copy_sz = VFLASH_RAM_SIZE;
+    for (uint32_t i = start; i < copy_sz; i += 4) {
+        uint32_t rv = *(uint32_t*)(vf->rom + i);
+        uint32_t mv = *(uint32_t*)(vf->ram + i);
+        if (mv == 0 && rv != 0)
+            *(uint32_t*)(vf->ram + i) = rv;
+    }
+    printf("[UNDEF-COPY] ROM → RAM[0x%X+]: %u KB (merge)\n",
+           start, (copy_sz - start) / 1024);
+}
+
 #define TLB_SIZE 4096
 static uint32_t tlb_cache[TLB_SIZE]; /* PA base | 1(valid). 0=invalid. */
 static uint32_t tlb_ttb = 0;        /* TTB value when TLB was filled */
@@ -1370,35 +1390,9 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                             printf("[ROM-PRELOAD] BOOT.BIN: %d bytes at RAM[0x%X] (0x%08X)\n",
                                    rd, dest, VFLASH_RAM_BASE + dest);
                         }
-                        /* Copy ROM to high RAM (above 512KB) so µMORE kernel code
-                         * is available. Skip first 512KB to avoid overwriting
-                         * flash window and calibration code. */
-                        {
-                            uint32_t start = 0x80000; /* above 512KB boot area */
-                            uint32_t copy_sz = vf->rom_size;
-                            if (copy_sz > VFLASH_RAM_SIZE) copy_sz = VFLASH_RAM_SIZE;
-                            for (uint32_t ci = start; ci < copy_sz; ci += 4) {
-                                uint32_t rv = *(uint32_t*)(vf->rom + ci);
-                                if (rv != 0)
-                                    *(uint32_t*)(vf->ram + ci) = rv;
-                            }
-                            printf("[ROM-PRELOAD] ROM → RAM[0x%X+]: %u KB\n",
-                                   start, (copy_sz - start) / 1024);
-                        }
-
-                        /* Patch BOOT.BIN callback: instead of 0x1880 (reboot),
-                         * jump to an IRQ-enable + idle stub. After BOOT.BIN init
-                         * registers tasks and enables MMU, we enter the idle loop
-                         * with IRQs enabled so the µMORE scheduler can dispatch. */
-                        {
-                            uint32_t s = 0xFF60;
-                            *(uint32_t*)(vf->ram + s+0)  = 0xE10F0000; /* MRS R0, CPSR */
-                            *(uint32_t*)(vf->ram + s+4)  = 0xE3C000C0; /* BIC R0, #0xC0 */
-                            *(uint32_t*)(vf->ram + s+8)  = 0xE129F000; /* MSR CPSR, R0 */
-                            *(uint32_t*)(vf->ram + s+12) = 0xEAFFFFFE; /* B . */
-                            *(uint32_t*)(vf->ram + 0xC00020) = 0x1000FF60;
-                            printf("[ROM-PRELOAD] Patched BOOT callback → 0x1000FF60 (no reboot)\n");
-                        }
+                        /* ROM→RAM copy is deferred to UNDEF callback.
+                         * At UNDEF time, flash remap and calibration are done
+                         * so copying ROM to RAM won't interfere with boot code. */
                     }
                 }
             }
@@ -1699,39 +1693,9 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                     *(uint32_t*)(vf->ram + 0xFFDC) = 0x1000FF40;
                     printf("[REBOOT] IRQ wrapper at 0x1000FF40 → µMORE 0x100872A4\n");
 
-                    /* Set µMORE scheduler state to "running" (=3). */
-                    *(uint32_t*)(vf->ram + 0x3585E0) = 3;
-
-                    /* Register a dummy task in the dispatch table.
-                     * Table at RAM[0x1A9440], indexed by R0 arg.
-                     * Each entry points to a task struct.
-                     * Task struct: +0x04 = func_ptr, +0x14 = counter (0=dispatch).
-                     * We create a minimal task that just returns. */
-                    {
-                        /* Task struct at RAM[0x7E0000] (safe area) */
-                        uint32_t task_addr = 0x7E0000;
-                        memset(vf->ram + task_addr, 0, 0x80);
-                        *(uint32_t*)(vf->ram + task_addr + 0x00) = 1;           /* non-zero */
-                        *(uint32_t*)(vf->ram + task_addr + 0x04) = 0x1000FF30;  /* func: BX LR (return) */
-                        *(uint32_t*)(vf->ram + task_addr + 0x14) = 0;           /* counter = 0 → dispatch */
-
-                        /* Write 'BX LR' stub at RAM[0xFF30] */
-                        *(uint32_t*)(vf->ram + 0xFF30) = 0xE12FFF1E; /* BX LR */
-
-                        /* Set task_table[0] and [1] = pointer to our task */
-                        *(uint32_t*)(vf->ram + 0x1A9440 + 0) = 0x10000000 + task_addr;
-                        *(uint32_t*)(vf->ram + 0x1A9440 + 4) = 0x10000000 + task_addr;
-
-                        /* Also need task manager state at [0xACC78] */
-                        *(uint32_t*)(vf->ram + 0xACC78) = 0x10000000 + task_addr;
-
-                        /* Task list head at [0x3585C0] (used in handler 0x8743C) */
-                        *(uint32_t*)(vf->ram + 0x3585C0) = 0x10000000 + task_addr;
-
-                        printf("[REBOOT] Registered dummy task at 0x%08X\n",
-                               0x10000000 + task_addr);
-                    }
-                    printf("[REBOOT] Set µMORE scheduler state = 3\n");
+                    /* Don't set dummy tasks — let BOOT.BIN init register real ones.
+                     * With ROM→RAM copy at UNDEF time, µMORE API should work. */
+                    printf("[REBOOT] Waiting for µMORE tasks from BOOT.BIN init...\n");
 
                     /* Set up SP804 timer for periodic IRQs */
                     vf->timer.timer[0].load = 37500;
@@ -2594,6 +2558,7 @@ VFlash* vflash_create(const char *disc_path) {
     vf->cpu.mem_write32  = mem_write32;
     vf->cpu.mem_write16  = mem_write16;
     vf->cpu.mem_write8   = mem_write8;
+    vf->cpu.undef_callback = undef_rom_copy;
 
     /* Try to load boot ROM (70004.bin) — enables real boot instead of HLE */
     {
