@@ -202,6 +202,7 @@ struct VFlash {
         uint8_t  *hdr;         /* I-frame JPEG header (SOI+tables, before SOS) */
         uint32_t  hdr_len;
         uint32_t  chunk_off;   /* current chunk offset in data */
+        uint32_t  vid_w, vid_h; /* video dimensions from MIAV header */
         int       playing;
         int       frame_rate;  /* frames to skip between decodes (throttle) */
         int       frame_skip;
@@ -2709,9 +2710,14 @@ void vflash_run_frame(VFlash *vf) {
             if (vf->mjp_player.data) {
                 int rd = cdrom_read_file(vf->cd, &mjp_entry, vf->mjp_player.data, 0, load_sz);
                 vf->mjp_player.data_size = (uint32_t)rd;
-                vf->mjp_player.chunk_off = 0x40; /* first chunk after MIAV header */
-                vf->mjp_player.frame_rate = 1; /* decode every emulator frame */
+                vf->mjp_player.chunk_off = 0x40;
+                vf->mjp_player.frame_rate = 1;
                 vf->mjp_player.frame_skip = 0;
+                /* Read video dimensions from MIAV header */
+                if (rd >= 0x1C) {
+                    vf->mjp_player.vid_w = *(uint16_t*)(vf->mjp_player.data + 0x18);
+                    vf->mjp_player.vid_h = *(uint16_t*)(vf->mjp_player.data + 0x1A);
+                }
 
                 /* Extract I-frame header (SOI + DQT + DHT + SOF0, before SOS) */
                 if (rd >= 0x4C && memcmp(vf->mjp_player.data + 0x40, "00dc", 4) == 0) {
@@ -2771,8 +2777,20 @@ void vflash_run_frame(VFlash *vf) {
                 if (csz > 0 && csz < 2000000 && co + 12 + csz <= dsz) {
                     if (mjp_decode_raw(vf->video, d + co + 12, csz,
                                        vf->mjp_player.hdr, vf->mjp_player.hdr_len)) {
-                        memcpy(vf->framebuf, mjp_get_framebuf(vf->video),
-                               VFLASH_SCREEN_W * VFLASH_SCREEN_H * 4);
+                        /* Scale decoded frame to fill 320×240 display */
+                        uint32_t *src = mjp_get_framebuf(vf->video);
+                        int sw = vf->video->width;
+                        int src_w = vf->mjp_player.vid_w ? vf->mjp_player.vid_w : sw;
+                        int src_h = vf->mjp_player.vid_h ? vf->mjp_player.vid_h : vf->video->height;
+                        if (src_w > sw) src_w = sw;
+                        if (src_h > vf->video->height) src_h = vf->video->height;
+                        for (int dy = 0; dy < VFLASH_SCREEN_H; dy++) {
+                            int sy = dy * src_h / VFLASH_SCREEN_H;
+                            for (int dx = 0; dx < VFLASH_SCREEN_W; dx++) {
+                                int sx = dx * src_w / VFLASH_SCREEN_W;
+                                vf->framebuf[dy * VFLASH_SCREEN_W + dx] = src[sy * sw + sx];
+                            }
+                        }
                         vf->vid.fb_dirty = 1;
                     }
                     co += 12 + csz;
