@@ -2730,54 +2730,63 @@ void vflash_run_frame(VFlash *vf) {
         ztimer_tick(&vf->timer, actual);
         done += (int)actual;
 
-        /* Detect µMORE scheduler loop and set up IRQ infrastructure */
-        if (vf->has_rom && (vf->cpu.cpsr & 0x80) && vf->frame_count > 2) {
+        /* Detect scheduler loop or idle stub and set up IRQ handling.
+         * Phase 1: ROM init → scheduler loop (0x7FFC0-0x80060) → redirect to BOOT.BIN
+         * Phase 2: BOOT.BIN init → idle stub (0xFFF000) → install IRQ, enable IRQs */
+        if (vf->has_rom && vf->frame_count > 2) {
             uint32_t pc = vf->cpu.r[15];
-            if (pc >= 0x1007FFC0 && pc <= 0x10080060) {
-                static int sched_setup = 0;
-                if (!sched_setup) {
-                    sched_setup = 1;
-                    /* Dump page table to understand VA→PA mapping */
-                    uint32_t ttb = vf->cpu.cp15.ttb;
-                    printf("[SCHED] PC=0x%08X TTB=0x%08X MMU=%d\n",
-                           pc, ttb, vf->cpu.cp15.mmu_enabled);
-                    for (uint32_t mb = 0; mb <= 0x110; mb++) {
-                        uint32_t l1 = phys_read32(vf, ttb + mb*4);
-                        if ((l1 & 3) == 2) {
-                            uint32_t pa = l1 & 0xFFF00000;
-                            if (mb <= 2 || (mb >= 0xFF && mb <= 0x110))
-                                printf("[SCHED] VA %08X → PA %08X\n", mb<<20, pa);
-                        }
-                    }
-                    /* Install IRQ wrapper at physical RAM[0xFF40] */
-                    uint32_t w = 0xFF40;
-                    *(uint32_t*)(vf->ram+w)=0xE92D500F; w+=4; /* PUSH */
-                    *(uint32_t*)(vf->ram+w)=0xE3A00001; w+=4; /* MOV R0,#1 */
-                    *(uint32_t*)(vf->ram+w)=0xE3A01000; w+=4; /* MOV R1,#0 */
-                    { int32_t bo=(int32_t)(0x872A4-(w+8))>>2;
-                      *(uint32_t*)(vf->ram+w)=0xEB000000|(bo&0xFFFFFF); w+=4; }
-                    *(uint32_t*)(vf->ram+w)=0xE59F000C; w+=4; /* LDR R0,[PC,#12] */
-                    *(uint32_t*)(vf->ram+w)=0xE3A01001; w+=4; /* MOV R1,#1 */
-                    *(uint32_t*)(vf->ram+w)=0xE5801000; w+=4; /* STR R1,[R0] */
-                    *(uint32_t*)(vf->ram+w)=0xE8BD500F; w+=4; /* POP */
-                    *(uint32_t*)(vf->ram+w)=0xE25EF004; w+=4; /* SUBS PC,LR,#4 */
-                    *(uint32_t*)(vf->ram+w)=0x9001000C; w+=4; /* pool */
-                    *(uint32_t*)(vf->ram+0xFF98)=0xE59FF03C; /* trampoline */
-                    *(uint32_t*)(vf->ram+0xFFDC)=0x10FFF040; /* IRQ wrapper */
-                    *(uint32_t*)(vf->ram+0x3585E0)=3; /* sched state */
-                    vf->timer.timer[0].load=37500;
-                    vf->timer.timer[0].count=37500;
-                    vf->timer.timer[0].ctrl=0xE2;
-                    vf->timer.irq.enable|=0x01;
-                    /* ROM init reached scheduler but no tasks registered.
-                     * Redirect CPU to BOOT.BIN entry to run its init
-                     * which registers game tasks via µMORE API.
-                     * BOOT.BIN callback is patched to our idle stub. */
-                    vf->cpu.r[15] = 0x10C00010;
-                    vf->cpu.r[13] = 0x10FFE000;
-                    printf("[SCHED] Redirecting to BOOT.BIN init at 0x10C00010\n");
+            static int phase = 0;
+
+            /* Phase 1: scheduler loop detected → redirect to BOOT.BIN */
+            if (phase == 0 && (pc >= 0x1007FFC0 && pc <= 0x10080060)) {
+                phase = 1;
+                printf("[SCHED] Phase 1: scheduler loop at PC=0x%08X → BOOT.BIN init\n", pc);
+                vf->cpu.r[15] = 0x10C00010;
+                vf->cpu.r[13] = 0x10FFE000;
+            }
+
+            /* Phase 2: idle stub reached → BOOT.BIN init done, set up IRQs */
+            if (phase == 1 && (pc >= 0x10FFF000 && pc <= 0x10FFF010)) {
+                phase = 2;
+                printf("[SCHED] Phase 2: BOOT.BIN init done, installing IRQ handler\n");
+
+                /* Dump task state */
+                printf("[SCHED] task_table[0..3] = %08X %08X %08X %08X\n",
+                       *(uint32_t*)(vf->ram+0x1A9440), *(uint32_t*)(vf->ram+0x1A9444),
+                       *(uint32_t*)(vf->ram+0x1A9448), *(uint32_t*)(vf->ram+0x1A944C));
+                printf("[SCHED] sched_state=%08X task_list=%08X task_mgr=%08X\n",
+                       *(uint32_t*)(vf->ram+0x3585E0), *(uint32_t*)(vf->ram+0x3585C0),
+                       *(uint32_t*)(vf->ram+0xACC78));
+
+                /* Install IRQ wrapper at 0xFFF040 (BOOT.BIN can't overwrite) */
+                uint32_t w = 0xFFF040;
+                *(uint32_t*)(vf->ram+w)=0xE92D500F; w+=4;
+                *(uint32_t*)(vf->ram+w)=0xE3A00001; w+=4;
+                *(uint32_t*)(vf->ram+w)=0xE3A01000; w+=4;
+                { int32_t bo=(int32_t)(0x872A4-(w+8))>>2;
+                  *(uint32_t*)(vf->ram+w)=0xEB000000|(bo&0xFFFFFF); w+=4; }
+                *(uint32_t*)(vf->ram+w)=0xE59F000C; w+=4;
+                *(uint32_t*)(vf->ram+w)=0xE3A01001; w+=4;
+                *(uint32_t*)(vf->ram+w)=0xE5801000; w+=4;
+                *(uint32_t*)(vf->ram+w)=0xE8BD500F; w+=4;
+                *(uint32_t*)(vf->ram+w)=0xE25EF004; w+=4;
+                *(uint32_t*)(vf->ram+w)=0x9001000C; w+=4;
+
+                /* Re-patch IRQ vector (BOOT.BIN init overwrote 0xFFDC) */
+                *(uint32_t*)(vf->ram+0xFFDC) = 0x10FFF040;
+
+                /* Timer + VIC */
+                if (vf->timer.timer[0].load == 0) {
+                    vf->timer.timer[0].load = 37500;
+                    vf->timer.timer[0].count = 37500;
+                    vf->timer.timer[0].ctrl = 0xE2;
+                    vf->timer.irq.enable |= 0x01;
                 }
-                vf->cpu.cpsr &= ~0x80; /* enable IRQs */
+
+                /* Switch to SVC mode with IRQs enabled for idle loop */
+                vf->cpu.cpsr = 0x00000013; /* SVC, IRQ+FIQ enabled */
+                vf->cpu.r[15] = 0x10FFF00C; /* B . in idle stub */
+                printf("[SCHED] IRQs enabled, idle at 0x10FFF00C\n");
             }
         }
 
@@ -2803,14 +2812,8 @@ void vflash_run_frame(VFlash *vf) {
 
     ztimer_raise_irq(&vf->timer, IRQ_TIMER0);   /* vsync */
 
-    /* Dump µMORE state after BOOT.BIN init (one-time at frame 10) */
-    if (vf->frame_count == 10 && vf->has_rom) {
-        printf("[POST-INIT] task_table[0..3] = %08X %08X %08X %08X\n",
-               *(uint32_t*)(vf->ram+0x1A9440), *(uint32_t*)(vf->ram+0x1A9444),
-               *(uint32_t*)(vf->ram+0x1A9448), *(uint32_t*)(vf->ram+0x1A944C));
-        printf("[POST-INIT] sched_state=%08X task_list=%08X task_mgr=%08X\n",
-               *(uint32_t*)(vf->ram+0x3585E0), *(uint32_t*)(vf->ram+0x3585C0),
-               *(uint32_t*)(vf->ram+0xACC78));
+    /* (task state dump moved to phase 2 above) */
+    if (0 && vf->frame_count == 10 && vf->has_rom) {
         /* Also scan RAM for non-zero near task areas */
         int nz = 0;
         for (uint32_t a = 0x3585A0; a < 0x358700; a += 4)
