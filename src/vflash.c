@@ -2646,15 +2646,16 @@ void vflash_run_frame(VFlash *vf) {
                 if (rd > 44) {
                     uint32_t hdr_sz = *(uint32_t*)ptx_buf;
                     if (hdr_sz >= 12 && hdr_sz <= 256 && hdr_sz < (uint32_t)rd) {
-                        uint32_t npix = ((uint32_t)rd - hdr_sz) / 2;
+                        /* PTX stores 2 interleaved images (scene + sprite) at stride 512.
+                         * Even rows = scene image (A), odd rows = sprite overlay (B).
+                         * Display scene image: read every other row. */
                         uint32_t pw = 512;
-                        for (uint32_t tw = 512; tw >= 128; tw >>= 1)
-                            if (npix % tw == 0 && npix / tw <= 512) { pw = tw; break; }
-                        uint32_t ph = npix / pw;
+                        uint32_t total_rows = ((uint32_t)rd - hdr_sz) / (pw * 2);
+                        uint32_t ph = total_rows / 2; /* half rows = scene image */
                         const uint16_t *px = (const uint16_t*)(ptx_buf + hdr_sz);
                         for (uint32_t y = 0; y < ph && y < VFLASH_SCREEN_H; y++)
                             for (uint32_t x = 0; x < pw && x < VFLASH_SCREEN_W; x++) {
-                                uint16_t p = px[y * pw + x];
+                                uint16_t p = px[y * 2 * pw + x]; /* even rows */
                                 uint8_t b = ((p >> 10) & 0x1F) << 3;
                                 uint8_t g = ((p >> 5)  & 0x1F) << 3;
                                 uint8_t r = ( p        & 0x1F) << 3;
