@@ -30,6 +30,11 @@ void    audio_set_volume(Audio *a, uint32_t vol);
 int     snd_decode(const uint8_t *data, uint32_t size,
                    int16_t **out_samples, uint32_t *out_count, uint32_t *out_rate);
 
+/* IMA ADPCM decoder for V.Flash MJP audio chunks.
+ * Data format: 4-byte header (predictor + step_index) + nibble-packed ADPCM.
+ * Decodes to mono 22050Hz, auto-upsampled to 44100Hz stereo. */
+void    audio_decode_ima_adpcm(Audio *a, const uint8_t *data, uint32_t size);
+
 /* DMA audio queue: raw PCM from RAM (called from I/O write handler)
  * stereo: 1=stereo, 0=mono
  * s16:    1=16-bit signed, 0=8-bit unsigned */

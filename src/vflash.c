@@ -2748,10 +2748,20 @@ void vflash_run_frame(VFlash *vf) {
             uint32_t dsz = vf->mjp_player.data_size;
             uint32_t co = vf->mjp_player.chunk_off;
 
-            /* Skip non-video chunks (audio: 01wb, 02wb) */
+            /* Process audio chunks (01wb) before next video frame */
             while (co + 12 < dsz && memcmp(d + co, "00dc", 4) != 0) {
                 uint32_t csz = *(uint32_t*)(d + co + 8);
                 if (csz == 0 || csz > 2000000) break;
+                if (memcmp(d + co, "01wb", 4) == 0 && csz >= 4) {
+                    /* IMA ADPCM audio: byte-swap then decode */
+                    uint8_t *abuf = malloc(csz);
+                    if (abuf) {
+                        for (uint32_t i = 0; i + 1 < csz; i += 2)
+                            { abuf[i] = d[co+12+i+1]; abuf[i+1] = d[co+12+i]; }
+                        audio_decode_ima_adpcm(vf->audio, abuf, csz);
+                        free(abuf);
+                    }
+                }
                 co += 12 + csz;
                 if (co & 1) co++;
             }

@@ -23,7 +23,7 @@ static void audio_callback(void *userdata, uint8_t *stream, int len) {
 
 Audio* audio_create(void) {
     Audio *a = calloc(1, sizeof(Audio));
-    a->buf_size = AUDIO_BUF_SAMPLES * 8;
+    a->buf_size = AUDIO_BUF_SAMPLES * 64; /* large buffer for MJP audio */
     a->buf = calloc(a->buf_size, sizeof(int16_t));
     a->volume = 200;
     return a;
@@ -128,6 +128,52 @@ int snd_decode(const uint8_t *data, uint32_t size,
     memcpy(*out_samples, data, size);
     printf("[Audio] Raw PCM: %u samples\n", samples);
     return 1;
+}
+
+/* ---- IMA ADPCM decoder (V.Flash MJP audio) ---- */
+static const int16_t ima_step_table[89] = {
+    7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,
+    60,66,73,80,88,97,107,118,130,143,157,173,190,209,230,253,279,307,
+    337,371,408,449,494,544,598,658,724,796,876,963,1060,1166,1282,1411,
+    1552,1707,1878,2066,2272,2499,2749,3024,3327,3660,4026,4428,4871,
+    5358,5894,6484,7132,7845,8630,9493,10442,11487,12635,13899,15289,
+    16818,18500,20350,22385,24623,27086,29794,32767
+};
+static const int8_t ima_index_table[16] = {
+    -1,-1,-1,-1, 2,4,6,8, -1,-1,-1,-1, 2,4,6,8
+};
+
+void audio_decode_ima_adpcm(Audio *a, const uint8_t *data, uint32_t size) {
+    if (!a || !data || size < 4) return;
+
+    /* 4-byte header: predictor(2) + step_index(1) + reserved(1) */
+    int16_t predictor = (int16_t)(data[0] | (data[1] << 8));
+    int step_idx = data[2];
+    if (step_idx > 88) step_idx = 88;
+
+    /* Decode nibbles → 16-bit PCM, push as mono (auto-upmixed to stereo) */
+    /* Resample from 22050 to 44100 by duplicating each sample */
+    for (uint32_t i = 4; i < size; i++) {
+        uint8_t byte = data[i];
+        for (int n = 0; n < 2; n++) {
+            uint8_t nibble = (n == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
+            int step = ima_step_table[step_idx];
+            int diff = step >> 3;
+            if (nibble & 1) diff += step >> 2;
+            if (nibble & 2) diff += step >> 1;
+            if (nibble & 4) diff += step;
+            if (nibble & 8) diff = -diff;
+            predictor = (int16_t)(predictor + diff);
+            if (predictor > 32767) predictor = 32767;
+            if (predictor < -32768) predictor = -32768;
+            step_idx += ima_index_table[nibble];
+            if (step_idx < 0) step_idx = 0;
+            if (step_idx > 88) step_idx = 88;
+            /* Push sample twice (22050→44100 upsample) as stereo (L+R) */
+            int16_t stereo[4] = {predictor, predictor, predictor, predictor};
+            audio_push_samples(a, stereo, 4);
+        }
+    }
 }
 
 /* Queue raw PCM from RAM (called from DMA write handler) */
