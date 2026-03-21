@@ -1407,9 +1407,25 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                             printf("[ROM-PRELOAD] BOOT.BIN: %d bytes at RAM[0x%X] (0x%08X)\n",
                                    rd, dest, VFLASH_RAM_BASE + dest);
                         }
-                        /* ROM→RAM copy is deferred to UNDEF callback.
-                         * At UNDEF time, flash remap and calibration are done
-                         * so copying ROM to RAM won't interfere with boot code. */
+                        /* Pre-load µMORE: ROM modules + kernel code to RAM.
+                         * Without this, ROM init hits NULL pointer at 0xA9D80.
+                         * 1. Copy ROM data segment to RAM (module tables)
+                         * 2. Copy ROM code above 512KB (kernel functions)
+                         * This allows ROM init to run completely. */
+                        {
+                            /* Modules: ROM[0xAE010] → RAM[0xAC000] */
+                            uint32_t ms = vf->rom_size - 0xAE010;
+                            if (0xAC000 + ms > VFLASH_RAM_SIZE) ms = VFLASH_RAM_SIZE - 0xAC000;
+                            memcpy(vf->ram + 0xAC000, vf->rom + 0xAE010, ms);
+                            /* ROM kernel code above 512KB */
+                            for (uint32_t ci = 0x80000; ci < vf->rom_size; ci += 4) {
+                                uint32_t rv = *(uint32_t*)(vf->rom + ci);
+                                if (rv != 0)
+                                    *(uint32_t*)(vf->ram + ci) = rv;
+                            }
+                            printf("[ROM-PRELOAD] Modules + kernel: %u KB\n",
+                                   (ms + vf->rom_size - 0x80000) / 1024);
+                        }
                     }
                 }
             }
