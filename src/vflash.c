@@ -1655,6 +1655,9 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                     {
                         uint32_t w = 0xFF40;
                         *(uint32_t*)(vf->ram + w) = 0xE92D500F; w += 4; /* PUSH {R0-R3,R12,LR} */
+                        /* Set R0=1 (timer IRQ task index), R1=0 (no direct task) */
+                        *(uint32_t*)(vf->ram + w) = 0xE3A00001; w += 4; /* MOV R0, #1 */
+                        *(uint32_t*)(vf->ram + w) = 0xE3A01000; w += 4; /* MOV R1, #0 */
                         int32_t bl_off = (int32_t)(0x872A4 - (w + 8)) >> 2;
                         *(uint32_t*)(vf->ram + w) = 0xEB000000 | (bl_off & 0x00FFFFFF); w += 4;
                         /* Clear SP804 timer IRQ after µMORE handler returns.
@@ -1669,10 +1672,38 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                     *(uint32_t*)(vf->ram + 0xFFDC) = 0x1000FF40;
                     printf("[REBOOT] IRQ wrapper at 0x1000FF40 → µMORE 0x100872A4\n");
 
-                    /* Set µMORE scheduler state to "running" (=3).
-                     * The IRQ dispatcher at 0x872B4 checks [0x103585E0]==3.
-                     * Also init related data structures. */
+                    /* Set µMORE scheduler state to "running" (=3). */
                     *(uint32_t*)(vf->ram + 0x3585E0) = 3;
+
+                    /* Register a dummy task in the dispatch table.
+                     * Table at RAM[0x1A9440], indexed by R0 arg.
+                     * Each entry points to a task struct.
+                     * Task struct: +0x04 = func_ptr, +0x14 = counter (0=dispatch).
+                     * We create a minimal task that just returns. */
+                    {
+                        /* Task struct at RAM[0x7E0000] (safe area) */
+                        uint32_t task_addr = 0x7E0000;
+                        memset(vf->ram + task_addr, 0, 0x80);
+                        *(uint32_t*)(vf->ram + task_addr + 0x00) = 1;           /* non-zero */
+                        *(uint32_t*)(vf->ram + task_addr + 0x04) = 0x1000FF30;  /* func: BX LR (return) */
+                        *(uint32_t*)(vf->ram + task_addr + 0x14) = 0;           /* counter = 0 → dispatch */
+
+                        /* Write 'BX LR' stub at RAM[0xFF30] */
+                        *(uint32_t*)(vf->ram + 0xFF30) = 0xE12FFF1E; /* BX LR */
+
+                        /* Set task_table[0] and [1] = pointer to our task */
+                        *(uint32_t*)(vf->ram + 0x1A9440 + 0) = 0x10000000 + task_addr;
+                        *(uint32_t*)(vf->ram + 0x1A9440 + 4) = 0x10000000 + task_addr;
+
+                        /* Also need task manager state at [0xACC78] */
+                        *(uint32_t*)(vf->ram + 0xACC78) = 0x10000000 + task_addr;
+
+                        /* Task list head at [0x3585C0] (used in handler 0x8743C) */
+                        *(uint32_t*)(vf->ram + 0x3585C0) = 0x10000000 + task_addr;
+
+                        printf("[REBOOT] Registered dummy task at 0x%08X\n",
+                               0x10000000 + task_addr);
+                    }
                     printf("[REBOOT] Set µMORE scheduler state = 3\n");
 
                     /* Set up SP804 timer for periodic IRQs */
