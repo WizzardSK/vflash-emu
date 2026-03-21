@@ -724,17 +724,20 @@ static void undef_rom_copy(void *ctx) {
     printf("[UNDEF-COPY] ROM → RAM[0x%X+]: %u KB (merge)\n",
            start, (copy_sz - start) / 1024);
 
-    /* Copy µMORE kernel modules from BOOT.BIN to where ROM init expects them.
-     * ROM init normally reads ~1MB from disc (BOOT.BIN offset 0xAE010)
-     * and loads it to RAM[0xAC000]. Without working ATAPI disc read,
-     * the function pointer table at RAM[0xAC000+] stays NULL → UNDEF.
-     * We pre-copy the data from our already-loaded BOOT.BIN. */
-    uint32_t src_off  = 0xC00000 + 0xAE010; /* BOOT.BIN[0xAE010] in RAM */
-    uint32_t dst_off  = 0xAC000;            /* where ROM expects it */
-    uint32_t mod_size = 0xF95B0;            /* ~1MB of µMORE modules */
-    if (src_off + mod_size <= VFLASH_RAM_SIZE && dst_off + mod_size <= VFLASH_RAM_SIZE) {
-        memcpy(vf->ram + dst_off, vf->ram + src_off, mod_size);
-        printf("[UNDEF-COPY] BOOT.BIN[0xAE010] → RAM[0xAC000]: %u KB (µMORE modules)\n",
+    /* Copy µMORE kernel modules from ROM to RAM.
+     * ROM init at 0x544 does: memcpy(RAM[0xAC000], ROM[0xAE010], 0xF95B0)
+     * This copies ~1MB of µMORE data (task tables, function pointers, etc.)
+     * from ROM's data section to SDRAM. Without this, ROM init hits a NULL
+     * function pointer at 0xA9D80 → UNDEF. */
+    uint32_t dst_off  = 0xAC000;
+    uint32_t src_rom  = 0xAE010;
+    /* Copy all ROM data from 0xAE010 to end of ROM content (0x1A75BC).
+     * The original 0xF95B0 size doesn't cover task_table at 0x1A9440. */
+    uint32_t mod_size = vf->rom_size - src_rom;
+    if (src_rom + mod_size <= vf->rom_size && dst_off + mod_size <= VFLASH_RAM_SIZE) {
+        memcpy(vf->ram + dst_off, vf->rom + src_rom, mod_size);
+        printf("[UNDEF-COPY] ROM[0x%X] → RAM[0x%X]: %u KB (µMORE modules)\n",
+               src_rom, dst_off,
                mod_size / 1024);
     }
 }
@@ -1672,46 +1675,47 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                      * Patch it to enable IRQs first, so µMORE's IRQ handler
                      * at 0x100873D0 can drive the scheduler. */
 
-                    /* Write IRQ-enable + idle stub at RAM[0xFF60] */
-                    uint32_t p = 0xFF60;
+                    /* Write idle stub at high RAM address (0xFFF000) where
+                     * BOOT.BIN init won't overwrite it. */
+                    uint32_t p = 0xFFF000;
                     *(uint32_t*)(vf->ram + p) = 0xE10F0000; p += 4; /* MRS R0, CPSR */
                     *(uint32_t*)(vf->ram + p) = 0xE3C000C0; p += 4; /* BIC R0, #0xC0 */
                     *(uint32_t*)(vf->ram + p) = 0xE129F000; p += 4; /* MSR CPSR_cxsf, R0 */
                     *(uint32_t*)(vf->ram + p) = 0xEAFFFFFE; p += 4; /* B . */
 
-                    /* Patch RAM[0xFFC8]: B to our stub at 0xFF60 */
-                    int32_t boff = (int32_t)(0xFF60 - (0xFFC8 + 8)) >> 2;
-                    *(uint32_t*)(vf->ram + 0xFFC8) = 0xEA000000 | (boff & 0x00FFFFFF);
-                    printf("[REBOOT] Patched RAM[0xFFC8]: B 0x1000FF60 (IRQ enable + idle)\n");
+                    /* Patch warm boot and callback to our high-address stub */
+                    {
+                        uint32_t wb = 0xFFC8;
+                        *(uint32_t*)(vf->ram + wb + 0) = 0xE51FF004; /* LDR PC,[PC,-#4] */
+                        *(uint32_t*)(vf->ram + wb + 4) = 0x10FFF000; /* idle stub addr */
+                    }
+                    printf("[REBOOT] Patched idle → 0x10FFF000\n");
 
                     /* Install proper IRQ wrapper at RAM[0xFF40].
                      * Saves regs, calls µMORE handler, clears timer IRQ,
                      * restores regs, returns from IRQ (SUBS PC,LR,#4). */
+                    /* IRQ wrapper at high address (0xFFF040) */
                     {
-                        uint32_t w = 0xFF40;
-                        *(uint32_t*)(vf->ram + w) = 0xE92D500F; w += 4; /* PUSH {R0-R3,R12,LR} */
-                        /* Set R0=1 (timer IRQ task index), R1=0 (no direct task) */
+                        uint32_t w = 0xFFF040;
+                        *(uint32_t*)(vf->ram + w) = 0xE92D500F; w += 4; /* PUSH */
                         *(uint32_t*)(vf->ram + w) = 0xE3A00001; w += 4; /* MOV R0, #1 */
                         *(uint32_t*)(vf->ram + w) = 0xE3A01000; w += 4; /* MOV R1, #0 */
                         int32_t bl_off = (int32_t)(0x872A4 - (w + 8)) >> 2;
                         *(uint32_t*)(vf->ram + w) = 0xEB000000 | (bl_off & 0x00FFFFFF); w += 4;
-                        /* Clear SP804 timer IRQ after µMORE handler returns.
-                         * Pool data follows after SUBS instruction. */
-                        /* w=FF48 */ *(uint32_t*)(vf->ram + w) = 0xE59F000C; w += 4; /* LDR R0, [PC,#12] */
-                        /* w=FF4C */ *(uint32_t*)(vf->ram + w) = 0xE3A01001; w += 4; /* MOV R1, #1 */
-                        /* w=FF50 */ *(uint32_t*)(vf->ram + w) = 0xE5801000; w += 4; /* STR R1, [R0] */
-                        /* w=FF54 */ *(uint32_t*)(vf->ram + w) = 0xE8BD500F; w += 4; /* POP {R0-R3,R12,LR} */
-                        /* w=FF58 */ *(uint32_t*)(vf->ram + w) = 0xE25EF004; w += 4; /* SUBS PC, LR, #4 */
-                        /* w=FF5C */ *(uint32_t*)(vf->ram + w) = 0x9001000C; w += 4; /* pool: timer IntClr */
+                        *(uint32_t*)(vf->ram + w) = 0xE59F000C; w += 4; /* LDR R0, [PC,#12] */
+                        *(uint32_t*)(vf->ram + w) = 0xE3A01001; w += 4; /* MOV R1, #1 */
+                        *(uint32_t*)(vf->ram + w) = 0xE5801000; w += 4; /* STR R1, [R0] */
+                        *(uint32_t*)(vf->ram + w) = 0xE8BD500F; w += 4; /* POP */
+                        *(uint32_t*)(vf->ram + w) = 0xE25EF004; w += 4; /* SUBS PC, LR, #4 */
+                        *(uint32_t*)(vf->ram + w) = 0x9001000C; w += 4; /* pool: timer IntClr */
                     }
-                    *(uint32_t*)(vf->ram + 0xFFDC) = 0x1000FF40;
-                    printf("[REBOOT] IRQ wrapper at 0x1000FF40 → µMORE 0x100872A4\n");
+                    printf("[REBOOT] IRQ wrapper at 0x10FFF040\n");
 
                     /* After warm boot, redirect to BOOT.BIN entry so it runs
                      * its init functions again. This second run should register
                      * tasks since µMORE kernel is now in RAM.
                      * Patch callback to idle stub (prevent infinite reboot). */
-                    *(uint32_t*)(vf->ram + 0xC00020) = 0x1000FF60;
+                    *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFF000;
 
                     /* Set warm boot entry to BOOT.BIN instead of idle loop */
                     {
@@ -2743,7 +2747,7 @@ void vflash_run_frame(VFlash *vf) {
                     *(uint32_t*)(vf->ram+w)=0xE25EF004; w+=4; /* SUBS PC,LR,#4 */
                     *(uint32_t*)(vf->ram+w)=0x9001000C; w+=4; /* pool */
                     *(uint32_t*)(vf->ram+0xFF98)=0xE59FF03C; /* trampoline */
-                    *(uint32_t*)(vf->ram+0xFFDC)=0x1000FF40; /* wrapper addr */
+                    *(uint32_t*)(vf->ram+0xFFDC)=0x10FFF040; /* IRQ wrapper */
                     *(uint32_t*)(vf->ram+0x3585E0)=3; /* sched state */
                     vf->timer.timer[0].load=37500;
                     vf->timer.timer[0].count=37500;
