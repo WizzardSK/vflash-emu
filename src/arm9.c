@@ -322,8 +322,13 @@ static void exec_arm(ARM9 *cpu, uint32_t insn) {
             if(l){
                 uint32_t v=r32(cpu,addr);
                 cpu->r[i]=v;
-                /* LDM with PC in list: loaded value IS the new PC */
-                if(i==15) PC = v & ~3u;
+                /* LDM with PC in list: loaded value IS the new PC.
+                 * If S-bit (bit22) set and PC in list → restore CPSR from SPSR */
+                if(i==15) {
+                    PC = v & ~3u;
+                    if(insn & (1<<22))
+                        set_mode(cpu, cpu->spsr);
+                }
             } else {
                 w32(cpu,addr,cpu->r[i]);
             }

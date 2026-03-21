@@ -1645,6 +1645,32 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                     *(uint32_t*)(vf->ram + 0xFFC8) = 0xEA000000 | (boff & 0x00FFFFFF);
                     printf("[REBOOT] Patched RAM[0xFFC8]: B 0x1000FF60 (IRQ enable + idle)\n");
 
+                    /* Install proper IRQ wrapper at RAM[0xFF40].
+                     * Saves regs, calls µMORE handler, clears timer IRQ,
+                     * restores regs, returns from IRQ (SUBS PC,LR,#4). */
+                    {
+                        uint32_t w = 0xFF40;
+                        *(uint32_t*)(vf->ram + w) = 0xE92D500F; w += 4; /* PUSH {R0-R3,R12,LR} */
+                        int32_t bl_off = (int32_t)(0x872A4 - (w + 8)) >> 2;
+                        *(uint32_t*)(vf->ram + w) = 0xEB000000 | (bl_off & 0x00FFFFFF); w += 4;
+                        /* Clear SP804 timer IRQ after µMORE handler returns.
+                         * Pool data follows after SUBS instruction. */
+                        /* w=FF48 */ *(uint32_t*)(vf->ram + w) = 0xE59F000C; w += 4; /* LDR R0, [PC,#12] */
+                        /* w=FF4C */ *(uint32_t*)(vf->ram + w) = 0xE3A01001; w += 4; /* MOV R1, #1 */
+                        /* w=FF50 */ *(uint32_t*)(vf->ram + w) = 0xE5801000; w += 4; /* STR R1, [R0] */
+                        /* w=FF54 */ *(uint32_t*)(vf->ram + w) = 0xE8BD500F; w += 4; /* POP {R0-R3,R12,LR} */
+                        /* w=FF58 */ *(uint32_t*)(vf->ram + w) = 0xE25EF004; w += 4; /* SUBS PC, LR, #4 */
+                        /* w=FF5C */ *(uint32_t*)(vf->ram + w) = 0x9001000C; w += 4; /* pool: timer IntClr */
+                    }
+                    *(uint32_t*)(vf->ram + 0xFFDC) = 0x1000FF40;
+                    printf("[REBOOT] IRQ wrapper at 0x1000FF40 → µMORE 0x100872A4\n");
+
+                    /* Set µMORE scheduler state to "running" (=3).
+                     * The IRQ dispatcher at 0x872B4 checks [0x103585E0]==3.
+                     * Also init related data structures. */
+                    *(uint32_t*)(vf->ram + 0x3585E0) = 3;
+                    printf("[REBOOT] Set µMORE scheduler state = 3\n");
+
                     /* Set up SP804 timer for periodic IRQs */
                     vf->timer.timer[0].load = 37500;
                     vf->timer.timer[0].count = 37500;
