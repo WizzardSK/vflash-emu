@@ -2648,22 +2648,26 @@ void vflash_run_frame(VFlash *vf) {
                     if (hdr_sz >= 12 && hdr_sz <= 256 && hdr_sz < (uint32_t)rd) {
                         /* PTX stores 2 interleaved images (scene + sprite) at stride 512.
                          * Even rows = scene image (A), odd rows = sprite overlay (B).
-                         * Display scene image: read every other row. */
+                         * Display scene image scaled to fill 320×240 display. */
                         uint32_t pw = 512;
                         uint32_t total_rows = ((uint32_t)rd - hdr_sz) / (pw * 2);
-                        uint32_t ph = total_rows / 2; /* half rows = scene image */
+                        uint32_t src_h = total_rows / 2;
+                        uint32_t src_w = pw < VFLASH_SCREEN_W ? pw : VFLASH_SCREEN_W;
                         const uint16_t *px = (const uint16_t*)(ptx_buf + hdr_sz);
-                        for (uint32_t y = 0; y < ph && y < VFLASH_SCREEN_H; y++)
-                            for (uint32_t x = 0; x < pw && x < VFLASH_SCREEN_W; x++) {
-                                uint16_t p = px[y * 2 * pw + x]; /* even rows */
+                        for (uint32_t dy = 0; dy < VFLASH_SCREEN_H; dy++) {
+                            uint32_t sy = dy * src_h / VFLASH_SCREEN_H;
+                            for (uint32_t dx = 0; dx < src_w; dx++) {
+                                uint16_t p = px[sy * 2 * pw + dx]; /* even rows */
                                 uint8_t b = ((p >> 10) & 0x1F) << 3;
                                 uint8_t g = ((p >> 5)  & 0x1F) << 3;
                                 uint8_t r = ( p        & 0x1F) << 3;
-                                vf->framebuf[y * VFLASH_SCREEN_W + x] =
+                                vf->framebuf[dy * VFLASH_SCREEN_W + dx] =
                                     0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
                             }
-                        printf("[PTX] Displayed %s (%ux%u XBGR1555)\n",
-                               ptx_entry.name, pw, ph);
+                        }
+                        printf("[PTX] Displayed %s (%ux%u → %ux%u XBGR1555)\n",
+                               ptx_entry.name, src_w, src_h,
+                               VFLASH_SCREEN_W, VFLASH_SCREEN_H);
                     }
                 }
                 free(ptx_buf);
