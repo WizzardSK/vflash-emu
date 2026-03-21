@@ -1167,7 +1167,9 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
     }
 
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
-        *(uint32_t*)(vf->ram + (addr - VFLASH_RAM_BASE)) = val;
+        uint32_t roff = addr - VFLASH_RAM_BASE;
+        /* (mem trace removed) */
+        *(uint32_t*)(vf->ram + roff) = val;
         return;
     }
 
@@ -1382,6 +1384,20 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                             }
                             printf("[ROM-PRELOAD] ROM → RAM[0x%X+]: %u KB\n",
                                    start, (copy_sz - start) / 1024);
+                        }
+
+                        /* Patch BOOT.BIN callback: instead of 0x1880 (reboot),
+                         * jump to an IRQ-enable + idle stub. After BOOT.BIN init
+                         * registers tasks and enables MMU, we enter the idle loop
+                         * with IRQs enabled so the µMORE scheduler can dispatch. */
+                        {
+                            uint32_t s = 0xFF60;
+                            *(uint32_t*)(vf->ram + s+0)  = 0xE10F0000; /* MRS R0, CPSR */
+                            *(uint32_t*)(vf->ram + s+4)  = 0xE3C000C0; /* BIC R0, #0xC0 */
+                            *(uint32_t*)(vf->ram + s+8)  = 0xE129F000; /* MSR CPSR, R0 */
+                            *(uint32_t*)(vf->ram + s+12) = 0xEAFFFFFE; /* B . */
+                            *(uint32_t*)(vf->ram + 0xC00020) = 0x1000FF60;
+                            printf("[ROM-PRELOAD] Patched BOOT callback → 0x1000FF60 (no reboot)\n");
                         }
                     }
                 }
