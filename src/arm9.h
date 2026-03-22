@@ -54,6 +54,7 @@ struct ARM9 {
 
     /* Callback for UNDEF recovery — copies ROM to RAM for µMORE */
     void     (*undef_callback)(void *ctx);
+    int      null_trap_enabled; /* set by Phase 2 to enable NULL trap */
 };
 typedef struct ARM9 ARM9;
 

@@ -2912,7 +2912,8 @@ void vflash_run_frame(VFlash *vf) {
                     vf->lcd.control = 0x182B;
                     printf("[SCHED] LCD handle fb@0x10%06X\n", fb);
                 }
-                /* Jump to game init with IRQ disabled */
+                /* Jump to game init with NULL trap enabled */
+                vf->cpu.null_trap_enabled = 1;
                 vf->cpu.cpsr = 0x00000093;
                 vf->cpu.r[15] = 0x10C16CB8;
                 vf->cpu.r[13] = 0x10FFE000;
