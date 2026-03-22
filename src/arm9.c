@@ -483,6 +483,15 @@ int arm9_step(ARM9 *cpu) {
         uint32_t i = r32(cpu, inst_addr);
         PC = inst_addr + 8;
 
+        /* One-shot trace: log first instruction at scheduler */
+        if (inst_addr == 0x10010234) {
+            static int sched_trace = 0;
+            if (!sched_trace) {
+                printf("[SCHED-TRACE] First fetch at 0x10010234: insn=0x%08X SP=0x%08X CPSR=0x%08X LR=0x%08X\n",
+                       i, cpu->r[13], CPSR, cpu->r[14]);
+                sched_trace = 1;
+            }
+        }
         /* Game init trace: log BL calls and returns */
         /* NULL pointer trap: when game code (LR in BOOT.BIN) calls through
          * a NULL pointer into BSS, auto-return to skip the call.

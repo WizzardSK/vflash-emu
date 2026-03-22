@@ -1501,20 +1501,31 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                             memcpy(vf->ram + 0x9FFD4, vf->rom + 0xC02C, 0xA1FE4);
                             /* Extra: module area (from previous working config) */
                             memcpy(vf->ram + 0xAC000, vf->rom + 0xAE010, 0xF95B0);
-                            /* Copy remaining ROM code for pool values etc. */
+                            /* Debug: check ram[0x10234] after phase 1 memcpy */
+                            printf("[DBG] After phase1: ram[0x10234]=0x%08X (expect E52DE004)\n",
+                                   *(uint32_t*)(vf->ram + 0x10234));
+                            /* Copy remaining ROM code for pool values etc.
+                             * IMPORTANT: skip range already covered by phase 1 memcpy
+                             * (0xFFF0-0x9FFD3) to avoid overwriting with ROM BSS zeros */
                             for (uint32_t ci = 0x1000; ci < vf->rom_size; ci += 4) {
+                                /* Skip areas populated by the phase 1/2 memcpys */
+                                if (ci >= 0xFFF0 && ci < 0x9FFD4) continue;
+                                if (ci >= 0x9FFD4 && ci < 0x141FB8) continue;
                                 uint32_t rv = *(uint32_t*)(vf->rom + ci);
                                 if (rv != 0) *(uint32_t*)(vf->ram + ci) = rv;
                             }
+                            printf("[DBG] After ROM copy: ram[0x10234]=0x%08X\n",
+                                   *(uint32_t*)(vf->ram + 0x10234));
+                            /* Watch for corruption: set a canary */
+                            printf("[DBG] Setting canary watch on ram[0x10234]\n");
                             /* Set sched_state=3 BEFORE ROM init runs.
                              * µMORE task_start (0x85E88) checks [0x103585E0]==3
                              * and refuses to register tasks if state != 3.
                              * On real HW this is set by earlier init stages. */
-                            /* BSS clear (init 0x5D0 equivalent): zero BSS area */
+                            /* BSS clear (init 0x5D0 equivalent): zero BSS area.
+                             * Keep as zeros — NULL trap catches function calls,
+                             * and zero is the correct initial value for data reads. */
                             memset(vf->ram + 0x1A55B0, 0, 0x1B40F4);
-                            /* Fill BSS with BX LR safety net */
-                            for (uint32_t a = 0x1A55B0; a < 0x1A55B0 + 0x1B40F4; a += 4)
-                                *(uint32_t*)(vf->ram + a) = 0xE12FFF1E;
                             /* Set scheduler state AFTER BSS clear */
                             *(uint32_t*)(vf->ram + 0x3585E0) = 3;
                             /* Skip SDRAM calibration — jump directly to kernel.
@@ -1527,40 +1538,50 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
 
                             /* Copy ROM vectors + low code to low_ram (PA 0 space) */
                             memcpy(vf->low_ram, vf->rom, sizeof(vf->low_ram));
+                            /* Patch reset vector to safe return (catches BLX to 0).
+                             * When BSS function pointers are 0, BLX R0 goes to PA 0.
+                             * Instead of ROM boot code, return R0=0 to caller. */
+                            *(uint32_t*)(vf->low_ram + 0x00) = 0xE3A00000; /* MOV R0, #0 */
+                            *(uint32_t*)(vf->low_ram + 0x04) = 0xE12FFF1E; /* BX LR */
 
                             /* Build page table at RAM[0xA8000] (VA=0x100A8000).
                              * Boot code normally builds this dynamically. */
+                            /* Build page table matching real init (0x704):
+                             * Identity-map ALL 4096 sections (every 1MB),
+                             * then add cacheable bit for ROM and RAM areas. */
                             {
                                 uint32_t *pt = (uint32_t*)(vf->ram + 0xA8000);
-                                memset(pt, 0, 0x4000); /* 4096 L1 entries */
-                                /* VA 0x00000000 → PA 0x00000000 (vectors + low ROM/RAM) */
-                                pt[0x000] = 0x00000C0E;
-                                pt[0x001] = 0x00100C0E;
-                                /* VA 0x10000000-0x10FFFFFF → PA 0x10000000 (16MB SDRAM) */
+                                /* Fill all 4096 entries: identity map, AP=full, domain=15 */
+                                for (int i = 0; i < 4096; i++)
+                                    pt[i] = (i << 20) | 0xDF2;
+                                /* Add cacheable bit (C=1, bit3) for ROM area (0-1MB) */
+                                pt[0x000] |= 0x08;
+                                pt[0x001] |= 0x08;
+                                /* Add cacheable bit for RAM (0x100-0x10F = 16MB) */
                                 for (int i = 0; i < 16; i++)
-                                    pt[0x100 + i] = ((0x100 + i) << 20) | 0xC0E;
-                                /* VA 0x90000000-0x900FFFFF → PA 0x90000000 (I/O) */
-                                for (int i = 0; i < 16; i++)
-                                    pt[0x900 + i] = ((0x900 + i) << 20) | 0xC02;
-                                /* VA 0xB8000000 → PA 0xB8000000 (flash controller) */
-                                pt[0xB80] = 0xB8000C02;
-                                pt[0xB81] = 0xB8100C02;
-                                /* VA 0xC0000000 → PA 0xC0000000 (PL111 LCD) */
-                                pt[0xC00] = 0xC0000C02;
+                                    pt[0x100 + i] |= 0x08;
                             }
                             vf->cpu.cp15.ttb = 0x100A8000;
                             vf->cpu.cp15.mmu_enabled = 1;
-                            vf->cpu.cp15.control = 0x0000507D;
+                            vf->cpu.cp15.control = 0x00005005; /* MMU on, caches on */
+                            vf->cpu.cp15.domain = 0xFFFFFFFF; /* all domains = manager */
                             tlb_flush();
                             printf("[ROM-PRELOAD] MMU ON TTB=0x%08X (built page table)\n",
                                    vf->cpu.cp15.ttb);
 
-                            /* Jump to kernel loop area for Phase 0→99 detection */
-                            vf->cpu.r[15] = 0x100A0008;
+                            /* Jump to scheduler entry to trace µMORE init */
+                            vf->cpu.r[15] = 0x10010234;
                             vf->cpu.r[13] = 0x10800000;
                             vf->cpu.r13_irq = 0x107FB000;
+                            vf->cpu.r13_svc = 0x10800000;
                             vf->cpu.cpsr  = 0x000000D3; /* SVC mode, IRQ disabled */
-                            printf("[ROM-PRELOAD] Kernel at 0x100A0008 (corrected memcpy)\n");
+                            vf->cpu.null_trap_enabled = 1;
+                            printf("[ROM-PRELOAD] Scheduler at 0x10010234 (trace mode)\n");
+                            printf("[ROM-PRELOAD] Verify: PC=0x%08X SP=0x%08X CPSR=0x%08X\n",
+                                   vf->cpu.r[15], vf->cpu.r[13], vf->cpu.cpsr);
+                            printf("[ROM-PRELOAD] ram[0x10234]=0x%08X MMU=%d TTB=0x%08X\n",
+                                   *(uint32_t*)(vf->ram + 0x10234),
+                                   vf->cpu.cp15.mmu_enabled, vf->cpu.cp15.ttb);
                         }
                     }
                 }
@@ -2959,10 +2980,8 @@ void vflash_run_frame(VFlash *vf) {
                     *(uint32_t*)(vf->ram + p) = 0xE129F000; p += 4; /* MSR CPSR_cxsf, R0 */
                     *(uint32_t*)(vf->ram + p) = 0xEAFFFFFE; p += 4; /* B . */
                 }
-                /* Fill BSS zero areas with BX LR safety net */
-                for (uint32_t a = 0x1A55B0; a < 0xC00000; a += 4)
-                    if (*(uint32_t*)(vf->ram + a) == 0)
-                        *(uint32_t*)(vf->ram + a) = 0xE12FFF1E; /* BX LR */
+                /* BSS stays as zeros — NULL trap handles function calls.
+                 * Data reads from BSS correctly return 0. */
                 /* Patch BOOT.BIN callback to idle (prevent reboot loop).
                  * BOOT.BIN header[0x20] = callback addr, originally 0x1880
                  * (ROM code that triggers warm reboot). Redirect to idle. */
@@ -3200,6 +3219,15 @@ void vflash_run_frame(VFlash *vf) {
      * This only needs to happen once. */
     /* No remap disable needed — flash reads always from ROM. */
 
+    if (vf->frame_count < 3) {
+        uint32_t v = *(uint32_t*)(vf->ram + 0x10234);
+        if (v != 0xE52DE004)
+            printf("[CANARY] Frame %lu: ram[0x10234]=0x%08X (CORRUPTED!)\n",
+                   (unsigned long)vf->frame_count, v);
+        if (vf->frame_count == 0)
+            printf("[SCHED-STATE] Frame 0: PC=0x%08X SP=0x%08X CPSR=0x%08X LR=0x%08X\n",
+                   vf->cpu.r[15], vf->cpu.r[13], vf->cpu.cpsr, vf->cpu.r[14]);
+    }
     if ((vf->frame_count % 10) == 0) {
         printf("[Frame %lu] PC=0x%08X CPSR=0x%08X R7=0x%08X R8=0x%08X R9=0x%08X"
                " T0:load=%u ctrl=0x%X cnt=%u IRQen=0x%X IRQst=0x%X\n",
