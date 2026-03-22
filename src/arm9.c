@@ -529,11 +529,22 @@ int arm9_step(ARM9 *cpu) {
                     bl_log++;
                 }
             }
-            /* Log scheduler entry */
+            /* Log scheduler entry and BL calls from init */
             if (inst_addr == 0x10010234) {
-                uint32_t val = cpu->mem_read32(cpu->mem_ctx, 0x10010234);
-                printf("[SCHED] Entry: insn=%08X val_at_addr=%08X SP=%08X\n",
-                       i, val, cpu->r[13]);
+                printf("[SCHED] Entry: insn=%08X SP=%08X\n", i, cpu->r[13]);
+            }
+            /* Trace BLs from scheduler init code */
+            if (inst_addr >= 0x10010240 && inst_addr <= 0x10010290 &&
+                (i & 0x0F000000) == 0x0B000000) {
+                static int sbl = 0;
+                if (sbl < 10) {
+                    int32_t boff = i & 0xFFFFFF;
+                    if (boff & 0x800000) boff |= (int32_t)0xFF000000;
+                    uint32_t tgt = inst_addr + 8 + (uint32_t)(boff * 4);
+                    printf("[SCHED-BL] 0x%08X → BL 0x%08X R0=%08X R1=%08X\n",
+                           inst_addr, tgt, cpu->r[0], cpu->r[1]);
+                    sbl++;
+                }
             }
         }
 
