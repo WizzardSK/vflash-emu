@@ -143,6 +143,19 @@ int main(int argc, char **argv) {
                             else                  dbg_resume();
                         }
                         break;
+                    case SDLK_F5: {
+                        /* Save screenshot as BMP */
+                        uint32_t *fb = vflash_get_framebuffer(vf);
+                        SDL_Surface *surf = SDL_CreateRGBSurfaceFrom(
+                            fb, 320, 240, 32, 320*4,
+                            0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
+                        if (surf) {
+                            SDL_SaveBMP(surf, "screenshot.bmp");
+                            SDL_FreeSurface(surf);
+                            printf("[Main] Screenshot saved: screenshot.bmp\n");
+                        }
+                        break;
+                    }
                     case SDLK_F11:
                         if (!headless) {
                             fullscreen = !fullscreen;
