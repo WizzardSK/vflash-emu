@@ -2816,6 +2816,39 @@ void vflash_run_frame(VFlash *vf) {
                 printf("[KERN] Timer + IRQ enabled, kernel at 0x%08X\n", pc);
             }
 
+            /* After kernel stabilizes (~20 frames), launch game init */
+            if (phase == 99 && vf->frame_count > 20 &&
+                pc >= 0x100A0000 && pc < 0x100A2000) {
+                phase = 100;
+                /* Fix page table: identity map ALL RAM */
+                uint32_t ttb_off = vf->cpu.cp15.ttb;
+                if (ttb_off >= 0x10000000) ttb_off -= 0x10000000;
+                if (ttb_off + 0x4000 < VFLASH_RAM_SIZE) {
+                    for (uint32_t mb = 0x100; mb <= 0x10F; mb++) {
+                        uint32_t *l1 = (uint32_t*)(vf->ram + ttb_off + mb*4);
+                        if ((*l1 & 3) == 0)
+                            *l1 = (mb << 20) | 0xC0E;
+                    }
+                    tlb_flush();
+                }
+                /* LCD handle */
+                uint32_t h = 0xBF0000, fb = 0x800000;
+                memset(vf->ram + h, 0, 0x1000);
+                *(uint32_t*)(vf->ram + h + 0x5C) = 0x10000000 + fb;
+                *(uint32_t*)(vf->ram + 0xBC0A40) = 0x10000000 + h;
+                vf->lcd.upbase = 0x10000000 + fb;
+                vf->lcd.control = 0x182B;
+                /* Enable NULL trap and jump to game init */
+                vf->cpu.null_trap_enabled = 1;
+                vf->cpu.cpsr = 0x00000093; /* SVC, IRQ disabled */
+                vf->cpu.r[15] = 0x10C16CB8;
+                vf->cpu.r[13] = 0x10FFE000;
+                vf->cpu.r[14] = 0x10FFF000;
+                vf->timer.timer[0].irq_pending = 0;
+                vf->timer.irq.status = 0;
+                printf("[GAME] Launching game init at 0x10C16CB8!\n");
+            }
+
             /* Phase 1: scheduler loop detected → re-copy modules + redirect */
             if (phase == 0 && (pc >= 0x1007FFC0 && pc <= 0x10080060)) {
                 phase = 1;
