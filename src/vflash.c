@@ -1156,6 +1156,14 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
+        /* Fastboot/scratch at 0x90030000 (off = 0x10030000) */
+        if (off >= 0x10030000u && off < 0x10031000u) {
+            uint32_t freg = off - 0x10030000u;
+            if (freg == 0x14)
+                return 0x20; /* bit5 set — scheduler dispatch check */
+            return 0;
+        }
+
         /* Watchdog at 0x90060000 (off = 0x10060000) */
         if (off >= 0x10060000u && off < 0x10061000u) {
             uint32_t wreg = off - 0x10060000u;

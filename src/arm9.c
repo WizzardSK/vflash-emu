@@ -546,19 +546,17 @@ int arm9_step(ARM9 *cpu) {
                     sbl++;
                 }
             }
-            /* Trace scheduler dispatch BL */
-            if (inst_addr == 0x100108E4) {
-                static int disp_log = 0;
-                if (disp_log < 5)
-                    printf("[DISP] BL 0x10095B08 R0=%08X R1=%08X\n",
-                           cpu->r[0], cpu->r[1]);
-                disp_log++;
-            }
-            if (inst_addr == 0x100108E8) {
-                static int disp_ret = 0;
-                if (disp_ret < 5)
-                    printf("[DISP] returned R0=%08X\n", cpu->r[0]);
-                disp_ret++;
+            /* Trace the actual I/O read in dispatch path */
+            if (inst_addr == 0x10095B20) { /* LDR R3,[R3,R2,LSL#16] */
+                static int io_log = 0;
+                if (io_log < 3) {
+                    uint32_t base = cpu->r[3];
+                    uint32_t bank = cpu->r[2];
+                    uint32_t addr = base + (bank << 16);
+                    printf("[IO-READ] base=0x%08X bank=%d addr=0x%08X\n",
+                           base, bank, addr);
+                }
+                io_log++;
             }
             /* Trace task_start function */
             if (inst_addr >= 0x10085E50 && inst_addr <= 0x10085F50) {
