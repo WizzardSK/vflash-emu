@@ -2746,15 +2746,25 @@ void vflash_run_frame(VFlash *vf) {
                 memcpy(vf->ram + 0x9FFD4, vf->rom + 0xC02C, 0xA1FE4);
                 *(uint32_t*)(vf->ram + 0x3585E0) = 3;
 
-                /* Populate task_table with pointers to task structs
-                 * from module data (0x100AC7D8+). Each has TCB magic. */
+                /* Create large task struct with context at +0x58 for dispatch.
+                 * Handler calls 0x86AE4 which reads task+0x58 as saved context.
+                 * We set PC at +0x58 to BOOT.BIN entry for game init. */
                 {
-                    uint32_t tb = 0xAC7D8; /* TCB structs, stride 0x24, magic at +0xC */
-                    uint32_t n = *(uint32_t*)(vf->ram + 0xAC004);
-                    if (n > 6) n = 6;
-                    for (uint32_t i = 0; i < n; i++)
-                        *(uint32_t*)(vf->ram + 0x1A9440 + i*4) = 0x10000000 + tb + i*0x24;
-                    printf("[SCHED] Phase 1: task_table[0..%u] populated\n", n);
+                    uint32_t task = 0xFFF100;
+                    memset(vf->ram + task, 0, 0x100);
+                    *(uint32_t*)(vf->ram + task + 0x00) = 0x42435124; /* $QCB */
+                    *(uint32_t*)(vf->ram + task + 0x08) = 1;          /* flags */
+                    *(uint32_t*)(vf->ram + task + 0x14) = 0;          /* counter */
+                    *(uint32_t*)(vf->ram + task + 0x20) = 4;          /* state: ready */
+                    /* Saved context at +0x58 (ARM register dump for task switch) */
+                    *(uint32_t*)(vf->ram + task + 0x58) = 0x10C0011C; /* saved PC */
+                    *(uint32_t*)(vf->ram + task + 0x5C) = 0x00000013; /* saved CPSR */
+                    *(uint32_t*)(vf->ram + task + 0x60) = 0x10FFE000; /* saved SP */
+
+                    *(uint32_t*)(vf->ram + 0x1A9440) = 0x10000000 + task;
+                    *(uint32_t*)(vf->ram + 0x3585C0) = 0x10000000 + task;
+                    *(uint32_t*)(vf->ram + 0xACC78) = 0x10000000 + task;
+                    printf("[SCHED] Phase 1: task with BOOT.BIN entry\n");
                 }
                 vf->cpu.r[15] = 0x10FFF000;
                 vf->cpu.r[13] = 0x10FFE000;
