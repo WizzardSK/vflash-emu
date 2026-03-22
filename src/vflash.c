@@ -1487,12 +1487,21 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                             printf("[ROM-PRELOAD] BOOT.BIN: %d bytes at RAM[0x%X] (0x%08X)\n",
                                    rd, dest, VFLASH_RAM_BASE + dest);
                         }
-                        /* Pre-load everything: kernel + modules + ROM code */
+                        /* Pre-load everything: exact same copies as ROM init BLs.
+                         * Init function 0x288: 64KB from ROM[0x2000] → SDRAM[0x0]
+                         * Init function 0x2B4 phase 1: ROM[0x12000] → SDRAM[0xFFF0]
+                         * Init function 0x2B4 phase 2: ROM[0xC02C] → SDRAM[0x9FFD4]
+                         * Also copy remaining ROM code for completeness. */
                         {
+                            /* Init 0x288: kernel code */
+                            memcpy(vf->ram, vf->rom + 0x2000, 0x10000);
+                            /* Init 0x2B4 phase 1: kernel + core modules */
+                            memcpy(vf->ram + 0xFFF0, vf->rom + 0x12000, 0x8FFE4);
+                            /* Init 0x2B4 phase 2: more modules */
                             memcpy(vf->ram + 0x9FFD4, vf->rom + 0xC02C, 0xA1FE4);
+                            /* Extra: module area (from previous working config) */
                             memcpy(vf->ram + 0xAC000, vf->rom + 0xAE010, 0xF95B0);
-                            /* Copy ROM code to RAM from 0x1000 (skip vectors).
-                             * Previously started at 0x80000 but scheduler is at 0x10234. */
+                            /* Copy remaining ROM code for pool values etc. */
                             for (uint32_t ci = 0x1000; ci < vf->rom_size; ci += 4) {
                                 uint32_t rv = *(uint32_t*)(vf->rom + ci);
                                 if (rv != 0) *(uint32_t*)(vf->ram + ci) = rv;
@@ -1501,6 +1510,12 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                              * µMORE task_start (0x85E88) checks [0x103585E0]==3
                              * and refuses to register tasks if state != 3.
                              * On real HW this is set by earlier init stages. */
+                            /* BSS clear (init 0x5D0 equivalent): zero BSS area */
+                            memset(vf->ram + 0x1A55B0, 0, 0x1B40F4);
+                            /* Fill BSS with BX LR safety net */
+                            for (uint32_t a = 0x1A55B0; a < 0x1A55B0 + 0x1B40F4; a += 4)
+                                *(uint32_t*)(vf->ram + a) = 0xE12FFF1E;
+                            /* Set scheduler state AFTER BSS clear */
                             *(uint32_t*)(vf->ram + 0x3585E0) = 3;
                             /* Skip SDRAM calibration — jump directly to kernel.
                              * Need to set up what boot code would have done:
@@ -1540,10 +1555,12 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                             printf("[ROM-PRELOAD] MMU ON TTB=0x%08X (built page table)\n",
                                    vf->cpu.cp15.ttb);
 
+                            /* Jump to kernel loop area for Phase 0→99 detection */
                             vf->cpu.r[15] = 0x100A0008;
-                            vf->cpu.r[13] = 0x10FFE000;
+                            vf->cpu.r[13] = 0x10800000;
+                            vf->cpu.r13_irq = 0x107FB000;
                             vf->cpu.cpsr  = 0x000000D3; /* SVC mode, IRQ disabled */
-                            printf("[ROM-PRELOAD] Skip calibration → PC=0x100A0008, PA 0 → RAM\n");
+                            printf("[ROM-PRELOAD] Kernel at 0x100A0008 (corrected memcpy)\n");
                         }
                     }
                 }
