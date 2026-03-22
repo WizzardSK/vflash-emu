@@ -285,12 +285,13 @@ Standard ARM dual-timer. Two timers per block at offsets +0x00 and +0x20:
 - **Task dispatch WORKING** — manually populated task_table + task_list_head; µMORE IRQ handler dispatches and exits scheduler loop
 - **Task structures decoded**: TCB at 0xAC7D8 (stride 0x24, $SCB magic at +0xC), large context struct (+0x58 = saved ARM registers for context switch)
 - **Key functions found**: task_init (0x8B6CC), task_start (0x85E88), task_dispatch (0x86AE4), context_switch (0x89BA4), syscall_dispatch (0x8BE40)
-- **GAME CODE RUNNING** — game init at 0x10C16CB8 executes, calls LCD init (PL111 setup), deeper game functions
-- **Page table fix**: BOOT.BIN was unmapped (L1[0x10C] = FAULT) after init; added identity mapping so game code at VA 0x10C00000+ is accessible
-- **LCD handle stub**: allocated at heap area 0x10BF0000 with PL111 base at +0x5C
+- **GAME CODE RUNNING** — game init executes ~2000 instructions through LCD init, display setup, deep init chain across 10+ BOOT.BIN functions
+- **PL111 LCD Controller** — read/write handlers for timing, framebuffer base, control registers; framebuffer blit (RGB565/ARGB)
+- **Page table fix**: added identity mapping for BOOT.BIN at VA 0x10C/0x10D
+- **LCD handle stub**: framebuffer at RAM[0x800000], display struct chain
 
 ### What doesn't work yet
-- **Game rendering** — game init runs but LCD controller (PL111) not implemented; display output needs PL111 framebuffer support
+- **BSS function pointers** — game init crashes at 0x10A01904 (BSS, zeroed by ROM init); µMORE kernel would normally populate these during boot. Requires either complete µMORE kernel init or ROM-level ATAPI support for proper disc loading.
 - **In-game audio** — `.snd` PCM WAV files not decoded (cutscene audio works)
 
 ## MJP / MIAV format
