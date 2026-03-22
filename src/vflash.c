@@ -236,6 +236,12 @@ struct VFlash {
     /* WAV sound list */
     CDEntry  *wav_list;
     int       wav_count;
+    int       wav_auto_idx;  /* auto-play index */
+
+    /* MJP video list */
+    CDEntry  *mjp_list;
+    int       mjp_count;
+    int       mjp_index;
 
     /* Debugger state */
     uint32_t bp[16];   /* breakpoint addresses (0 = unused) */
@@ -2895,6 +2901,7 @@ void vflash_destroy(VFlash *vf) {
     free(vf->rom);
     free(vf->ptx_list);
     free(vf->wav_list);
+    free(vf->mjp_list);
     free(vf);
 }
 
@@ -3430,6 +3437,29 @@ void vflash_run_frame(VFlash *vf) {
             }
         }
         printf("[WAV] Found %d WAV sound files\n", vf->wav_count);
+
+        /* Also scan for MJP files */
+        vf->mjp_list = calloc(64, sizeof(CDEntry));
+        vf->mjp_count = 0;
+        if (cdrom_read_sector(vf->cd, 16, pvd)) {
+            uint32_t root_lba  = *(uint32_t*)(pvd + 156 + 2);
+            uint32_t root_size = *(uint32_t*)(pvd + 156 + 10);
+            CDEntry l1m[64];
+            int n1m = cdrom_list_dir(vf->cd, root_lba, root_size, l1m, 64);
+            for (int im = 0; im < n1m && vf->mjp_count < 64; im++) {
+                if (!l1m[im].is_dir) continue;
+                CDEntry *l2m = malloc(256 * sizeof(CDEntry));
+                if (!l2m) continue;
+                int n2m = cdrom_list_dir(vf->cd, l1m[im].lba, l1m[im].size, l2m, 256);
+                for (int jm = 0; jm < n2m && vf->mjp_count < 64; jm++) {
+                    char *dot = strrchr(l2m[jm].name, '.');
+                    if (dot && strcasecmp(dot, ".MJP") == 0)
+                        vf->mjp_list[vf->mjp_count++] = l2m[jm];
+                }
+                free(l2m);
+            }
+        }
+        printf("[MJP] Found %d MJP video files\n", vf->mjp_count);
     }
     /* Navigate gallery with Left/Right keys */
     if (vf->ptx_count > 0 && vf->cd && vf->cd->is_open) {
@@ -3476,32 +3506,27 @@ void vflash_run_frame(VFlash *vf) {
         }
     }
 
-    /* MJP video player — load on first frame, then play frame-by-frame */
-    if (vf->frame_count == 1 && vf->has_rom && vf->cd && vf->cd->is_open
-        && !vf->mjp_player.playing) {
-        /* Find and load MJP file from disc */
-        CDEntry mjp_entry;
-        static const char *mjp_names[] = {
-            "EN.MJP", "MAIN01.MJP", "MAIN.MJP", "CUTSCENE01.MJP",
-            "INTRO.MJP", "MOVIE.MJP", "OPENING.MJP",
-            "101KW_MOVIE.MJP", "106KW_MOVIE.MJP", NULL
-        };
-        int mjp_found = 0;
-        for (int mi = 0; mjp_names[mi] && !mjp_found; mi++)
-            mjp_found = cdrom_find_file_any(vf->cd, mjp_names[mi], &mjp_entry);
-        if (!mjp_found) {
-            CDEntry entries[64];
-            uint8_t pvd[2048];
-            if (cdrom_read_sector(vf->cd, 16, pvd)) {
-                uint32_t root_lba  = *(uint32_t*)(pvd + 156 + 2);
-                uint32_t root_size = *(uint32_t*)(pvd + 156 + 10);
-                int n = cdrom_list_dir(vf->cd, root_lba, root_size, entries, 64);
-                for (int ei = 0; ei < n && !mjp_found; ei++) {
-                    char *dot = strrchr(entries[ei].name, '.');
-                    if (dot && (strcmp(dot, ".MJP") == 0 || strcmp(dot, ".mjp") == 0))
-                        { mjp_entry = entries[ei]; mjp_found = 1; }
-                }
-            }
+    /* MJP video player — Red button loads next MJP, auto-load first on frame 1 */
+    if (vf->cd && vf->cd->is_open && vf->mjp_count > 0) {
+        uint32_t pressed = vf->input & ~vf->input_prev;
+        int load_mjp = 0;
+        if (vf->frame_count == 1 && !vf->mjp_player.playing) {
+            load_mjp = 1; /* auto-load first */
+        }
+        if ((pressed & VFLASH_BTN_RED) && !vf->mjp_player.playing) {
+            vf->mjp_index = (vf->mjp_index + 1) % vf->mjp_count;
+            load_mjp = 1;
+        }
+        if ((pressed & VFLASH_BTN_YELLOW) && vf->mjp_player.playing) {
+            /* Yellow = stop video, return to gallery */
+            vf->mjp_player.playing = 0;
+            free(vf->mjp_player.data); vf->mjp_player.data = NULL;
+            free(vf->mjp_player.hdr); vf->mjp_player.hdr = NULL;
+        }
+        if (load_mjp) {
+            CDEntry mjp_entry = vf->mjp_list[vf->mjp_index];
+            int mjp_found = 1;
+            {
         }
         if (mjp_found && mjp_entry.size > 100) {
             printf("[MJP-PLAY] Loading %s (%u bytes)...\n", mjp_entry.name, mjp_entry.size);
@@ -3543,6 +3568,20 @@ void vflash_run_frame(VFlash *vf) {
                 vf->mjp_player.playing = 1;
                 printf("[MJP-PLAY] Playing %u bytes of video\n", vf->mjp_player.data_size);
             }
+        }
+        } /* end load_mjp block */
+    }
+
+    /* Auto-play background WAVs when no MJP is playing */
+    if (vf->wav_count > 0 && vf->audio && vf->audio->initialized &&
+        !vf->mjp_player.playing && (vf->frame_count % 120) == 60) {
+        /* Check if audio buffer is nearly empty */
+        uint32_t buffered = (vf->audio->write_pos >= vf->audio->read_pos)
+            ? vf->audio->write_pos - vf->audio->read_pos
+            : vf->audio->buf_size - vf->audio->read_pos + vf->audio->write_pos;
+        if (buffered < 44100) { /* less than 0.5 seconds of audio */
+            play_wav_from_cd(vf, &vf->wav_list[vf->wav_auto_idx % vf->wav_count]);
+            vf->wav_auto_idx++;
         }
     }
 
