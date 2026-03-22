@@ -3104,13 +3104,11 @@ void vflash_run_frame(VFlash *vf) {
             uint32_t pc = vf->cpu.r[15];
             static int phase = 0;
 
-            /* Scheduler/kernel loop: enable timer + IRQ.
-             * Natural boot: scheduler at 0x10095Bxx / 0x100108xx.
-             * Old kernel loop: 0x100A0000-0x100A2000. */
-            if (phase == 0 && (vf->cpu.cpsr & 0x80) &&
-                ((pc >= 0x100A0000 && pc < 0x100A2000) ||
-                 (pc >= 0x10095B00 && pc < 0x10095B70) ||
-                 (pc >= 0x100108D0 && pc < 0x10010900))) {
+            /* µMORE kernel running: enable timer + FIQ after init.
+             * Match ANY kernel address after frame 8 (init BLs done by then). */
+            if (phase == 0 && vf->frame_count > 8 &&
+                pc >= 0x10000000 && pc < 0x10100000 &&
+                (vf->cpu.cpsr & 0x1F) == 0x13) { /* SVC mode */
                 phase = 99; /* skip old phases */
                 vf->timer.timer[0].load = 37500;
                 vf->timer.timer[0].count = 37500;
