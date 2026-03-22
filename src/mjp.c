@@ -36,20 +36,26 @@ int mjp_decode_frame(MJPDecoder *dec, const uint8_t *data, uint32_t size) {
     MJPErrorMgr jerr;
     int decoded_lines = 0;
 
-    /* Clear framebuf to prevent stale scanlines from previous frames */
-    memset(dec->framebuf, 0, dec->width * dec->height * sizeof(uint32_t));
+    /* Decode into temporary buffer — only copy to framebuf on success.
+     * This prevents flickering (black frames) on decode errors. */
+    uint32_t *tmpbuf = malloc(dec->width * dec->height * sizeof(uint32_t));
+    if (!tmpbuf) return 0;
+    memset(tmpbuf, 0, dec->width * dec->height * sizeof(uint32_t));
 
     cinfo.err = jpeg_std_error(&jerr.pub);
     jerr.pub.error_exit = mjp_error_exit;
     jerr.pub.output_message = mjp_output_message;
     if (setjmp(jerr.setjmp_buf)) {
-        /* Error during decode — return partial result if we got any lines */
         jpeg_destroy_decompress(&cinfo);
-        if (decoded_lines > 0) {
+        if (decoded_lines > dec->height / 2) {
+            /* Got most of the frame — use it */
+            memcpy(dec->framebuf, tmpbuf, dec->width * dec->height * sizeof(uint32_t));
+            free(tmpbuf);
             dec->frames_decoded++;
-            return 1; /* partial decode is OK */
+            return 1;
         }
-        fprintf(stderr, "[MJP] JPEG decode error (no scanlines decoded)\n");
+        /* Too few lines — keep previous frame (no flicker) */
+        free(tmpbuf);
         return 0;
     }
 
@@ -72,7 +78,7 @@ int mjp_decode_frame(MJPDecoder *dec, const uint8_t *data, uint32_t size) {
                 uint8_t r = row[x*3+0];
                 uint8_t g = row[x*3+1];
                 uint8_t b = row[x*3+2];
-                dec->framebuf[y * dec->width + x] = 0xFF000000 | (r<<16) | (g<<8) | b;
+                tmpbuf[y * dec->width + x] = 0xFF000000 | (r<<16) | (g<<8) | b;
             }
         }
     }
@@ -80,6 +86,10 @@ int mjp_decode_frame(MJPDecoder *dec, const uint8_t *data, uint32_t size) {
     free(row);
     jpeg_finish_decompress(&cinfo);
     jpeg_destroy_decompress(&cinfo);
+
+    /* Full decode success — swap to framebuf */
+    memcpy(dec->framebuf, tmpbuf, dec->width * dec->height * sizeof(uint32_t));
+    free(tmpbuf);
     dec->frames_decoded++;
     return 1;
 }
