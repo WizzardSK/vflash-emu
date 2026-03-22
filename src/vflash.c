@@ -3554,6 +3554,100 @@ void vflash_run_frame(VFlash *vf) {
         }
     }
 
+    /* VFF scene viewer: load and display VFF scene on Enter/Up/Down.
+     * VFF format: header (0x400) + sections (code, framebuf, data).
+     * Section with RAM addr near 0x107xxxxx often contains XBGR1555 pixels. */
+    if (vf->cd && vf->cd->is_open) {
+        static int vff_loaded = 0;
+        static CDEntry vff_list[32];
+        static int vff_count = 0, vff_index = 0;
+        uint32_t pressed = vf->input & ~vf->input_prev;
+
+        /* Scan for VFF files on first use */
+        if (!vff_loaded) {
+            vff_loaded = 1;
+            uint8_t pvd[2048];
+            if (cdrom_read_sector(vf->cd, 16, pvd)) {
+                uint32_t root_lba  = *(uint32_t*)(pvd + 156 + 2);
+                uint32_t root_size = *(uint32_t*)(pvd + 156 + 10);
+                CDEntry l1[64];
+                int n1 = cdrom_list_dir(vf->cd, root_lba, root_size, l1, 64);
+                for (int i = 0; i < n1 && vff_count < 32; i++) {
+                    if (!l1[i].is_dir) continue;
+                    CDEntry *l2 = malloc(256 * sizeof(CDEntry));
+                    if (!l2) continue;
+                    int n2 = cdrom_list_dir(vf->cd, l1[i].lba, l1[i].size, l2, 256);
+                    for (int j = 0; j < n2 && vff_count < 32; j++) {
+                        char *dot = strrchr(l2[j].name, '.');
+                        if (dot && strcasecmp(dot, ".VFF") == 0)
+                            vff_list[vff_count++] = l2[j];
+                    }
+                    free(l2);
+                }
+                printf("[VFF] Found %d VFF scene files\n", vff_count);
+            }
+        }
+
+        /* Navigate VFF scenes with Up/Down, load on Enter */
+        if (vff_count > 0) {
+            if (pressed & VFLASH_BTN_DOWN)
+                vff_index = (vff_index + 1) % vff_count;
+            if (pressed & VFLASH_BTN_UP)
+                vff_index = (vff_index + vff_count - 1) % vff_count;
+
+            if ((pressed & (VFLASH_BTN_ENTER | VFLASH_BTN_UP | VFLASH_BTN_DOWN)) ||
+                vf->frame_count == 3) {
+                CDEntry *e = &vff_list[vff_index];
+                /* Read VFF header */
+                uint8_t hdr[0x400];
+                int rd = cdrom_read_file(vf->cd, e, hdr, 0, 0x400);
+                if (rd >= 0x60 && hdr[0]=='v' && hdr[1]=='f' && hdr[2]=='D' && hdr[3]=='0') {
+                    uint32_t nsec = *(uint32_t*)(hdr + 0x2C);
+                    if (nsec > 8) nsec = 8;
+                    /* Find the largest section with pixel-like address (0x103-0x108 range) */
+                    uint32_t fb_off = 0x400; /* data starts after header */
+                    uint32_t best_off = 0, best_size = 0;
+                    uint32_t cur = 0x400;
+                    for (uint32_t si = 0; si < nsec; si++) {
+                        uint32_t addr = *(uint32_t*)(hdr + 0x30 + si * 0x10);
+                        uint32_t sz   = *(uint32_t*)(hdr + 0x34 + si * 0x10);
+                        /* Heuristic: framebuffer section is large and not code-like */
+                        if (sz > best_size && sz >= 153600) { /* at least one 320x240 frame */
+                            best_off = cur;
+                            best_size = sz;
+                        }
+                        cur += sz;
+                    }
+                    if (best_size > 0) {
+                        /* Read one frame (320x240 XBGR1555 = 153600 bytes) */
+                        uint32_t frame_sz = 320 * 240 * 2;
+                        uint8_t *fb = malloc(frame_sz);
+                        if (fb) {
+                            int fbrd = cdrom_read_file(vf->cd, e, fb, best_off, frame_sz);
+                            if (fbrd >= (int)frame_sz) {
+                                const uint16_t *px = (const uint16_t *)fb;
+                                for (int y = 0; y < 240; y++) {
+                                    for (int x = 0; x < 320; x++) {
+                                        uint16_t p = px[y * 320 + x];
+                                        uint8_t b = ((p >> 10) & 0x1F) << 3;
+                                        uint8_t g = ((p >> 5)  & 0x1F) << 3;
+                                        uint8_t r = ( p        & 0x1F) << 3;
+                                        vf->framebuf[y * 320 + x] =
+                                            0xFF000000 | ((uint32_t)r<<16) | ((uint32_t)g<<8) | b;
+                                    }
+                                }
+                                printf("[VFF] %d/%d: %s frame at +0x%X (%uKB section)\n",
+                                       vff_index+1, vff_count, e->name,
+                                       best_off, best_size/1024);
+                            }
+                            free(fb);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /* PL111 LCD framebuffer blit: if LCD is enabled and has a valid
      * framebuffer address, copy it to our display framebuffer. */
     if ((vf->lcd.control & 1) && vf->lcd.upbase >= VFLASH_RAM_BASE &&
