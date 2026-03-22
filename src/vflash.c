@@ -3817,31 +3817,8 @@ void vflash_run_frame(VFlash *vf) {
                                 vf->framebuf[pi] = bgpx;
                         }
 
-                        /* Step 2: overlay foreground (section 1, or largest non-bg) */
-                        int fg_sec = (nsec >= 3) ? 1 : 0;
-                        if (vff_sec >= 0 && (uint32_t)vff_sec < nsec) fg_sec = vff_sec;
-                        if (sec_sz[fg_sec] >= frame_bytes) {
-                            uint8_t *fb = malloc(frame_bytes);
-                            if (fb) {
-                                int rd = cdrom_read_file(vf->cd, e, fb, sec_off[fg_sec], frame_bytes);
-                                if (rd >= (int)frame_bytes) {
-                                    for (int y = 0; y < 240; y++) {
-                                        for (int x = 0; x < 320; x++) {
-                                            int idx = y * 320 + x;
-                                            uint16_t p = fb[idx*2] | (fb[idx*2+1] << 8);
-                                            if (p != 0) { /* non-zero = visible pixel */
-                                                uint8_t r = (p & 0x1F) << 3;
-                                                uint8_t g = ((p >> 5) & 0x1F) << 3;
-                                                uint8_t b = ((p >> 10) & 0x1F) << 3;
-                                                vf->framebuf[idx] =
-                                                    0xFF000000|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
-                                            }
-                                        }
-                                    }
-                                }
-                                free(fb);
-                            }
-                        }
+                        /* VFF foreground data is tiled/compressed — can't display raw.
+                         * Only the background fill color is directly usable. */
                         printf("[VFF] %d/%d: %s (bg+fg composite)\n",
                                vff_index+1, vff_count, e->name);
                     }
