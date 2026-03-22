@@ -545,8 +545,12 @@ static int mjp_decode_raw(MJPDecoder *dec, const uint8_t *raw, uint32_t raw_sz,
         hp += 2 + mlen;
     }
 
-    /* Re-insert byte-stuffing in entropy data */
-    uint8_t *fixed = malloc(total + total / 4 + 16);
+    /* Re-insert byte-stuffing in entropy data.
+     * V.Flash hardware JPEG encoder omits FF 00 byte-stuffing.
+     * Only preserve FF D9 (EOI) — everything else gets stuffed.
+     * Don't preserve FF D0-D7 (restart markers) as the encoder
+     * likely doesn't use them and these bytes are entropy data. */
+    uint8_t *fixed = malloc(total + total / 2 + 16);
     if (!fixed) { free(swapped); return 0; }
     memcpy(fixed, swapped, sos_data);
     uint32_t fi = sos_data;
@@ -554,10 +558,19 @@ static int mjp_decode_raw(MJPDecoder *dec, const uint8_t *raw, uint32_t raw_sz,
         fixed[fi++] = swapped[ei];
         if (swapped[ei] == 0xFF && ei + 1 < total) {
             uint8_t nxt = swapped[ei + 1];
-            if (nxt == 0x00 || (nxt >= 0xD0 && nxt <= 0xD7) || nxt == 0xD9)
-                { fixed[fi++] = nxt; ei++; }
-            else
-                { fixed[fi++] = 0x00; }
+            if (nxt == 0xD9) {
+                /* EOI — pass through and stop */
+                fixed[fi++] = 0xD9;
+                ei++;
+                break;
+            } else if (nxt == 0x00) {
+                /* Already stuffed — pass through */
+                fixed[fi++] = 0x00;
+                ei++;
+            } else {
+                /* Unstuffed FF in entropy — insert 0x00 */
+                fixed[fi++] = 0x00;
+            }
         }
     }
     if (fi < 2 || fixed[fi-2] != 0xFF || fixed[fi-1] != 0xD9)

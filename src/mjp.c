@@ -36,6 +36,9 @@ int mjp_decode_frame(MJPDecoder *dec, const uint8_t *data, uint32_t size) {
     MJPErrorMgr jerr;
     int decoded_lines = 0;
 
+    /* Clear framebuf to prevent stale scanlines from previous frames */
+    memset(dec->framebuf, 0, dec->width * dec->height * sizeof(uint32_t));
+
     cinfo.err = jpeg_std_error(&jerr.pub);
     jerr.pub.error_exit = mjp_error_exit;
     jerr.pub.output_message = mjp_output_message;
