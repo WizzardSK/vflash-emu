@@ -1558,10 +1558,13 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                              * µMORE task_start (0x85E88) checks [0x103585E0]==3
                              * and refuses to register tasks if state != 3.
                              * On real HW this is set by earlier init stages. */
-                            /* DON'T fill BSS with BX LR in natural boot mode.
-                             * Real init 0x5D0 clears BSS, kernel init writes heap.
-                             * BX LR fill would overwrite heap metadata later.
-                             * Also DON'T set sched_state — real init handles it. */
+                            /* DON'T fill BSS in natural boot — real init handles it.
+                             * BUT set sched_state=3 AFTER BSS clear but before task_start.
+                             * Real init BLs: 0x5D0(BSS clear), then 0x704(MMU), then
+                             * scheduler at 0x10010234 calls task_start which needs state=3.
+                             * Patch: write sched_state directly to ROM pool area so it
+                             * gets set when the init code runs. */
+                            /* We'll intercept in the HLE handler instead — set flag */
                             /* DON'T create dummy idle task — real init will do it.
                              * Dummy task at 0x107FD000 was interfering with real init. */
                             if (0) { /* disabled for natural boot */
@@ -3000,6 +3003,23 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         }
     }
 
+    /* Intercept scheduler init: set sched_state=3 before task_start.
+     * task_start at 0x10085E50 checks sched_state and refuses if != 3.
+     * BSS clear zeros it, but nothing sets it back before task_start. */
+    if (addr == 0x10085E50) {
+        VFlash *vfp = (VFlash *)ctx;
+        /* task_start checks two guards:
+         * 1. [0x10358600] must NOT be 1 (already running)
+         * 2. [0x101A4F80] must be 0 (not initialized)
+         * BSS clear zeros 0x358600 but 0x1A4F80 is in ROM code area
+         * with non-zero data. Clear it so task_start proceeds. */
+        if (*(uint32_t*)(vfp->ram + 0x3585E0) == 0)
+            *(uint32_t*)(vfp->ram + 0x3585E0) = 3;
+        *(uint32_t*)(vfp->ram + 0x1A4F80) = 0;
+        printf("[HLE] Cleared guards for task_start\n");
+        return 0; /* let real code run */
+    }
+
     if (addr >= 0x10190000 && addr < 0x10C00000) {
         static int hle_logged = 0;
         if (hle_logged < 200) {
@@ -3095,9 +3115,24 @@ void vflash_run_frame(VFlash *vf) {
                 *(uint32_t*)(vf->ram+w)=0xE25EF004; w+=4;
                 *(uint32_t*)(vf->ram+w)=0x9001000C; w+=4;
                 printf("[KERN] Timer + IRQ enabled, kernel at 0x%08X\n", pc);
-                printf("[KERN] Heap check: RAM[0x359660]=%08X RAM[0x3596B0]=%08X\n",
+                printf("[KERN] Heap: [0x359660]=%08X [0x3596B0]=%08X\n",
                        *(uint32_t*)(vf->ram + 0x359660),
                        *(uint32_t*)(vf->ram + 0x3596B0));
+                printf("[KERN] Tasks: list_head[0x3585C0]=%08X sched_state[0x3585E0]=%08X\n",
+                       *(uint32_t*)(vf->ram + 0x3585C0),
+                       *(uint32_t*)(vf->ram + 0x3585E0));
+                printf("[KERN] Task mgr[0xACC78]=%08X [0x358600]=%08X\n",
+                       *(uint32_t*)(vf->ram + 0xACC78),
+                       *(uint32_t*)(vf->ram + 0x358600));
+                /* Check if heap was used (allocated blocks) */
+                uint32_t heap_start = *(uint32_t*)(vf->ram + 0x359660);
+                if (heap_start >= 0x10000000 && heap_start < 0x11000000) {
+                    uint32_t hoff = heap_start - 0x10000000;
+                    uint32_t blk0 = *(uint32_t*)(vf->ram + hoff);
+                    uint32_t blk1 = *(uint32_t*)(vf->ram + hoff + 4);
+                    printf("[KERN] Heap block: [%08X]=%08X next=%08X (free=%d size=%08X)\n",
+                           heap_start, blk0, blk1, blk0 & 1, blk0 & ~1u);
+                }
             }
 
             /* After kernel stabilizes (~20 frames), launch game init */
