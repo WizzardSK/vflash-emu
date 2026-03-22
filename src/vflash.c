@@ -1470,7 +1470,12 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                              * and refuses to register tasks if state != 3.
                              * On real HW this is set by earlier init stages. */
                             *(uint32_t*)(vf->ram + 0x3585E0) = 3;
-                            printf("[ROM-PRELOAD] Kernel+modules+code+sched_state=3\n");
+                            /* Patch flash_buf[0] to µMORE kernel entry instead of
+                             * remap value (0x118). After hw init, flash dispatch
+                             * jumps to [0xB8000800] = flash_buf[0].
+                             * Without this: infinite reboot loop. */
+                            *(uint32_t*)(vf->flash_buf) = 0x1009FFD4; /* kernel entry */
+                            printf("[ROM-PRELOAD] flash_buf[0] → kernel 0x1009FFD4\n");
                         }
                     }
                 }
@@ -2781,12 +2786,35 @@ void vflash_run_frame(VFlash *vf) {
         ztimer_tick(&vf->timer, actual);
         done += (int)actual;
 
-        /* Detect scheduler loop or idle stub and set up IRQ handling.
-         * Phase 1: ROM init → scheduler loop (0x7FFC0-0x80060) → redirect to BOOT.BIN
-         * Phase 2: BOOT.BIN init → idle stub (0xFFF000) → install IRQ, enable IRQs */
-        if (vf->has_rom && vf->frame_count > 2) {
+        /* Detect kernel loop and enable timer + IRQ */
+        if (vf->has_rom && vf->frame_count > 5) {
             uint32_t pc = vf->cpu.r[15];
             static int phase = 0;
+
+            /* Kernel loop at 0x100A0000-0x100A2000: enable timer + IRQ */
+            if (phase == 0 && pc >= 0x100A0000 && pc < 0x100A2000
+                && (vf->cpu.cpsr & 0x80)) {
+                phase = 99; /* skip old phases */
+                vf->timer.timer[0].load = 37500;
+                vf->timer.timer[0].count = 37500;
+                vf->timer.timer[0].ctrl = 0xE2;
+                vf->timer.irq.enable |= 0x01;
+                vf->cpu.cpsr &= ~0x80; /* enable IRQ */
+                vf->cpu.r13_irq = 0x10800000;
+                /* Install IRQ vector chain */
+                *(uint32_t*)(vf->ram + 0xFF98) = 0xE59FF03C;
+                *(uint32_t*)(vf->ram + 0xFFDC) = 0x10FFF040;
+                /* IRQ wrapper at 0xFFF040 */
+                uint32_t w = 0xFFF040;
+                *(uint32_t*)(vf->ram+w)=0xE92D500F; w+=4;
+                *(uint32_t*)(vf->ram+w)=0xE59F000C; w+=4;
+                *(uint32_t*)(vf->ram+w)=0xE3A01001; w+=4;
+                *(uint32_t*)(vf->ram+w)=0xE5801000; w+=4;
+                *(uint32_t*)(vf->ram+w)=0xE8BD500F; w+=4;
+                *(uint32_t*)(vf->ram+w)=0xE25EF004; w+=4;
+                *(uint32_t*)(vf->ram+w)=0x9001000C; w+=4;
+                printf("[KERN] Timer + IRQ enabled, kernel at 0x%08X\n", pc);
+            }
 
             /* Phase 1: scheduler loop detected → re-copy modules + redirect */
             if (phase == 0 && (pc >= 0x1007FFC0 && pc <= 0x10080060)) {
