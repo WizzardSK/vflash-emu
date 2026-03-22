@@ -546,6 +546,20 @@ int arm9_step(ARM9 *cpu) {
                     sbl++;
                 }
             }
+            /* Trace scheduler dispatch BL */
+            if (inst_addr == 0x100108E4) {
+                static int disp_log = 0;
+                if (disp_log < 5)
+                    printf("[DISP] BL 0x10095B08 R0=%08X R1=%08X\n",
+                           cpu->r[0], cpu->r[1]);
+                disp_log++;
+            }
+            if (inst_addr == 0x100108E8) {
+                static int disp_ret = 0;
+                if (disp_ret < 5)
+                    printf("[DISP] returned R0=%08X\n", cpu->r[0]);
+                disp_ret++;
+            }
             /* Trace task_start function */
             if (inst_addr >= 0x10085E50 && inst_addr <= 0x10085F50) {
                 static int ts_log = 0;
