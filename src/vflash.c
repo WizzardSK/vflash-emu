@@ -2983,18 +2983,32 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     /* Intercept ANY zero-instruction call in µMORE service BSS range
      * (0x109A0000-0x109B0000) and nearby areas. Also catch the specific
      * dispatch table addresses and second-level dispatch addresses. */
-    /* µMORE service handlers: return 1 = "event processed".
-     * Without this, game loops calling these forever. */
-    if (addr == 0x109A0950 || addr == 0x109A09DC ||
-        addr == 0x109A0868 || addr == 0x109A0970 ||
-        addr == 0x109A0A38 || addr == 0x109A0A0C ||
-        addr == 0x109A0A1C || addr == 0x109A09AC ||
-        addr == 0x109A0A98 || addr == 0x109A0AC4 ||
-        addr == 0x109A0D2C || addr == 0x109A0CE4 ||
-        addr == 0x109A0D08) {
-        cpu->r[0] = 1;
-        cpu->r[15] = cpu->r[14] & ~3u;
-        return 1;
+    /* µMORE service handlers — log parameters to understand what game wants */
+    {
+        static const uint32_t svc_addrs[] = {
+            0x109A0868, 0x109A0950, 0x109A0970, 0x109A0A38,
+            0x109A0A0C, 0x109A0A1C, 0x109A09AC, 0x109A09DC,
+            0x109A0A98, 0x109A0AC4, 0x109A0D2C, 0x109A0CE4, 0x109A0D08, 0
+        };
+        for (int si = 0; svc_addrs[si]; si++) {
+            if (addr == svc_addrs[si]) {
+                static int svc_log_counts[16] = {0};
+                if (svc_log_counts[si] < 5) {
+                    /* Read stack args too: [SP], [SP+4], [SP+8], [SP+12] */
+                    uint32_t sp = cpu->r[13];
+                    uint32_t s0 = cpu->mem_read32(cpu->mem_ctx, sp);
+                    uint32_t s1 = cpu->mem_read32(cpu->mem_ctx, sp + 4);
+                    uint32_t s2 = cpu->mem_read32(cpu->mem_ctx, sp + 8);
+                    printf("[SVC-%02d] 0x%08X R0=%08X R1=%08X R2=%08X R3=%08X [SP]=%08X,%08X,%08X LR=%08X\n",
+                           si, addr, cpu->r[0], cpu->r[1], cpu->r[2], cpu->r[3],
+                           s0, s1, s2, cpu->r[14]);
+                    svc_log_counts[si]++;
+                }
+                cpu->r[0] = 1;
+                cpu->r[15] = cpu->r[14] & ~3u;
+                return 1;
+            }
+        }
     }
 
     if (addr >= 0x10190000 && addr < 0x10C00000) {
@@ -3172,7 +3186,16 @@ void vflash_run_frame(VFlash *vf) {
                     memset(vf->ram + ctx_base, 0, 0x2000);
                     /* context + 0x6C = pointer to event data */
                     *(uint32_t*)(vf->ram + ctx_base + 0x6C) = 0x10000000 + evt_base;
-                    /* event data fields — start with zeros (safe) */
+                    /* Fill event data with initial values.
+                     * Fields at evt+12, +16, +20, +24 become R0/args for services.
+                     * Also fill other potential fields the game reads. */
+                    *(uint32_t*)(vf->ram + evt_base + 0x00) = 0x00000001; /* flags/type */
+                    *(uint32_t*)(vf->ram + evt_base + 0x04) = 0x10800000; /* framebuffer? */
+                    *(uint32_t*)(vf->ram + evt_base + 0x08) = 0x00000140; /* width=320 */
+                    *(uint32_t*)(vf->ram + evt_base + 0x0C) = 0x00000001; /* field+12: enable/count */
+                    *(uint32_t*)(vf->ram + evt_base + 0x10) = 0x00000140; /* field+16: width=320 */
+                    *(uint32_t*)(vf->ram + evt_base + 0x14) = 0x000000F0; /* field+20: height=240 */
+                    *(uint32_t*)(vf->ram + evt_base + 0x18) = 0x10800000; /* field+24: fb addr */
                     /* Store context pointer where game expects it */
                     *(uint32_t*)(vf->ram + 0xB909C0) = 0x10000000 + ctx_base;
                     printf("[EVENT] Context at 0x%08X, events at 0x%08X\n",
@@ -3878,6 +3901,12 @@ void vflash_run_frame(VFlash *vf) {
             uint32_t save_r0 = vf->cpu.r[0];
             uint32_t save_r1 = vf->cpu.r[1];
 
+            /* Update event data each frame */
+            {
+                uint32_t evt = 0xF01000;
+                *(uint32_t*)(vf->ram + evt + 0x0C) = (uint32_t)vf->frame_count; /* frame counter */
+                *(uint32_t*)(vf->ram + evt + 0x18) = vf->input; /* button state */
+            }
             /* Call dispatcher: cycle through event types 0-7 */
             vf->cpu.r[0] = (uint32_t)(vf->frame_count % 8);
             vf->cpu.r[1] = *(uint32_t*)(vf->ram + 0xB909C0);
