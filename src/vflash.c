@@ -3777,10 +3777,12 @@ void vflash_run_frame(VFlash *vf) {
         }
     }
 
-    /* PL111 LCD framebuffer blit: if LCD is enabled and has a valid
-     * framebuffer address, copy it to our display framebuffer. */
+    /* PL111 LCD framebuffer blit: only when game actually writes to LCD
+     * (not during asset browser mode where MJP/PTX write directly to framebuf).
+     * Skip if video is playing or if the LCD framebuffer hasn't been written by game code. */
     if ((vf->lcd.control & 1) && vf->lcd.upbase >= VFLASH_RAM_BASE &&
-        vf->lcd.upbase < VFLASH_RAM_BASE + VFLASH_RAM_SIZE && !vf->vid.fb_dirty) {
+        vf->lcd.upbase < VFLASH_RAM_BASE + VFLASH_RAM_SIZE && !vf->vid.fb_dirty &&
+        !vf->mjp_player.playing && !vf->ptx_loaded) {
         uint32_t fb_off = vf->lcd.upbase - VFLASH_RAM_BASE;
         uint32_t bpp_code = (vf->lcd.control >> 1) & 7;
         /* BPP: 1=2bpp, 2=4bpp, 3=8bpp, 4=16bpp, 5=24bpp, 6=16bpp565 */
