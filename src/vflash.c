@@ -1472,11 +1472,12 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                              * and refuses to register tasks if state != 3.
                              * On real HW this is set by earlier init stages. */
                             *(uint32_t*)(vf->ram + 0x3585E0) = 3;
-                            /* Flash dispatch jumps to [flash_buf[0]]. Set it to
-                             * µMORE scheduler entry at 0x10010234 (from ROM[0xD90]).
-                             * On real HW: flash → 0x118 → BL inits → LDR PC=0x10010234.
-                             * We skip the BLs (already preloaded) and go direct. */
-                            *(uint32_t*)(vf->flash_buf) = 0x10010234;
+                            /* Flash dispatch → [flash_buf[0]] = 0x118.
+                             * RAM[0x118] has flash remap code (PLL/SDRAM/dispatch loop).
+                             * We OVERWRITE it with ORIGINAL ROM code (BL init calls)
+                             * so the init sequence runs: 0x118 → BL inits → scheduler. */
+                            memcpy(vf->ram + 0x118, vf->rom + 0x118, 0xE00 - 0x118);
+                            printf("[ROM-PRELOAD] ROM[0x118..0xE00] → RAM (init BLs)\n");
                             printf("[ROM-PRELOAD] flash_buf[0] → kernel 0x1009FFD4\n");
                         }
                     }
