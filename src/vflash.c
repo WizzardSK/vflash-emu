@@ -1144,6 +1144,7 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             uint32_t ureg = off - 0x10020000u;
             switch (ureg) {
                 case 0x00: return 0;         /* UARTDR: no data */
+                case 0x14: return 0x20;      /* UARTIFLS / status: bit5 set (scheduler checks this) */
                 case 0x18: return 0x90;      /* UARTFR: TX empty, RX empty */
                 case 0x24: return 0;         /* UARTIBRD */
                 case 0x28: return 0;         /* UARTFBRD */
@@ -3012,13 +3013,37 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         if (*(uint32_t*)(vfp->ram + 0x3585E0) == 0)
             *(uint32_t*)(vfp->ram + 0x3585E0) = 3;
         *(uint32_t*)(vfp->ram + 0x1A4F80) = 0;
-        /* Populate VIC dispatch table for FIQ handler.
-         * Table at RAM[0x1CBC], slot +28 = timer FIQ handler.
-         * Write µMORE timer handler address (0x10001A78 = alternate
-         * entry that takes R0 as interrupt ID). */
+        /* Write custom timer FIQ handler into RAM.
+         * VIC dispatch table at RAM[0x1CBC] chains through wrappers.
+         * Instead of populating the whole chain, write a direct handler
+         * that clears timer + calls µMORE scheduler wakeup. */
         if (*(uint32_t*)(vfp->ram + 0x1CD8) == 0) {
-            *(uint32_t*)(vfp->ram + 0x1CD8) = 0x10001A78;
-            printf("[HLE] VIC dispatch[7] = 0x10001A78 (timer FIQ)\n");
+            /* Write handler at RAM[0xFFE000] (safe high area) */
+            uint32_t h = 0xFFE000;
+            uint32_t p = h;
+            /* PUSH {R0-R3, LR} */
+            *(uint32_t*)(vfp->ram + p) = 0xE92D400F; p += 4;
+            /* LDR R0, =0x9001000C (timer IntClr) */
+            *(uint32_t*)(vfp->ram + p) = 0xE59F0018; p += 4;
+            /* MOV R1, #1 */
+            *(uint32_t*)(vfp->ram + p) = 0xE3A01001; p += 4;
+            /* STR R1, [R0] — clear timer interrupt */
+            *(uint32_t*)(vfp->ram + p) = 0xE5801000; p += 4;
+            /* MOV R0, #1 (timer event ID) */
+            *(uint32_t*)(vfp->ram + p) = 0xE3A00001; p += 4;
+            /* BL 0x10084494-ish (scheduler notify — skip for now) */
+            /* Just clear and return for now */
+            /* POP {R0-R3, LR} */
+            *(uint32_t*)(vfp->ram + p) = 0xE8BD400F; p += 4;
+            /* MOV PC, LR (return to FIQ wrapper) */
+            *(uint32_t*)(vfp->ram + p) = 0xE1A0F00E; p += 4;
+            /* Pool: timer IntClr address */
+            *(uint32_t*)(vfp->ram + p) = 0x9001000C; p += 4;
+
+            /* Point VIC slot 7 directly to our handler (skip chain) */
+            *(uint32_t*)(vfp->ram + 0x1CD8) = 0x10000000 + h;
+            printf("[HLE] VIC dispatch[7] → custom handler at 0x%08X\n",
+                   0x10000000 + h);
         }
         printf("[HLE] Cleared guards for task_start\n");
         return 0;
