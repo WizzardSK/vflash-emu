@@ -399,6 +399,7 @@ static void exec_thumb(ARM9 *cpu, uint16_t insn) {
 void arm9_reset(ARM9 *cpu) {
     memset(cpu->r,0,sizeof(cpu->r));
     CPSR=ARM9_MODE_SVC|ARM9_FLAG_I|ARM9_FLAG_F; cpu->spsr=0; PC=0; cpu->cycles=0;
+    cpu->null_trap_enabled = 0;
     cp15_reset(&cpu->cp15);
     printf("[ARM9] Reset PC=0x%08X CPSR=0x%08X\n",PC,CPSR);
 }
@@ -550,11 +551,11 @@ void arm9_swi(ARM9 *cpu) {
 
 void arm9_undef(ARM9 *cpu) {
     static int undef_count = 0;
-    if (undef_count < 3) {
+    if (undef_count < 20) {
         uint32_t bad_pc = PC - 8;
         uint32_t insn = cpu->mem_read32(cpu->mem_ctx, bad_pc);
-        fprintf(stderr, "[UNDEF] #%d at PC=0x%08X insn=0x%08X CPSR=0x%08X LR=0x%08X R0=0x%08X\n",
-                undef_count, bad_pc, insn, CPSR, cpu->r[14], cpu->r[0]);
+        fprintf(stderr, "[UNDEF] #%d PC=0x%08X insn=0x%08X LR=0x%08X\n",
+                undef_count, bad_pc, insn, cpu->r[14]);
     }
     undef_count++;
 
