@@ -291,7 +291,7 @@ Standard ARM dual-timer. Two timers per block at offsets +0x00 and +0x20:
 - **LCD handle stub**: framebuffer at RAM[0x800000], display struct chain
 
 ### What doesn't work yet
-- **BSS function pointers** — game init crashes at 0x10A01904 (BSS, zeroed by ROM init); µMORE kernel would normally populate these during boot. Requires either complete µMORE kernel init or ROM-level ATAPI support for proper disc loading.
+- **Game rendering** — game init runs through LCD init + display setup but crashes on UNDEF exception in deeper init chain. BSS filled with BX LR safety net + NULL pointer trap catches most NULL calls. Full page table identity mapping for all 16MB RAM. Likely needs complete µMORE kernel init for BSS function pointer population.
 - **In-game audio** — `.snd` PCM WAV files not decoded (cutscene audio works)
 
 ## MJP / MIAV format
