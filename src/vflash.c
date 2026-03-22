@@ -9,6 +9,9 @@
 #include <string.h>
 #include <stdio.h>
 
+/* Forward declarations */
+static int hle_service_intercept(void *ctx, uint32_t addr);
+
 /* ============================================================
  * V.Flash System — ZEVIO 1020 SoC
  * ARM926EJ-S @ 150MHz, 16MB SDRAM
@@ -2798,6 +2801,8 @@ VFlash* vflash_create(const char *disc_path) {
     vf->cpu.mem_write16  = mem_write16;
     vf->cpu.mem_write8   = mem_write8;
     vf->cpu.undef_callback = undef_rom_copy;
+    vf->cpu.hle_intercept  = hle_service_intercept;
+    vf->cpu.hle_ctx        = vf;
 
     /* Try to load boot ROM (70004.bin) — enables real boot instead of HLE */
     {
@@ -2894,6 +2899,45 @@ void vflash_init_audio(VFlash *vf) {
 
 void vflash_set_debug(VFlash *vf, int on) {
     vf->debug = on;
+}
+
+/* ============================================================
+ * HLE µMORE service layer
+ * Game dispatch table at 0x10C13854 routes to 8 BSS addresses.
+ * We intercept execution at these addresses and handle the calls.
+ * ============================================================ */
+
+/* µMORE service addresses (from BOOT.BIN jump table at 0x10C1385C) */
+#define UMORE_SVC_0  0x109A0868
+#define UMORE_SVC_1  0x109A0950  /* most frequently called */
+#define UMORE_SVC_2  0x109A0970
+#define UMORE_SVC_3  0x109A0A38
+#define UMORE_SVC_4  0x109A0A0C
+#define UMORE_SVC_5  0x109A0A1C
+#define UMORE_SVC_6  0x109A09AC
+#define UMORE_SVC_7  0x109A09DC
+
+static int hle_service_intercept(void *ctx, uint32_t addr) {
+    VFlash *vf = ctx;
+    ARM9 *cpu = &vf->cpu;
+
+    /* Intercept ANY zero-instruction call in µMORE service BSS range
+     * (0x109A0000-0x109B0000) and nearby areas. Also catch the specific
+     * dispatch table addresses and second-level dispatch addresses. */
+    if (addr >= 0x10190000 && addr < 0x10400000) {
+        /* This is the BSS/uninitialized area — log and return */
+        static int hle_logged = 0;
+        if (hle_logged < 50) {
+            printf("[HLE] BSS call 0x%08X R0=0x%08X R1=0x%08X LR=0x%08X\n",
+                   addr, cpu->r[0], cpu->r[1], cpu->r[14]);
+            hle_logged++;
+        }
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+
+    return 0; /* not handled */
 }
 
 /* ============================================================

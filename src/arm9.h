@@ -55,6 +55,11 @@ struct ARM9 {
     /* Callback for UNDEF recovery — copies ROM to RAM for µMORE */
     void     (*undef_callback)(void *ctx);
     int      null_trap_enabled; /* set by Phase 2 to enable NULL trap */
+
+    /* HLE service intercept: called when PC matches a registered address.
+     * Returns 1 if handled (skip instruction execution), 0 to continue. */
+    int      (*hle_intercept)(void *ctx, uint32_t addr);
+    void     *hle_ctx;
 };
 typedef struct ARM9 ARM9;
 

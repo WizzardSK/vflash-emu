@@ -487,16 +487,19 @@ int arm9_step(ARM9 *cpu) {
         /* NULL pointer trap: when game code (LR in BOOT.BIN) calls through
          * a NULL pointer into BSS, auto-return to skip the call.
          * Only active for calls FROM BOOT.BIN code (0x10C00000+). */
+        /* HLE service intercept: check BEFORE null trap (services are at zero-init addresses) */
+        if (cpu->hle_intercept && cpu->hle_intercept(cpu->hle_ctx, inst_addr)) {
+            cpu->cycles += 1;
+            return 1;
+        }
+
         if (i == 0 && cpu->null_trap_enabled && inst_addr >= 0x10000100 && inst_addr < 0x10C00000) {
             static int ntp = 0;
-            if (ntp < 50)
-                printf("[NULL-TRAP] 0x%08X (from LR=0x%08X)\n", inst_addr, cpu->r[14]);
+            if (ntp < 200)
+                printf("[NULL-TRAP] 0x%08X (LR=0x%08X R0=0x%08X)\n", inst_addr, cpu->r[14], cpu->r[0]);
             ntp++;
-            /* Return R0=0 without modifying RAM.
-             * Writing stubs to RAM corrupts data reads from the same
-             * addresses (µMORE code interprets instruction bytes as data). */
             cpu->r[0] = 0;
-            PC = cpu->r[14] & ~3u; /* return to caller (BX LR equivalent) */
+            PC = cpu->r[14] & ~3u;
             cpu->cycles += 1;
             return 1;
         }
