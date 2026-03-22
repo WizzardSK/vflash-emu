@@ -292,7 +292,7 @@ Standard ARM dual-timer. Two timers per block at offsets +0x00 and +0x20:
 - **Flash dispatch**: patched flash_buf[0] to scheduler entry (0x10010234)
 
 ### What doesn't work yet
-- **µMORE scheduler init** — scheduler at 0x10010234 runs but exits to unmapped area via BSS function pointer chain. BSS fill (BX LR) catches NULL calls but return values cascade into crashes. Needs complete µMORE init sequence (init BLs at 0x118-0x134) to populate vtables.
+- **Game event dispatch** — game code runs stable loop at 0x10C55844 (switch/case reading event state from stack). Jump table targets (0x10A018xx) are in BSS (BX LR fill) — µMORE would populate these with real event handlers. Game is waiting for events that never arrive.
 - **In-game audio** — `.snd` PCM WAV files not decoded (cutscene audio works)
 
 ## MJP / MIAV format
