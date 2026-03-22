@@ -55,6 +55,8 @@ int mjp_decode_frame(MJPDecoder *dec, const uint8_t *data, uint32_t size) {
     jpeg_mem_src(&cinfo, (unsigned char*)data, size);
     jpeg_read_header(&cinfo, TRUE);
     cinfo.out_color_space = JCS_RGB;
+    cinfo.do_fancy_upsampling = FALSE;
+    cinfo.do_block_smoothing = FALSE;
     jpeg_start_decompress(&cinfo);
 
     int w = cinfo.output_width;

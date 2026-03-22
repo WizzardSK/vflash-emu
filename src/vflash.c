@@ -556,20 +556,21 @@ static int mjp_decode_raw(MJPDecoder *dec, const uint8_t *raw, uint32_t raw_sz,
     uint32_t fi = sos_data;
     for (uint32_t ei = sos_data; ei < total; ei++) {
         fixed[fi++] = swapped[ei];
-        if (swapped[ei] == 0xFF && ei + 1 < total) {
-            uint8_t nxt = swapped[ei + 1];
-            if (nxt == 0xD9) {
-                /* EOI — pass through and stop */
-                fixed[fi++] = 0xD9;
-                ei++;
-                break;
-            } else if (nxt == 0x00) {
-                /* Already stuffed — pass through */
-                fixed[fi++] = 0x00;
-                ei++;
+        if (swapped[ei] == 0xFF) {
+            if (ei + 1 < total) {
+                uint8_t nxt = swapped[ei + 1];
+                if (nxt == 0xD9) {
+                    fixed[fi++] = 0xD9;
+                    ei++;
+                    break;
+                } else if (nxt == 0x00) {
+                    fixed[fi++] = 0x00;
+                    ei++;
+                } else {
+                    fixed[fi++] = 0x00; /* stuff it */
+                }
             } else {
-                /* Unstuffed FF in entropy — insert 0x00 */
-                fixed[fi++] = 0x00;
+                fixed[fi++] = 0x00; /* trailing FF — stuff it */
             }
         }
     }
@@ -3523,9 +3524,6 @@ void vflash_run_frame(VFlash *vf) {
     if (vf->cd && vf->cd->is_open && vf->mjp_count > 0) {
         uint32_t pressed = vf->input & ~vf->input_prev;
         int load_mjp = 0;
-        if (vf->frame_count == 1 && !vf->mjp_player.playing) {
-            load_mjp = 1;
-        }
         if (pressed & VFLASH_BTN_RED) {
             /* Z = next video (works even during playback) */
             vf->mjp_index = (vf->mjp_index + 1) % vf->mjp_count;
@@ -3658,9 +3656,9 @@ void vflash_run_frame(VFlash *vf) {
             }
 
             vf->mjp_player.chunk_off = co;
-            /* Loop video if we reached the end */
+            /* Loop: restart from beginning */
             if (co + 12 >= dsz)
-                vf->mjp_player.chunk_off = 0x40;
+                co = 0x40;
         }
     }
 
