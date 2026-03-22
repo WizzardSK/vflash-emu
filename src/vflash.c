@@ -1470,11 +1470,21 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                              * and refuses to register tasks if state != 3.
                              * On real HW this is set by earlier init stages. */
                             *(uint32_t*)(vf->ram + 0x3585E0) = 3;
-                            /* Patch flash_buf[0] to µMORE kernel entry instead of
-                             * remap value (0x118). After hw init, flash dispatch
-                             * jumps to [0xB8000800] = flash_buf[0].
-                             * Without this: infinite reboot loop. */
-                            *(uint32_t*)(vf->flash_buf) = 0x1009FFD4; /* kernel entry */
+                            /* After hw init, flash dispatch jumps to [flash_buf[0]].
+                             * On real HW this is the remap address (0x118) and boot code
+                             * runs AGAIN with warm boot flag, taking a different path
+                             * that leads to scheduler. Set warm boot flag so boot code
+                             * at 0x118 takes the warm path. */
+                            vf->misc_regs[0x0C >> 2] |= 0x02; /* warm boot flag */
+                            /* Warm boot → RAM[0xFFC8] → BOOT.BIN init */
+                            *(uint32_t*)(vf->ram + 0xFFC8) = 0xE51FF004;
+                            *(uint32_t*)(vf->ram + 0xFFCC) = 0x10C00010;
+                            *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFF000; /* callback→idle */
+                            uint32_t is = 0xFFF000;
+                            *(uint32_t*)(vf->ram + is) = 0xE10F0000;
+                            *(uint32_t*)(vf->ram + is+4) = 0xE3C000C0;
+                            *(uint32_t*)(vf->ram + is+8) = 0xE129F000;
+                            *(uint32_t*)(vf->ram + is+12) = 0xEAFFFFFE;
                             printf("[ROM-PRELOAD] flash_buf[0] → kernel 0x1009FFD4\n");
                         }
                     }
