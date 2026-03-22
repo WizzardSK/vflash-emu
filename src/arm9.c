@@ -546,6 +546,15 @@ int arm9_step(ARM9 *cpu) {
                     sbl++;
                 }
             }
+            /* Trace kernel init function 0x1009CFB4 step by step */
+            if (inst_addr >= 0x1009CFB4 && inst_addr <= 0x1009CFF0) {
+                static int ki_log = 0;
+                if (ki_log < 20) {
+                    printf("[KINIT] PC=%08X insn=%08X R0=%08X R1=%08X R2=%08X R3=%08X\n",
+                           inst_addr, i, cpu->r[0], cpu->r[1], cpu->r[2], cpu->r[3]);
+                    ki_log++;
+                }
+            }
         }
 
         /* HLE service intercept: check BEFORE null trap (services are at zero-init addresses) */

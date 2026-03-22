@@ -107,8 +107,11 @@ void cp15_write(CP15 *cp, uint32_t crn, uint32_t crm, uint32_t op2, uint32_t val
                 default: break;
             }
             break;
-        case 8:  /* TLB operations */
-            printf("[CP15] TLB op CRm=%u op2=%u val=0x%08X\n", crm, op2, val);
+        case 8:  /* TLB operations — invalidate TLB */
+            /* CRm=7: unified, CRm=5: I-TLB, CRm=6: D-TLB
+             * op2=0: invalidate all, op2=1: invalidate by MVA
+             * Signal to vflash.c's TLB cache via global flag */
+            cp->tlb_flush_needed = 1;
             break;
         case 9:  /* TCM */
             if (op2 == 0) { cp->dtcm_base = val; printf("[CP15] DTCM base=0x%08X\n", val); }

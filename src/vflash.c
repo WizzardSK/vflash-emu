@@ -807,6 +807,12 @@ static uint32_t mmu_translate(VFlash *vf, uint32_t va) {
     if (!cp->mmu_enabled)
         return va;
 
+    /* Check for MCR c8 TLB invalidate */
+    if (__builtin_expect(cp->tlb_flush_needed, 0)) {
+        tlb_flush();
+        cp->tlb_flush_needed = 0;
+    }
+
     /* TLB lookup (section-only cache) */
     uint32_t l1_index = va >> 20;
     uint32_t tlb_entry = tlb_cache[l1_index];
@@ -1258,7 +1264,14 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
 
     /* Fast path: RAM write (most common) */
     if (__builtin_expect(addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE, 1)) {
-        *(uint32_t*)(vf->ram + (addr - VFLASH_RAM_BASE)) = val;
+        uint32_t roff = addr - VFLASH_RAM_BASE;
+        if (roff == 0x359660) {
+            static int fwp = 0;
+            if (fwp < 20) printf("[FWP] ram[0x359660] = 0x%08X (PA=0x%08X PC=0x%08X)\n",
+                                val, addr, vf->cpu.r[15]);
+            fwp++;
+        }
+        *(uint32_t*)(vf->ram + roff) = val;
         return;
     }
 
@@ -3082,6 +3095,9 @@ void vflash_run_frame(VFlash *vf) {
                 *(uint32_t*)(vf->ram+w)=0xE25EF004; w+=4;
                 *(uint32_t*)(vf->ram+w)=0x9001000C; w+=4;
                 printf("[KERN] Timer + IRQ enabled, kernel at 0x%08X\n", pc);
+                printf("[KERN] Heap check: RAM[0x359660]=%08X RAM[0x3596B0]=%08X\n",
+                       *(uint32_t*)(vf->ram + 0x359660),
+                       *(uint32_t*)(vf->ram + 0x3596B0));
             }
 
             /* After kernel stabilizes (~20 frames), launch game init */
