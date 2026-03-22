@@ -1461,7 +1461,9 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                         {
                             memcpy(vf->ram + 0x9FFD4, vf->rom + 0xC02C, 0xA1FE4);
                             memcpy(vf->ram + 0xAC000, vf->rom + 0xAE010, 0xF95B0);
-                            for (uint32_t ci = 0x80000; ci < vf->rom_size; ci += 4) {
+                            /* Copy ROM code to RAM from 0x1000 (skip vectors).
+                             * Previously started at 0x80000 but scheduler is at 0x10234. */
+                            for (uint32_t ci = 0x1000; ci < vf->rom_size; ci += 4) {
                                 uint32_t rv = *(uint32_t*)(vf->rom + ci);
                                 if (rv != 0) *(uint32_t*)(vf->ram + ci) = rv;
                             }
@@ -1470,21 +1472,11 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                              * and refuses to register tasks if state != 3.
                              * On real HW this is set by earlier init stages. */
                             *(uint32_t*)(vf->ram + 0x3585E0) = 3;
-                            /* After hw init, flash dispatch jumps to [flash_buf[0]].
-                             * On real HW this is the remap address (0x118) and boot code
-                             * runs AGAIN with warm boot flag, taking a different path
-                             * that leads to scheduler. Set warm boot flag so boot code
-                             * at 0x118 takes the warm path. */
-                            vf->misc_regs[0x0C >> 2] |= 0x02; /* warm boot flag */
-                            /* Warm boot → RAM[0xFFC8] → BOOT.BIN init */
-                            *(uint32_t*)(vf->ram + 0xFFC8) = 0xE51FF004;
-                            *(uint32_t*)(vf->ram + 0xFFCC) = 0x10C00010;
-                            *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFF000; /* callback→idle */
-                            uint32_t is = 0xFFF000;
-                            *(uint32_t*)(vf->ram + is) = 0xE10F0000;
-                            *(uint32_t*)(vf->ram + is+4) = 0xE3C000C0;
-                            *(uint32_t*)(vf->ram + is+8) = 0xE129F000;
-                            *(uint32_t*)(vf->ram + is+12) = 0xEAFFFFFE;
+                            /* Flash dispatch jumps to [flash_buf[0]]. Set it to
+                             * µMORE scheduler entry at 0x10010234 (from ROM[0xD90]).
+                             * On real HW: flash → 0x118 → BL inits → LDR PC=0x10010234.
+                             * We skip the BLs (already preloaded) and go direct. */
+                            *(uint32_t*)(vf->flash_buf) = 0x10010234;
                             printf("[ROM-PRELOAD] flash_buf[0] → kernel 0x1009FFD4\n");
                         }
                     }
