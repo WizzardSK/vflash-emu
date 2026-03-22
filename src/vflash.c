@@ -233,6 +233,10 @@ struct VFlash {
     int       ptx_index;   /* current displayed index */
     int       ptx_loaded;  /* 1 after gallery scanned */
 
+    /* WAV sound list */
+    CDEntry  *wav_list;
+    int       wav_count;
+
     /* Debugger state */
     uint32_t bp[16];   /* breakpoint addresses (0 = unused) */
     int      bp_hit;   /* set by vflash_step() when BP hit */
@@ -2890,6 +2894,7 @@ void vflash_destroy(VFlash *vf) {
     free(vf->sram);
     free(vf->rom);
     free(vf->ptx_list);
+    free(vf->wav_list);
     free(vf);
 }
 
@@ -2899,6 +2904,39 @@ void vflash_init_audio(VFlash *vf) {
 
 void vflash_set_debug(VFlash *vf, int on) {
     vf->debug = on;
+}
+
+/* Play a WAV file from CD-ROM through the audio system */
+static void play_wav_from_cd(VFlash *vf, CDEntry *entry) {
+    if (!vf->audio || !entry || entry->size < 44) return;
+    uint8_t *wav = malloc(entry->size);
+    if (!wav) return;
+    int rd = cdrom_read_file(vf->cd, entry, wav, 0, entry->size);
+    if (rd > 44) {
+        int16_t *samples = NULL;
+        uint32_t count = 0, rate = 0;
+        if (snd_decode(wav, (uint32_t)rd, &samples, &count, &rate)) {
+            /* Resample to 44100 stereo if needed */
+            if (rate == 22050) {
+                /* Upsample 2x and mono→stereo */
+                uint32_t out_count = count * 4; /* 2x rate * 2 channels */
+                int16_t *out = malloc(out_count * sizeof(int16_t));
+                if (out) {
+                    for (uint32_t i = 0; i < count; i++) {
+                        int16_t s = samples[i];
+                        out[i*4+0] = s; out[i*4+1] = s; /* L,R */
+                        out[i*4+2] = s; out[i*4+3] = s; /* L,R (dup) */
+                    }
+                    audio_push_samples(vf->audio, out, out_count);
+                    free(out);
+                }
+            } else {
+                audio_push_samples(vf->audio, samples, count);
+            }
+            free(samples);
+        }
+    }
+    free(wav);
 }
 
 /* ============================================================
@@ -3369,6 +3407,29 @@ void vflash_run_frame(VFlash *vf) {
             }
         }
         printf("[PTX-GALLERY] Found %d PTX images on disc\n", vf->ptx_count);
+
+        /* Also scan for WAV files */
+        vf->wav_list = calloc(1024, sizeof(CDEntry));
+        vf->wav_count = 0;
+        if (cdrom_read_sector(vf->cd, 16, pvd)) {
+            uint32_t root_lba  = *(uint32_t*)(pvd + 156 + 2);
+            uint32_t root_size = *(uint32_t*)(pvd + 156 + 10);
+            CDEntry l1w[64];
+            int n1w = cdrom_list_dir(vf->cd, root_lba, root_size, l1w, 64);
+            for (int iw = 0; iw < n1w && vf->wav_count < 1024; iw++) {
+                if (!l1w[iw].is_dir) continue;
+                CDEntry *l2w = malloc(1024 * sizeof(CDEntry));
+                if (!l2w) continue;
+                int n2w = cdrom_list_dir(vf->cd, l1w[iw].lba, l1w[iw].size, l2w, 1024);
+                for (int jw = 0; jw < n2w && vf->wav_count < 1024; jw++) {
+                    char *dot = strrchr(l2w[jw].name, '.');
+                    if (dot && strcasecmp(dot, ".WAV") == 0)
+                        vf->wav_list[vf->wav_count++] = l2w[jw];
+                }
+                free(l2w);
+            }
+        }
+        printf("[WAV] Found %d WAV sound files\n", vf->wav_count);
     }
     /* Navigate gallery with Left/Right keys */
     if (vf->ptx_count > 0 && vf->cd && vf->cd->is_open) {
@@ -3403,6 +3464,11 @@ void vflash_run_frame(VFlash *vf) {
                         }
                         printf("[PTX-GALLERY] %d/%d: %s (%ux%u)\n",
                                vf->ptx_index + 1, vf->ptx_count, e->name, src_w, src_h);
+                        /* Play corresponding WAV (use PTX index mod wav_count) */
+                        if (vf->wav_count > 0 && vf->audio && vf->audio->initialized) {
+                            int wi = vf->ptx_index % vf->wav_count;
+                            play_wav_from_cd(vf, &vf->wav_list[wi]);
+                        }
                     }
                 }
                 free(ptx_buf);
@@ -3639,6 +3705,11 @@ void vflash_run_frame(VFlash *vf) {
                                 printf("[VFF] %d/%d: %s frame at +0x%X (%uKB section)\n",
                                        vff_index+1, vff_count, e->name,
                                        best_off, best_size/1024);
+                                /* Play a WAV sound with the scene */
+                                if (vf->wav_count > 0 && vf->audio && vf->audio->initialized) {
+                                    int wi = (vff_index * 7) % vf->wav_count;
+                                    play_wav_from_cd(vf, &vf->wav_list[wi]);
+                                }
                             }
                             free(fb);
                         }
