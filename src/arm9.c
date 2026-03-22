@@ -483,15 +483,6 @@ int arm9_step(ARM9 *cpu) {
         uint32_t i = r32(cpu, inst_addr);
         PC = inst_addr + 8;
 
-        /* One-shot trace: log first instruction at scheduler */
-        if (inst_addr == 0x10010234) {
-            static int sched_trace = 0;
-            if (!sched_trace) {
-                printf("[SCHED-TRACE] First fetch at 0x10010234: insn=0x%08X SP=0x%08X CPSR=0x%08X LR=0x%08X\n",
-                       i, cpu->r[13], CPSR, cpu->r[14]);
-                sched_trace = 1;
-            }
-        }
         /* Game init trace: log BL calls and returns */
         /* NULL pointer trap: when game code (LR in BOOT.BIN) calls through
          * a NULL pointer into BSS, auto-return to skip the call.
@@ -499,12 +490,15 @@ int arm9_step(ARM9 *cpu) {
         if (i == 0 && cpu->null_trap_enabled && inst_addr >= 0x10000100 && inst_addr < 0x10C00000) {
             static int ntp = 0;
             if (ntp < 50)
-                printf("[NULL-TRAP] 0x%08X (from 0x%08X)\n", inst_addr, cpu->r[14]);
+                printf("[NULL-TRAP] 0x%08X (from LR=0x%08X)\n", inst_addr, cpu->r[14]);
             ntp++;
-            /* Write stub: MOV R0,#0 (success); BX LR (return) */
-            cpu->mem_write32(cpu->mem_ctx, inst_addr, 0xE3A00000); /* MOV R0,#0 */
-            cpu->mem_write32(cpu->mem_ctx, inst_addr + 4, 0xE12FFF1E); /* BX LR */
-            PC = inst_addr; /* re-execute (now runs stub) */
+            /* Return R0=0 without modifying RAM.
+             * Writing stubs to RAM corrupts data reads from the same
+             * addresses (µMORE code interprets instruction bytes as data). */
+            cpu->r[0] = 0;
+            PC = cpu->r[14] & ~3u; /* return to caller (BX LR equivalent) */
+            cpu->cycles += 1;
+            return 1;
         }
 
         exec_arm(cpu, i);
