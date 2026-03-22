@@ -3808,6 +3808,7 @@ void vflash_run_frame(VFlash *vf) {
         }
     }
 
+    vf->input_prev = vf->input;  /* update for next frame's edge detection */
     vf->frame_count++;
 }
 
