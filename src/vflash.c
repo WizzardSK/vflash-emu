@@ -1421,6 +1421,14 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                     if (val + flush_size > VFLASH_RAM_SIZE)
                         flush_size = VFLASH_RAM_SIZE - val;
                     memcpy(vf->ram + val, vf->flash_buf, flush_size);
+                    /* IMMEDIATELY restore ROM init BLs and NOP hazardous ones.
+                     * Flash flush overwrites RAM[0x118+] with flash code.
+                     * We restore ROM code and NOP first 4 BLs (HW init). */
+                    if (val == 0x118 && vf->rom) {
+                        memcpy(vf->ram + 0x118, vf->rom + 0x118, 0xE00 - 0x118);
+                        for (int bi = 0; bi < 4; bi++)
+                            *(uint32_t*)(vf->ram + 0x118 + bi*4) = 0xE1A00000;
+                    }
                     printf("[FLASH] Remap=0x%X, flushed %u bytes to RAM[0x%X]\n",
                            val, flush_size, val);
 
@@ -1434,8 +1442,8 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                                tbl_off, *(uint32_t*)(vf->ram + tbl_off),
                                tbl_off+4, *(uint32_t*)(vf->ram + tbl_off+4),
                                tbl_off+8, *(uint32_t*)(vf->ram + tbl_off+8));
-                        /* Put terminator right at first entry */
-                        *(uint32_t*)(vf->ram + tbl_off) = 0x000000FF;
+                        /* Keep first 2 entries, put terminator at entry 2 */
+                        *(uint32_t*)(vf->ram + tbl_off + 8) = 0x000000FF;
                         printf("[FLASH] Patched SDRAM table: 0xFF at RAM[0x%X]\n", tbl_off);
                         printf("[FLASH] Verify: RAM[0x%X]=0x%08X\n", tbl_off,
                                *(uint32_t*)(vf->ram + tbl_off));
@@ -1472,13 +1480,16 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                              * and refuses to register tasks if state != 3.
                              * On real HW this is set by earlier init stages. */
                             *(uint32_t*)(vf->ram + 0x3585E0) = 3;
-                            /* Flash dispatch → [flash_buf[0]] = 0x118.
-                             * RAM[0x118] has flash remap code (PLL/SDRAM/dispatch loop).
-                             * We OVERWRITE it with ORIGINAL ROM code (BL init calls)
-                             * so the init sequence runs: 0x118 → BL inits → scheduler. */
+                            /* Skip flash dispatch loop: jump directly to ROM init
+                             * code at 0x118 AFTER restoring ROM content there.
+                             * This runs the init BLs without triggering flash remap. */
                             memcpy(vf->ram + 0x118, vf->rom + 0x118, 0xE00 - 0x118);
-                            printf("[ROM-PRELOAD] ROM[0x118..0xE00] → RAM (init BLs)\n");
-                            printf("[ROM-PRELOAD] flash_buf[0] → kernel 0x1009FFD4\n");
+                            /* NOP out first 4 BLs that trigger flash remap.
+                             * Keep BL BSS_clear(0x128), BL data_init(0x12C),
+                             * MOV R0(0x130), BL cache_flush(0x134), LDR PC(0x138). */
+                            for (int bi = 0; bi < 4; bi++)
+                                *(uint32_t*)(vf->ram + 0x118 + bi*4) = 0xE1A00000;
+                            printf("[ROM-PRELOAD] ROM init at 0x118 (first 4 BLs nop'd)\n");
                         }
                     }
                 }
