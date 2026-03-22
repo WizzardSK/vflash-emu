@@ -3713,63 +3713,82 @@ void vflash_run_frame(VFlash *vf) {
 
         /* Navigate VFF scenes with Up/Down, load on Enter */
         if (vff_count > 0) {
+            static int vff_fmt = 0; /* 0=XBGR1555, 1=byte-swap, 2=RGB565, 3=stride512 */
+            static int vff_sec = -1; /* -1=auto, 0/1/2=specific section */
+            int reload = 0;
             if (pressed & VFLASH_BTN_DOWN)
-                vff_index = (vff_index + 1) % vff_count;
+                { vff_index = (vff_index + 1) % vff_count; reload = 1; }
             if (pressed & VFLASH_BTN_UP)
-                vff_index = (vff_index + vff_count - 1) % vff_count;
+                { vff_index = (vff_index + vff_count - 1) % vff_count; reload = 1; }
+            if (pressed & VFLASH_BTN_GREEN)
+                { vff_fmt = (vff_fmt + 1) % 4; reload = 1; }
+            if (pressed & VFLASH_BTN_BLUE)
+                { vff_sec = (vff_sec + 1) % 4; if (vff_sec == 3) vff_sec = -1; reload = 1; }
+            if (vf->frame_count == 3) reload = 1;
 
-            if ((pressed & (VFLASH_BTN_ENTER | VFLASH_BTN_UP | VFLASH_BTN_DOWN)) ||
-                vf->frame_count == 3) {
+            if (reload) {
                 CDEntry *e = &vff_list[vff_index];
-                /* Read VFF header */
                 uint8_t hdr[0x400];
                 int rd = cdrom_read_file(vf->cd, e, hdr, 0, 0x400);
                 if (rd >= 0x60 && hdr[0]=='v' && hdr[1]=='f' && hdr[2]=='D' && hdr[3]=='0') {
                     uint32_t nsec = *(uint32_t*)(hdr + 0x2C);
                     if (nsec > 8) nsec = 8;
-                    /* Find the largest section with pixel-like address (0x103-0x108 range) */
-                    uint32_t fb_off = 0x400; /* data starts after header */
-                    uint32_t best_off = 0, best_size = 0;
+                    /* Build section offset table */
+                    uint32_t sec_off[8], sec_sz[8];
                     uint32_t cur = 0x400;
                     for (uint32_t si = 0; si < nsec; si++) {
-                        uint32_t addr = *(uint32_t*)(hdr + 0x30 + si * 0x10);
-                        uint32_t sz   = *(uint32_t*)(hdr + 0x34 + si * 0x10);
-                        /* Heuristic: framebuffer section is large and not code-like */
-                        if (sz > best_size && sz >= 153600) { /* at least one 320x240 frame */
-                            best_off = cur;
-                            best_size = sz;
-                        }
-                        cur += sz;
+                        sec_off[si] = cur;
+                        sec_sz[si] = *(uint32_t*)(hdr + 0x34 + si * 0x10);
+                        cur += sec_sz[si];
                     }
-                    if (best_size > 0) {
-                        /* Read one frame (320x240 XBGR1555 = 153600 bytes) */
-                        uint32_t frame_sz = 320 * 240 * 2;
+                    /* Pick section: auto = largest, or user-selected */
+                    int pick = 0;
+                    if (vff_sec >= 0 && (uint32_t)vff_sec < nsec) {
+                        pick = vff_sec;
+                    } else {
+                        uint32_t best = 0;
+                        for (uint32_t si = 0; si < nsec; si++)
+                            if (sec_sz[si] > best) { best = sec_sz[si]; pick = (int)si; }
+                    }
+                    uint32_t frame_sz = 320 * 240 * 2;
+                    int stride = (vff_fmt == 3) ? 512 : 320;
+                    if (vff_fmt == 3) frame_sz = 512 * 240 * 2;
+                    if (sec_sz[pick] >= frame_sz) {
                         uint8_t *fb = malloc(frame_sz);
                         if (fb) {
-                            int fbrd = cdrom_read_file(vf->cd, e, fb, best_off, frame_sz);
+                            int fbrd = cdrom_read_file(vf->cd, e, fb, sec_off[pick], frame_sz);
                             if (fbrd >= (int)frame_sz) {
-                                const uint16_t *px = (const uint16_t *)fb;
+                                const char *fmt_names[] = {"XBGR1555","ByteSwap","RGB565","Stride512"};
                                 for (int y = 0; y < 240; y++) {
                                     for (int x = 0; x < 320; x++) {
-                                        uint16_t p = px[y * 320 + x];
-                                        uint8_t b = ((p >> 10) & 0x1F) << 3;
-                                        uint8_t g = ((p >> 5)  & 0x1F) << 3;
-                                        uint8_t r = ( p        & 0x1F) << 3;
+                                        int si = y * stride + x;
+                                        uint16_t p = ((uint16_t)fb[si*2]) | ((uint16_t)fb[si*2+1] << 8);
+                                        if (vff_fmt == 1) /* byte-swap */
+                                            p = ((uint16_t)fb[si*2+1]) | ((uint16_t)fb[si*2] << 8);
+                                        uint8_t r, g, b;
+                                        if (vff_fmt == 2) { /* RGB565 */
+                                            r = ((p >> 11) & 0x1F) << 3;
+                                            g = ((p >> 5) & 0x3F) << 2;
+                                            b = (p & 0x1F) << 3;
+                                        } else { /* XBGR1555 */
+                                            b = ((p >> 10) & 0x1F) << 3;
+                                            g = ((p >> 5) & 0x1F) << 3;
+                                            r = (p & 0x1F) << 3;
+                                        }
                                         vf->framebuf[y * 320 + x] =
                                             0xFF000000 | ((uint32_t)r<<16) | ((uint32_t)g<<8) | b;
                                     }
                                 }
-                                printf("[VFF] %d/%d: %s frame at +0x%X (%uKB section)\n",
+                                printf("[VFF] %d/%d: %s sec%d %s (%uKB)\n",
                                        vff_index+1, vff_count, e->name,
-                                       best_off, best_size/1024);
-                                /* Play a WAV sound with the scene */
-                                if (vf->wav_count > 0 && vf->audio && vf->audio->initialized) {
-                                    int wi = (vff_index * 7) % vf->wav_count;
-                                    play_wav_from_cd(vf, &vf->wav_list[wi]);
-                                }
+                                       pick, fmt_names[vff_fmt], sec_sz[pick]/1024);
                             }
                             free(fb);
                         }
+                    }
+                    if (vf->wav_count > 0 && vf->audio && vf->audio->initialized) {
+                        int wi = (vff_index * 7) % vf->wav_count;
+                        play_wav_from_cd(vf, &vf->wav_list[wi]);
                     }
                 }
             }
