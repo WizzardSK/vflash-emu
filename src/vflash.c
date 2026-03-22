@@ -2838,9 +2838,9 @@ void vflash_run_frame(VFlash *vf) {
                 *(uint32_t*)(vf->ram + 0xBC0A40) = 0x10000000 + h;
                 vf->lcd.upbase = 0x10000000 + fb;
                 vf->lcd.control = 0x182B;
-                /* Enable NULL trap and jump to game init */
+                /* Enable NULL trap and jump to game init with IRQ enabled */
                 vf->cpu.null_trap_enabled = 1;
-                vf->cpu.cpsr = 0x00000093; /* SVC, IRQ disabled */
+                vf->cpu.cpsr = 0x00000013; /* SVC, IRQ ENABLED */
                 vf->cpu.r[15] = 0x10C16CB8;
                 vf->cpu.r[13] = 0x10FFE000;
                 vf->cpu.r[14] = 0x10FFF000;
