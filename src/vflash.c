@@ -1472,9 +1472,10 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                              * and refuses to register tasks if state != 3.
                              * On real HW this is set by earlier init stages. */
                             *(uint32_t*)(vf->ram + 0x3585E0) = 3;
-                            /* Jump to scheduler directly (skip flash remap loop) */
-                            *(uint32_t*)(vf->flash_buf) = 0x10010234;
-                            printf("[ROM-PRELOAD] flash_buf → scheduler 0x10010234\n");
+                            /* Jump to kernel utility code (stable loop).
+                             * 0x1009FFD4 = kernel base in RAM (from ROM copy). */
+                            *(uint32_t*)(vf->flash_buf) = 0x1009FFD4;
+                            printf("[ROM-PRELOAD] flash_buf → kernel 0x1009FFD4\n");
                         }
                     }
                 }
