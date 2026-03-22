@@ -483,9 +483,7 @@ int arm9_step(ARM9 *cpu) {
         PC = inst_addr + 8;
 
         /* Game init trace: log BL calls and returns */
-        static int gt = 0;
-        if (inst_addr == 0x10C16CB8) { gt = 1; fprintf(stderr, "[GT] === GAME INIT ===\n"); }
-        if (gt > 0 && gt <= 40) { fprintf(stderr, "[GT] %08X: %08X\n", inst_addr, i); gt++; }
+        /* (instruction trace disabled) */
 
         exec_arm(cpu, i);
         if (PC == inst_addr + 8)

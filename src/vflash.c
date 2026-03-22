@@ -158,6 +158,16 @@ typedef struct {
     int      fb_dirty;
 } VideoRegs;
 
+/* PL111 LCD Controller state */
+typedef struct {
+    uint32_t timing[4];   /* 0x00-0x0C: timing registers */
+    uint32_t upbase;      /* 0x10: upper panel framebuffer PA */
+    uint32_t lpbase;      /* 0x14: lower panel framebuffer PA */
+    uint32_t control;     /* 0x18: control register */
+    uint32_t imsc;        /* 0x1C: interrupt mask */
+    uint32_t ris;         /* 0x20: raw interrupt status */
+} LCDRegs;
+
 /* Audio DMA state */
 typedef struct {
     uint32_t src;
@@ -194,6 +204,7 @@ struct VFlash {
     AudioRegs aud;
     CDRomRegs cdr;
     ATAPIState atapi;
+    LCDRegs lcd;
 
     /* MJP video player state */
     struct {
@@ -860,6 +871,22 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         if (off < 0x200)
             return ztimer_read(&vf->timer, off);
 
+        /* PL111 LCD Controller at 0xC0000000 (off = 0x40000000) */
+        if (off >= 0x40000000u && off < 0x40001000u) {
+            uint32_t lreg = off - 0x40000000u;
+            switch (lreg) {
+                case 0x00: case 0x04: case 0x08: case 0x0C:
+                    return vf->lcd.timing[lreg >> 2];
+                case 0x10: return vf->lcd.upbase;
+                case 0x14: return vf->lcd.lpbase;
+                case 0x18: return vf->lcd.control;
+                case 0x1C: return vf->lcd.imsc;
+                case 0x20: return vf->lcd.ris;
+                case 0x24: return vf->lcd.ris & vf->lcd.imsc; /* MIS */
+                default: return 0;
+            }
+        }
+
         /* PL190 VIC at 0xDC000000 (off = 0x5C000000) */
         if (off >= 0x5C000000u && off < 0x5C001000u) {
             uint32_t vreg = off - 0x5C000000u;
@@ -1221,6 +1248,29 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
 
         /* Primary IRQ + timers */
         if (off < 0x200) { ztimer_write(&vf->timer, off, val); return; }
+
+        /* PL111 LCD Controller write at 0xC0000000 */
+        if (off >= 0x40000000u && off < 0x40001000u) {
+            uint32_t lreg = off - 0x40000000u;
+            switch (lreg) {
+                case 0x00: case 0x04: case 0x08: case 0x0C:
+                    vf->lcd.timing[lreg >> 2] = val; break;
+                case 0x10:
+                    vf->lcd.upbase = val;
+                    printf("[LCD] Framebuffer base = 0x%08X\n", val);
+                    break;
+                case 0x14: vf->lcd.lpbase = val; break;
+                case 0x18:
+                    vf->lcd.control = val;
+                    if (val & 1)
+                        printf("[LCD] ENABLED: ctrl=0x%08X BPP=%u fb=0x%08X\n",
+                               val, 1 << ((val >> 1) & 7), vf->lcd.upbase);
+                    break;
+                case 0x1C: vf->lcd.imsc = val; break;
+                case 0x28: vf->lcd.ris &= ~val; break; /* ICR: clear interrupts */
+            }
+            return;
+        }
 
         /* PL190 VIC write at 0xDC000000 */
         if (off >= 0x5C000000u && off < 0x5C001000u) {
@@ -3087,6 +3137,36 @@ void vflash_run_frame(VFlash *vf) {
                 *(uint32_t*)(vf->ram + task_tbl + i * 4) = 0x00000001;
             *(uint32_t*)(vf->ram + 0xC08) = 0x10000000 + task_tbl;
             printf("[TASK] Installed dummy task table at 0x%08X\n", 0x10000000 + task_tbl);
+        }
+    }
+
+    /* PL111 LCD framebuffer blit: if LCD is enabled and has a valid
+     * framebuffer address, copy it to our display framebuffer. */
+    if ((vf->lcd.control & 1) && vf->lcd.upbase >= VFLASH_RAM_BASE &&
+        vf->lcd.upbase < VFLASH_RAM_BASE + VFLASH_RAM_SIZE && !vf->vid.fb_dirty) {
+        uint32_t fb_off = vf->lcd.upbase - VFLASH_RAM_BASE;
+        uint32_t bpp_code = (vf->lcd.control >> 1) & 7;
+        /* BPP: 1=2bpp, 2=4bpp, 3=8bpp, 4=16bpp, 5=24bpp, 6=16bpp565 */
+        if (bpp_code == 4 || bpp_code == 6) {
+            /* 16-bit RGB565 framebuffer */
+            const uint16_t *src = (const uint16_t*)(vf->ram + fb_off);
+            for (int y = 0; y < VFLASH_SCREEN_H; y++) {
+                for (int x = 0; x < VFLASH_SCREEN_W; x++) {
+                    uint16_t px = src[y * VFLASH_SCREEN_W + x];
+                    uint8_t r = ((px >> 11) & 0x1F) << 3;
+                    uint8_t g = ((px >> 5) & 0x3F) << 2;
+                    uint8_t b = (px & 0x1F) << 3;
+                    vf->framebuf[y * VFLASH_SCREEN_W + x] =
+                        0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+                }
+            }
+            vf->vid.fb_dirty = 1;
+        } else if (bpp_code == 5) {
+            /* 24-bit or 32-bit ARGB */
+            const uint32_t *src = (const uint32_t*)(vf->ram + fb_off);
+            for (int i = 0; i < VFLASH_SCREEN_W * VFLASH_SCREEN_H; i++)
+                vf->framebuf[i] = src[i] | 0xFF000000;
+            vf->vid.fb_dirty = 1;
         }
     }
 
