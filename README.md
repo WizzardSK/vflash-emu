@@ -12,8 +12,8 @@ No other emulator exists for this system.
 | Media | CD-ROM, ISO 9660, no copy protection |
 | Video | Motion JPEG (.mjp), raw bitmap (.ptx), scene modules (.vff) |
 | Audio | PCM WAV, IMA ADPCM |
-| OS | µMORE v4.0 RTOS |
-| Boot ROM | 70004.bin (2MB, optional — enables real boot flow) |
+| OS | µMORE v4.0 RTOS (same as TI-Nspire) |
+| Boot ROM | 70004.bin (2MB, required for real boot flow) |
 
 ## Controls
 
@@ -21,9 +21,9 @@ No other emulator exists for this system.
 |-----|--------|
 | Left / Right | Browse PTX image gallery (88 images) |
 | Up / Down | Browse VFF game scenes (20 scenes) |
-| Enter | Load selected VFF scene |
 | Z (Red) | Next MJP video (20 videos) |
 | X (Yellow) | Stop video playback |
+| F5 | Save screenshot (BMP) |
 | F11 | Toggle fullscreen |
 | Esc | Quit |
 
@@ -31,86 +31,109 @@ Background voice/SFX audio plays automatically from 561 WAV files on disc.
 
 ## Status
 
-**Asset browser working** — displays all game content: images, video, scenes, audio.
-Boot flow reaches game code, but interactive gameplay requires µMORE RTOS HLE (in progress).
+**µMORE RTOS boots natively** — full ROM boot with SDRAM calibration, kernel init,
+heap allocation, and task registration. Asset browser for images/video/audio.
 
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spider-Man.
 
-### Working features
+### µMORE RTOS Boot (fully working)
 
-- **PTX gallery** — 88 XBGR1555 images (splash screens, backgrounds, characters)
-- **MJP video** — 20 Motion JPEG cutscenes with IMA ADPCM audio, fullscreen
-- **VFF scenes** — 20 game scene modules with embedded graphics
-- **WAV audio** — 561 voice lines and sound effects, auto-play
-- **Boot ROM flow** — flash remap, SDRAM skip, MMU page table, kernel loop
-- **Game code execution** — BOOT.BIN init + game init run stably
+| Step | Status |
+|------|--------|
+| ROM boot + flash remap | ✅ |
+| SDRAM calibration | ✅ Passes (emulated SDRAM always works) |
+| PLL / clock setup | ✅ |
+| Kernel memcpy (ROM → SDRAM) | ✅ Three copy phases |
+| BSS clear | ✅ |
+| MMU page table + enable | ✅ Built natively by ROM init |
+| Cache invalidate | ✅ |
+| Scheduler entry (0x10010234) | ✅ |
+| µMORE heap init (1MB) | ✅ Free-list allocator at 0x103596B0 |
+| Task registration ($TCB) | ✅ Task at 0x100AC0E0, entry 0x100113DC |
+| Timer (SP804 periodic) | ✅ 37500 cycles, IRQ delivery |
+| Custom IRQ handler | ✅ Clears timer, returns to kernel |
+| Scheduler active loop | ✅ Polls I/O for events |
+| **Task dispatch** | 🔧 Scheduler polls but doesn't wake task |
+
+### Remaining for gameplay
+
+The scheduler polls peripheral status registers (0x90020014) waiting for events.
+On real hardware, the timer interrupt handler wakes tasks via context switch.
+Our custom IRQ handler clears the timer but doesn't call the µMORE task wakeup.
+Need: either fix the VIC interrupt dispatch chain or implement task wakeup in the IRQ handler.
+
+### Asset Browser
+
+- **PTX gallery** — 88 XBGR1555 images, Left/Right navigation + WAV audio
+- **MJP video** — 20 Motion JPEG cutscenes with IMA ADPCM, Z to switch, X to stop
+- **VFF scenes** — 20 game scene modules (background color display)
+- **WAV audio** — 561 voice/SFX files, auto-play during navigation
 
 ### CPU — ARM926EJ-S (ARMv5TE)
 - Full ARM32 and Thumb instruction sets
 - CLZ, LDRD/STRD, DSP multiply (SMLA/SMUL/SMLAL/SMULW/QADD/QSUB)
 - SWI/IRQ/FIQ/UNDEF exceptions with correct register banking
-- CPI timing model; CP15 coprocessor (MMU, cache, HIVEC, domain)
+- CP15 coprocessor (MMU, cache, TLB invalidate, HIVEC, domain access)
+- Fixed: branch-forward-by-0 (B/BL with offset 0 to PC+8)
 
 ### MMU
 - ARM926EJ-S two-level page table translation
 - L1 section (1MB) and coarse page table (4KB/64KB pages)
 - TLB cache (4096-entry direct-mapped, ~30% speedup)
-- Full 4096-section identity map (matching real ROM init at 0x704)
+- TLB invalidate via CP15 MCR c8
+- Full 4096-section identity map (built natively by ROM init at 0x704)
 
-### Boot flow (with 70004.bin)
-1. ROM boot at PA 0 → flash remap → SDRAM calibration skipped
-2. ROM/kernel/modules copied to SDRAM (matching real init functions)
-3. MMU page table built, BSS cleared, PA 0 remapped to separate buffer
-4. Kernel loop → timer + IRQ enabled → BOOT.BIN init → game init
-5. Game code runs at 0x10CAA2xx (BOOT.BIN main loop)
+### Boot Flow
 
-### Physical memory map (ZEVIO 1020)
+```
+ROM[0x00] → flash copy → flash remap (0x118)
+  → PLL setup (0x1C8) → cache init (0x78C)
+  → 64KB memcpy (0x288) → large memcpy (0x2B4)
+  → BSS clear (0x5D0) → page table + MMU (0x704)
+  → cache invalidate (0x7D0)
+  → scheduler entry (0x10010234)
+    → kernel init (0x1009CFB4) — heap 1MB
+    → task_start (0x10085E50) — $TCB registered
+    → scheduler idle loop (0x10095Bxx)
+    → timer IRQ → custom handler → kernel active
+```
+
+### Physical Memory Map (ZEVIO 1020)
 | Address | Size | Region |
 |---------|------|--------|
-| `0x00000000` | 8KB | Low RAM (vector table, separate from SDRAM) |
+| `0x00000000` | 2MB | Boot ROM (NOR flash, read-only) |
 | `0x0FFE0000` | 128KB | Internal SRAM / TCM |
 | `0x10000000` | 16MB | Main SDRAM |
-| `0x8FFF0000` | 4KB | DMA controller |
-| `0x90000000` | | I/O: timers, VIC, UART, GPIO, PMU |
+| `0x8FFF0000` | 4KB | SDRAM / DMA controller |
+| `0x90010000` | 4KB | SP804 Timer |
+| `0x90020000` | 4KB | PL011 UART |
+| `0x90060000` | 4KB | Watchdog |
+| `0x900A0000` | 4KB | System control (reset, boot flags) |
+| `0x900B0000` | 4KB | PMU (clock/PLL) |
 | `0xAA000000` | | ATAPI CD-ROM controller |
-| `0xB8000000` | 2MB | NOR flash (boot ROM mirror) |
+| `0xB8000000` | 2MB | NOR flash mirror + write buffer |
 | `0xC0000000` | | PL111 LCD controller |
 
-### ATAPI CD-ROM Controller
-- Full PACKET command protocol at `0xAA000000`
-- Commands: INQUIRY, IDENTIFY, READ(10), READ CD, READ TOC, READ CAPACITY, TEST UNIT READY, REQUEST SENSE, MODE SENSE
-- ZEVIO IDE wrapper registers for DMA and interrupt control
+### Key Bug Fixes
 
-### Video — MJP (Motion JPEG)
-- MIAV container with interleaved audio/video chunks
-- 16-bit byte-swap + automatic byte-stuffing restoration
-- SOS-only P-frame support (reuses I-frame DHT/DQT tables)
-- Nearest-neighbor scaling to 320x240, video loops at end
-- libjpeg decode with partial frame tolerance
+| Bug | Impact | Fix |
+|-----|--------|-----|
+| Branch-forward-by-0 | Memcpy broken → scheduler had garbage | Check B/BL encoding after PC compare |
+| TLB invalidate ignored | Stale page table after MMU enable | Handle CP15 MCR c8 writes |
+| VIC IntSelect = all FIQ | IRQ delivery never happened | Deliver FIQ when fiq_sel routes there |
+| NULL trap wrote to RAM | Data reads got instruction bytes | Return R0=0 via LR without memory write |
+| PA 0 / SDRAM aliasing | IRQ vectors corrupted by game code | Separate low_ram buffer |
+| UART reg 0x14 returned 0 | Scheduler stuck in idle loop | Return bit5=1 (event present) |
+| Forced vsync IRQ raise | IRQ storm after every clear | Let timer fire naturally |
 
-### Audio
-- IMA ADPCM from MIAV `01wb` chunks (22050Hz mono → 44100Hz stereo)
-- PCM WAV playback (16-bit, 22050Hz mono, resampled to 44100Hz stereo)
-- SDL2 audio output with ring buffer
-
-### PTX — Static Images
-- XBGR1555 pixel format, 44-byte header, 512px stride
-- Interleaved scene/sprite layout (even rows = scene, odd rows = sprite)
-- Scaled to fill 320x240 display
-
-### VFF — Game Scene Modules
-- "vfD0" container with 3 sections: code + framebuffer + data
-- Sections loaded to specific RAM addresses
-- Entry point and callback pointers in header
-
-### Other subsystems
-- ISO 9660 with full subdirectory traversal and recursive search
-- BIN/CUE disc image support (auto-detects raw 2352-byte vs 2048-byte)
-- V.Flash BOOT format parser (magic, load address, entry point, REL table)
-- HLE boot with disc-wide file search
-- Non-destructive NULL trap for BSS function pointers
-- HLE service intercept framework for µMORE RTOS
-- SDL2 display + audio output
+### Subsystems
+- ATAPI CD-ROM: INQUIRY, READ(10), READ CD, READ TOC, READ CAPACITY, MODE SENSE
+- MJP video: byte-swap, byte-stuffing restore, in-place decode, scaling
+- IMA ADPCM + PCM WAV audio, 22050→44100Hz stereo resampling
+- PTX: XBGR1555, 512px stride, interleaved scene/sprite
+- VFF: "vfD0" container, 3 sections (code + graphics + background)
+- ISO 9660 with recursive search, BIN/CUE auto-detect
+- Interactive debugger with breakpoints, disassembly, memory dump
 
 ## Build
 
@@ -131,9 +154,9 @@ make
 ./vflash --scale 3 game.cue        # 3x window
 ```
 
-Boot ROM (70004.bin) is auto-detected from current directory or `../vflash-roms/`.
+Boot ROM `70004.bin` is auto-detected from current directory or `../vflash-roms/`.
 
-## Debugger (stdin commands, F2 = pause/resume)
+## Debugger
 
 ```
 s [N]      step N instructions    c         continue
@@ -148,8 +171,8 @@ q          quit
 ## Tools
 
 ```bash
-./disc_analyze  game.iso
-./disc_compare  g1.iso g2.iso ...
-./mjp_extract   game.iso frames/
-./ptx_extract   game.iso images/
+./disc_analyze  game.iso           # list disc contents
+./disc_compare  g1.iso g2.iso      # compare disc structures
+./mjp_extract   game.iso frames/   # extract MJP video frames
+./ptx_extract   game.iso images/   # extract PTX images
 ```
