@@ -3008,16 +3008,20 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
      * BSS clear zeros it, but nothing sets it back before task_start. */
     if (addr == 0x10085E50) {
         VFlash *vfp = (VFlash *)ctx;
-        /* task_start checks two guards:
-         * 1. [0x10358600] must NOT be 1 (already running)
-         * 2. [0x101A4F80] must be 0 (not initialized)
-         * BSS clear zeros 0x358600 but 0x1A4F80 is in ROM code area
-         * with non-zero data. Clear it so task_start proceeds. */
+        /* Fix guards for task_start */
         if (*(uint32_t*)(vfp->ram + 0x3585E0) == 0)
             *(uint32_t*)(vfp->ram + 0x3585E0) = 3;
         *(uint32_t*)(vfp->ram + 0x1A4F80) = 0;
+        /* Populate VIC dispatch table for FIQ handler.
+         * Table at RAM[0x1CBC], slot +28 = timer FIQ handler.
+         * Write µMORE timer handler address (0x10001A78 = alternate
+         * entry that takes R0 as interrupt ID). */
+        if (*(uint32_t*)(vfp->ram + 0x1CD8) == 0) {
+            *(uint32_t*)(vfp->ram + 0x1CD8) = 0x10001A78;
+            printf("[HLE] VIC dispatch[7] = 0x10001A78 (timer FIQ)\n");
+        }
         printf("[HLE] Cleared guards for task_start\n");
-        return 0; /* let real code run */
+        return 0;
     }
 
     if (addr >= 0x10190000 && addr < 0x10C00000) {
