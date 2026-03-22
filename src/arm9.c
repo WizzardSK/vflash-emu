@@ -483,20 +483,9 @@ int arm9_step(ARM9 *cpu) {
         PC = inst_addr + 8;
 
         /* Game init trace: log BL calls and returns */
-        static int game_trace = 0;
-        if (inst_addr == 0x10C16CB8) { game_trace = 1; fprintf(stderr, "[GTRACE] === GAME INIT ENTERED ===\n"); }
-        if (game_trace && game_trace < 200) {
-            if ((i & 0x0F000000) == 0x0B000000) { /* BL */
-                int32_t off = (int32_t)(i << 8) >> 6;
-                fprintf(stderr, "[GTRACE] %08X: BL %08X\n", inst_addr, (uint32_t)((int32_t)(inst_addr+8)+off));
-                game_trace++;
-            }
-            if (i == 0xE49DF004 || i == 0xE8BD8000 || (i & 0x0FFF0FFF) == 0x01A0F00E) { /* POP PC / MOV PC,LR */
-                fprintf(stderr, "[GTRACE] %08X: RET → %08X\n", inst_addr, PC);
-                if (inst_addr < 0x10C16CB0 || inst_addr > 0x10C16D20)
-                    game_trace++; /* count returns from sub-functions */
-            }
-        }
+        static int gt = 0;
+        if (inst_addr == 0x10C16CB8) { gt = 1; fprintf(stderr, "[GT] === GAME INIT ===\n"); }
+        if (gt > 0 && gt <= 40) { fprintf(stderr, "[GT] %08X: %08X\n", inst_addr, i); gt++; }
 
         exec_arm(cpu, i);
         if (PC == inst_addr + 8)

@@ -2812,12 +2812,25 @@ void vflash_run_frame(VFlash *vf) {
                 /* Set scheduler state and jump to kernel code */
                 *(uint32_t*)(vf->ram + 0x3585E0) = 3;
 
-                /* Jump to game init (LCD + display setup).
-                 * Found via LCD register (0xC0000084) reference chain. */
-                /* Disable IRQs during game init to prevent IRQ from
-                 * overriding our PC before game code runs */
-                vf->cpu.cpsr = 0x00000093; /* SVC, IRQ disabled */
-                vf->cpu.r[15] = 0x10C16CB8; /* game init */
+                /* Fix page table: map BOOT.BIN at VA 0x10C/0x10D (identity) */
+                {
+                    uint32_t ttb_off = vf->cpu.cp15.ttb - 0x10000000;
+                    for (uint32_t mb = 0x10C; mb <= 0x10D; mb++)
+                        *(uint32_t*)(vf->ram + ttb_off + mb * 4) = (mb << 20) | 0xC02;
+                    tlb_flush();
+                    printf("[SCHED] Mapped VA 0x10C/0x10D → identity\n");
+                }
+                /* Create LCD handle for game init (prevents NULL crash) */
+                {
+                    uint32_t h = 0xBF0000;
+                    memset(vf->ram + h, 0, 0x100);
+                    *(uint32_t*)(vf->ram + h + 0x5C) = 0xC0000000; /* PL111 base */
+                    *(uint32_t*)(vf->ram + 0xBC0A40) = 0x10000000 + h;
+                    printf("[SCHED] LCD handle at 0x10%06X\n", h);
+                }
+                /* Jump to game init with IRQ disabled */
+                vf->cpu.cpsr = 0x00000093;
+                vf->cpu.r[15] = 0x10C16CB8;
                 vf->cpu.r[13] = 0x10FFE000;
                 vf->cpu.r[14] = 0x10FFF000; /* return → idle */
                 /* Clear pending IRQ so it doesn't fire immediately */
