@@ -194,6 +194,11 @@ struct VFlash {
     uint32_t  flash_remap; /* Flash controller: remap base written to reg 0x800 */
     uint8_t   flash_buf[0x2000]; /* Flash controller write buffer (captures writes to 0xB8000800+) */
     int       flash_buf_dirty;   /* 1 if flash_buf has been written to */
+    int       flash_preloaded;   /* 1 after ROM preload done (don't overwrite flash_buf[0]) */
+    int       rom_remapped;      /* 1 after flash remap: PA 0 reads from low_ram, not ROM */
+    uint8_t   low_ram[0x2000];   /* Separate buffer for PA 0x00000000-0x00001FFF (vector table etc.)
+                                  * On real HW, PA 0 = ROM; after remap = flash window → SDRAM.
+                                  * Must NOT alias with SDRAM at 0x10000000 (vf->ram). */
     uint32_t  dma_param_a, dma_param_b, dma_param_c;
     uint32_t  misc_regs[64];   /* Misc system control at 0x900A0000 (read/write) */
     uint32_t  rtc_regs[16];    /* RTC scratch at 0x900900F0-0x900900FF */
@@ -836,13 +841,15 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         return *(uint32_t*)(vf->ram + (addr - VFLASH_RAM_BASE));
 
     /* Physical address 0:
-     * With boot ROM: 512KB read-only NOR flash (always present)
-     * Without ROM (HLE): addr 0 = RAM (writable, for vector table + stubs) */
+     * Before flash remap: 512KB read-only NOR flash
+     * After flash remap: separate low_ram buffer (NOT aliased with SDRAM)
+     * HLE mode (no ROM): direct SDRAM (vector table at 0x10000000) */
     if (addr < 0x00200000u) {
-        if (vf->has_rom && addr < vf->rom_size)
+        if (vf->has_rom && !vf->rom_remapped && addr < vf->rom_size)
             return *(uint32_t*)(vf->rom + addr);
-        /* HLE mode: addr 0 = RAM (same buffer as 0x10000000) */
-        if (!vf->has_rom && addr < VFLASH_RAM_SIZE)
+        if (vf->rom_remapped && addr < sizeof(vf->low_ram))
+            return *(uint32_t*)(vf->low_ram + addr);
+        if (addr < VFLASH_RAM_SIZE)
             return *(uint32_t*)(vf->ram + addr);
         return 0;
     }
@@ -1158,17 +1165,19 @@ static uint16_t mem_read16(void *ctx, uint32_t addr) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
     if (addr < 0x00200000u) {
-        if (vf->has_rom && addr + 1 < vf->rom_size)
+        if (vf->has_rom && !vf->rom_remapped && addr + 1 < vf->rom_size)
             return *(uint16_t*)(vf->rom + addr);
-        if (!vf->has_rom && addr + 1 < VFLASH_RAM_SIZE)
+        if (vf->rom_remapped && addr + 1 < sizeof(vf->low_ram))
+            return *(uint16_t*)(vf->low_ram + addr);
+        if (addr + 1 < VFLASH_RAM_SIZE)
             return *(uint16_t*)(vf->ram + addr);
         return 0;
     }
     if (addr >= 0xFFFF0000u) {
         uint32_t off = addr - 0xFFFF0000u;
-        if (vf->has_rom && off + 1 < vf->rom_size)
+        if (vf->has_rom && !vf->rom_remapped && off + 1 < vf->rom_size)
             return *(uint16_t*)(vf->rom + off);
-        if (!vf->has_rom && off + 1 < VFLASH_RAM_SIZE)
+        if (off + 1 < VFLASH_RAM_SIZE)
             return *(uint16_t*)(vf->ram + off);
         return 0;
     }
@@ -1185,17 +1194,19 @@ static uint8_t mem_read8(void *ctx, uint32_t addr) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
     if (addr < 0x00200000u) {
-        if (vf->has_rom && addr < vf->rom_size)
+        if (vf->has_rom && !vf->rom_remapped && addr < vf->rom_size)
             return vf->rom[addr];
-        if (!vf->has_rom && addr < VFLASH_RAM_SIZE)
+        if (vf->rom_remapped && addr < sizeof(vf->low_ram))
+            return vf->low_ram[addr];
+        if (addr < VFLASH_RAM_SIZE)
             return vf->ram[addr];
         return 0;
     }
     if (addr >= 0xFFFF0000u) {
         uint32_t off = addr - 0xFFFF0000u;
-        if (vf->has_rom && off < vf->rom_size)
+        if (vf->has_rom && !vf->rom_remapped && off < vf->rom_size)
             return vf->rom[off];
-        if (!vf->has_rom && off < VFLASH_RAM_SIZE)
+        if (off < VFLASH_RAM_SIZE)
             return vf->ram[off];
         return 0;
     }
@@ -1222,7 +1233,11 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
      * With ROM: read-only, writes ignored.
      * HLE mode (no ROM): writable RAM for vector table and ROM stubs. */
     if (addr < 0x00200000u) {
-        if (vf->has_rom) return;  /* ROM is read-only */
+        if (vf->has_rom && !vf->rom_remapped) return;  /* ROM is read-only before remap */
+        if (vf->rom_remapped && addr < sizeof(vf->low_ram)) {
+            *(uint32_t*)(vf->low_ram + addr) = val;
+            return;
+        }
         if (addr < VFLASH_RAM_SIZE) {
             *(uint32_t*)(vf->ram + addr) = val;
             return;
@@ -1406,12 +1421,16 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
             uint32_t foff = off - 0x38000000u;
             if (foff >= 0x800 && foff < 0x800 + sizeof(vf->flash_buf)) {
                 uint32_t boff = foff - 0x800;
-                /* Buffer the write */
-                *(uint32_t*)(vf->flash_buf + boff) = val;
+                /* Buffer the write (but don't overwrite flash_buf[0] after preload) */
+                if (boff == 0 && vf->flash_preloaded) {
+                    /* Skip — preloaded kernel entry must survive */
+                } else {
+                    *(uint32_t*)(vf->flash_buf + boff) = val;
+                }
                 vf->flash_buf_dirty = 1;
 
-                /* Write to reg 0x800 = remap trigger */
-                if (foff == 0x800 && val != 0) {
+                /* Write to reg 0x800 = remap trigger (only on first boot) */
+                if (foff == 0x800 && val != 0 && !vf->flash_preloaded) {
                     vf->flash_remap = val;
                     /* Flush buffer to RAM at remap offset.
                      * The buffer contains ROM init code that was
@@ -1428,17 +1447,22 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                      * The table at flash offset 0x2D0 (RAM[remap+0x2D0]) has 71 identical
                      * entries (all 0x16) followed by 0xFF terminator. Since emulated SDRAM
                      * always works, put terminator at entry 1 (skip entire calibration). */
-                    uint32_t tbl_off = val + 0x2D0;  /* SDRAM config table in RAM */
-                    if (tbl_off + 8 < VFLASH_RAM_SIZE) {
+                    /* Patch SDRAM table in flash_buf so subsequent flushes
+                     * preserve the patch. Table is at buf offset 0x2D0. */
+                    uint32_t tbl_boff = 0x2D0;
+                    if (tbl_boff + 8 < sizeof(vf->flash_buf)) {
                         printf("[FLASH] Table before: [0x%X]=0x%08X [0x%X]=0x%08X [0x%X]=0x%08X\n",
-                               tbl_off, *(uint32_t*)(vf->ram + tbl_off),
-                               tbl_off+4, *(uint32_t*)(vf->ram + tbl_off+4),
-                               tbl_off+8, *(uint32_t*)(vf->ram + tbl_off+8));
-                        /* Keep first 2 entries, put terminator at entry 2 */
-                        *(uint32_t*)(vf->ram + tbl_off + 8) = 0x000000FF;
-                        printf("[FLASH] Patched SDRAM table: 0xFF at RAM[0x%X]\n", tbl_off);
-                        printf("[FLASH] Verify: RAM[0x%X]=0x%08X\n", tbl_off,
-                               *(uint32_t*)(vf->ram + tbl_off));
+                               val+tbl_boff, *(uint32_t*)(vf->flash_buf + tbl_boff),
+                               val+tbl_boff+4, *(uint32_t*)(vf->flash_buf + tbl_boff+4),
+                               val+tbl_boff+8, *(uint32_t*)(vf->flash_buf + tbl_boff+8));
+                        /* Put terminator at entry 0 → skip entire calibration */
+                        *(uint32_t*)(vf->flash_buf + tbl_boff) = 0x000000FF;
+                        /* Also patch RAM (current flush already happened) */
+                        uint32_t tbl_off = val + tbl_boff;
+                        if (tbl_off + 4 < VFLASH_RAM_SIZE)
+                            *(uint32_t*)(vf->ram + tbl_off) = 0x000000FF;
+                        printf("[FLASH] Patched SDRAM table: 0xFF at flash_buf[0x%X] + RAM[0x%X]\n",
+                               tbl_boff, tbl_off);
                     }
 
                     /* Pre-load BOOT.BIN into RAM so the ROM can jump to it
@@ -1446,7 +1470,7 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                      * controller to read BOOT.BIN from disc. We bypass ATAPI
                      * by loading it now, so when ROM jumps to 0x10C00000+
                      * the code is already in place. */
-                    if (vf->cd && vf->cd->is_open) {
+                    if (vf->cd && vf->cd->is_open && !vf->flash_preloaded) {
                         CDEntry boot_entry;
                         if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &boot_entry)) {
                             uint32_t dest = 0xC00000; /* RAM offset for 0x10C00000 */
@@ -1472,10 +1496,48 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                              * and refuses to register tasks if state != 3.
                              * On real HW this is set by earlier init stages. */
                             *(uint32_t*)(vf->ram + 0x3585E0) = 3;
-                            /* Jump to kernel utility code (stable loop).
-                             * 0x1009FFD4 = kernel base in RAM (from ROM copy). */
-                            *(uint32_t*)(vf->flash_buf) = 0x1009FFD4;
-                            printf("[ROM-PRELOAD] flash_buf → kernel 0x1009FFD4\n");
+                            /* Skip SDRAM calibration — jump directly to kernel.
+                             * Need to set up what boot code would have done:
+                             * 1. Copy vector table from ROM to RAM (PA 0 → RAM after remap)
+                             * 2. Enable MMU with page table from ROM
+                             * 3. Set PC to kernel loop area */
+                            vf->flash_preloaded = 1;
+                            vf->rom_remapped = 1;
+
+                            /* Copy ROM vectors + low code to low_ram (PA 0 space) */
+                            memcpy(vf->low_ram, vf->rom, sizeof(vf->low_ram));
+
+                            /* Build page table at RAM[0xA8000] (VA=0x100A8000).
+                             * Boot code normally builds this dynamically. */
+                            {
+                                uint32_t *pt = (uint32_t*)(vf->ram + 0xA8000);
+                                memset(pt, 0, 0x4000); /* 4096 L1 entries */
+                                /* VA 0x00000000 → PA 0x00000000 (vectors + low ROM/RAM) */
+                                pt[0x000] = 0x00000C0E;
+                                pt[0x001] = 0x00100C0E;
+                                /* VA 0x10000000-0x10FFFFFF → PA 0x10000000 (16MB SDRAM) */
+                                for (int i = 0; i < 16; i++)
+                                    pt[0x100 + i] = ((0x100 + i) << 20) | 0xC0E;
+                                /* VA 0x90000000-0x900FFFFF → PA 0x90000000 (I/O) */
+                                for (int i = 0; i < 16; i++)
+                                    pt[0x900 + i] = ((0x900 + i) << 20) | 0xC02;
+                                /* VA 0xB8000000 → PA 0xB8000000 (flash controller) */
+                                pt[0xB80] = 0xB8000C02;
+                                pt[0xB81] = 0xB8100C02;
+                                /* VA 0xC0000000 → PA 0xC0000000 (PL111 LCD) */
+                                pt[0xC00] = 0xC0000C02;
+                            }
+                            vf->cpu.cp15.ttb = 0x100A8000;
+                            vf->cpu.cp15.mmu_enabled = 1;
+                            vf->cpu.cp15.control = 0x0000507D;
+                            tlb_flush();
+                            printf("[ROM-PRELOAD] MMU ON TTB=0x%08X (built page table)\n",
+                                   vf->cpu.cp15.ttb);
+
+                            vf->cpu.r[15] = 0x100A0008;
+                            vf->cpu.r[13] = 0x10FFE000;
+                            vf->cpu.cpsr  = 0x000000D3; /* SVC mode, IRQ disabled */
+                            printf("[ROM-PRELOAD] Skip calibration → PC=0x100A0008, PA 0 → RAM\n");
                         }
                     }
                 }
@@ -1800,11 +1862,21 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                     printf("[REBOOT] Timer0 configured: load=%u\n", vf->timer.timer[0].load);
                 }
 
-                /* Set warm boot flag and restart from ROM */
+                /* Set warm boot flag and restart.
+                 * On real HW, ROM re-runs from 0 and detects warm boot flag.
+                 * We skip ROM boot entirely — go straight to kernel. */
                 vf->misc_regs[0x0C >> 2] |= 0x02;
                 arm9_reset(&vf->cpu);
-                vf->cpu.r[15] = 0x00000000;
+                /* Restore MMU (reset cleared it) */
+                vf->cpu.cp15.ttb = 0x100A8000;
+                vf->cpu.cp15.mmu_enabled = 1;
+                vf->cpu.cp15.control = 0x0000507D;
+                tlb_flush();
+                vf->cpu.r[15] = 0x100A0008; /* kernel loop area */
+                vf->cpu.r[13] = 0x10FFE000;
                 vf->cpu.r13_irq = 0x10800000;
+                vf->cpu.cpsr = 0x000000D3; /* SVC, IRQ disabled */
+                printf("[REBOOT] Skip ROM re-boot → kernel 0x100A0008\n");
             }
             return;
         }
@@ -1853,7 +1925,9 @@ static void mem_write16(void *ctx, uint32_t addr, uint16_t val) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
     if (addr < 0x00200000u) {
-        if (vf->has_rom) return;
+        if (vf->has_rom && !vf->rom_remapped) return;
+        if (vf->rom_remapped && addr + 1 < sizeof(vf->low_ram))
+            { *(uint16_t*)(vf->low_ram + addr) = val; return; }
         if (addr + 1 < VFLASH_RAM_SIZE) *(uint16_t*)(vf->ram + addr) = val;
         return;
     }
@@ -1879,7 +1953,9 @@ static void mem_write8(void *ctx, uint32_t addr, uint8_t val) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
     if (addr < 0x00200000u) {
-        if (vf->has_rom) return;
+        if (vf->has_rom && !vf->rom_remapped) return;
+        if (vf->rom_remapped && addr < sizeof(vf->low_ram))
+            { vf->low_ram[addr] = val; return; }
         if (addr < VFLASH_RAM_SIZE) vf->ram[addr] = val;
         return;
     }
@@ -2801,9 +2877,22 @@ void vflash_run_frame(VFlash *vf) {
                 vf->timer.irq.enable |= 0x01;
                 vf->cpu.cpsr &= ~0x80; /* enable IRQ */
                 vf->cpu.r13_irq = 0x10800000;
-                /* Install IRQ vector chain */
-                *(uint32_t*)(vf->ram + 0xFF98) = 0xE59FF03C;
-                *(uint32_t*)(vf->ram + 0xFFDC) = 0x10FFF040;
+                /* Install ARM exception vector table at PA 0 (low_ram[0x00-0x3C]).
+                 * Uses separate low_ram buffer so SDRAM writes don't overwrite.
+                 * Format: LDR PC,[PC,#0x18] at each vector slot (0x00-0x1C),
+                 * with target addresses at 0x20-0x3C. */
+                {
+                    uint32_t ldr = 0xE59FF018; /* LDR PC,[PC,#0x18] */
+                    for (int vi = 0; vi < 8; vi++)
+                        *(uint32_t*)(vf->low_ram + vi * 4) = ldr;
+                    /* All exceptions → BX LR stub except IRQ → wrapper */
+                    uint32_t bxlr_addr = 0x10FFF080; /* BX LR stub */
+                    for (int vi = 0; vi < 8; vi++)
+                        *(uint32_t*)(vf->low_ram + 0x20 + vi * 4) = bxlr_addr;
+                    *(uint32_t*)(vf->low_ram + 0x38) = 0x10FFF040; /* IRQ → wrapper */
+                    /* Write BX LR at the stub address (in SDRAM) */
+                    *(uint32_t*)(vf->ram + 0xFFF080) = 0xE1B0F00E; /* MOVS PC,LR */
+                }
                 /* IRQ wrapper at 0xFFF040 */
                 uint32_t w = 0xFFF040;
                 *(uint32_t*)(vf->ram+w)=0xE92D500F; w+=4;
@@ -2838,15 +2927,39 @@ void vflash_run_frame(VFlash *vf) {
                 *(uint32_t*)(vf->ram + 0xBC0A40) = 0x10000000 + h;
                 vf->lcd.upbase = 0x10000000 + fb;
                 vf->lcd.control = 0x182B;
-                /* Enable NULL trap and jump to game init with IRQ enabled */
+                /* Install idle stub at 0xFFF000 (IRQ-enabled infinite loop) */
+                {
+                    uint32_t p = 0xFFF000;
+                    *(uint32_t*)(vf->ram + p) = 0xE10F0000; p += 4; /* MRS R0, CPSR */
+                    *(uint32_t*)(vf->ram + p) = 0xE3C000C0; p += 4; /* BIC R0, #0xC0 */
+                    *(uint32_t*)(vf->ram + p) = 0xE129F000; p += 4; /* MSR CPSR_cxsf, R0 */
+                    *(uint32_t*)(vf->ram + p) = 0xEAFFFFFE; p += 4; /* B . */
+                }
+                /* Fill BSS zero areas with BX LR safety net */
+                for (uint32_t a = 0x1A55B0; a < 0xC00000; a += 4)
+                    if (*(uint32_t*)(vf->ram + a) == 0)
+                        *(uint32_t*)(vf->ram + a) = 0xE12FFF1E; /* BX LR */
+                /* Disable timer during game init (re-enable when idle reached) */
+                vf->timer.timer[0].ctrl = 0x10; /* disabled */
+                vf->timer.timer[0].irq_pending = 0;
+                vf->timer.irq.status = 0;
+                /* Enable NULL trap and jump to game init with IRQ DISABLED */
                 vf->cpu.null_trap_enabled = 1;
-                vf->cpu.cpsr = 0x00000013; /* SVC, IRQ ENABLED */
+                vf->cpu.cpsr = 0x000000D3; /* SVC, IRQ+FIQ disabled */
                 vf->cpu.r[15] = 0x10C16CB8;
                 vf->cpu.r[13] = 0x10FFE000;
                 vf->cpu.r[14] = 0x10FFF000;
-                vf->timer.timer[0].irq_pending = 0;
-                vf->timer.irq.status = 0;
-                printf("[GAME] Launching game init at 0x10C16CB8!\n");
+                printf("[GAME] Launching game init at 0x10C16CB8 (IRQ off)\n");
+            }
+
+            /* Phase 101: game init returned to idle → re-enable timer + IRQ */
+            if (phase == 100 && (pc == 0x10FFF000 || pc == 0x10FFF00C)) {
+                phase = 101;
+                vf->timer.timer[0].load = 37500;
+                vf->timer.timer[0].count = 37500;
+                vf->timer.timer[0].ctrl = 0xE2;
+                vf->timer.irq.enable |= 0x01;
+                printf("[GAME] Init done → idle at 0x%08X, timer+IRQ re-enabled\n", pc);
             }
 
             /* Phase 1: scheduler loop detected → re-copy modules + redirect */
@@ -2998,6 +3111,10 @@ void vflash_run_frame(VFlash *vf) {
                 uint32_t vec_insn = mem_read32(vf, vec_addr);
                 printf("[IRQ] First IRQ! PC was 0x%08X, vector VA=0x%08X PA=0x%08X insn=0x%08X\n",
                        vf->cpu.r[15], vec_addr, pa, vec_insn);
+                printf("[IRQ] RAM[0x18]=0x%08X ROM[0x18]=0x%08X remapped=%d\n",
+                       *(uint32_t*)(vf->ram + 0x18),
+                       vf->rom ? *(uint32_t*)(vf->rom + 0x18) : 0,
+                       vf->rom_remapped);
                 printf("[IRQ] SP_irq=0x%08X CPSR=0x%08X MMU=%d\n",
                        vf->cpu.r13_irq, vf->cpu.cpsr, vf->cpu.cp15.mmu_enabled);
                 irq_logged = 1;

@@ -492,10 +492,10 @@ int arm9_step(ARM9 *cpu) {
             if (ntp < 50)
                 fprintf(stderr, "[NULL-TRAP] 0x%08X (from 0x%08X)\n", inst_addr, cpu->r[14]);
             ntp++;
-            /* Patch the NULL address to BX LR (permanent fix) */
-            cpu->mem_write32(cpu->mem_ctx, inst_addr, 0xE12FFF1E); /* BX LR */
-            cpu->r[0] = 0; /* return NULL/0 */
-            PC = cpu->r[14];
+            /* Write stub: MOV R0,#0 (success); BX LR (return) */
+            cpu->mem_write32(cpu->mem_ctx, inst_addr, 0xE3A00000); /* MOV R0,#0 */
+            cpu->mem_write32(cpu->mem_ctx, inst_addr + 4, 0xE12FFF1E); /* BX LR */
+            PC = inst_addr; /* re-execute (now runs stub) */
         }
 
         exec_arm(cpu, i);
