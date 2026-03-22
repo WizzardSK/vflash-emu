@@ -1281,11 +1281,11 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
         uint32_t roff = addr - VFLASH_RAM_BASE;
         /* Watchpoint: track writes to scheduler entry */
-        if (roff == 0x10234) {
+        if (roff == 0x359660 || roff == 0x3596B0 || roff == 0x9CFEC) {
             static int wp_count = 0;
-            if (wp_count < 5)
-                printf("[WP] ram[0x10234] = 0x%08X (was 0x%08X) PC=0x%08X\n",
-                       val, *(uint32_t*)(vf->ram + roff), vf->cpu.r[15]);
+            if (wp_count < 10)
+                printf("[WP-HEAP] ram[0x%06X] = 0x%08X PC=0x%08X\n",
+                       roff, val, vf->cpu.r[15]);
             wp_count++;
         }
         *(uint32_t*)(vf->ram + roff) = val;
@@ -1545,20 +1545,13 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                              * µMORE task_start (0x85E88) checks [0x103585E0]==3
                              * and refuses to register tasks if state != 3.
                              * On real HW this is set by earlier init stages. */
-                            /* BSS clear + fill with BX LR safety net.
-                             * BX LR prevents crashes when kernel code calls
-                             * uninitialized function pointers in BSS. */
-                            for (uint32_t a = 0x1A55B0; a < 0x1A55B0 + 0x1B40F4; a += 4)
-                                *(uint32_t*)(vf->ram + a) = 0xE12FFF1E;
-                            /* Set scheduler state AFTER BSS clear */
-                            *(uint32_t*)(vf->ram + 0x3585E0) = 3;
-                            /* Create minimal idle task for µMORE context switch.
-                             * Caller at 0x10084480: R3 = *[0x103585C0] + 0x44
-                             * Context switch: LDR SP, [R1] where R1 = task+0x44
-                             * So task+0x44 must contain a valid saved SP.
-                             * The saved stack frame: {CPSR, R0-R12, LR, PC} = 16 words */
-                            {
-                                /* RAM offsets (add 0x10000000 for VA) */
+                            /* DON'T fill BSS with BX LR in natural boot mode.
+                             * Real init 0x5D0 clears BSS, kernel init writes heap.
+                             * BX LR fill would overwrite heap metadata later.
+                             * Also DON'T set sched_state — real init handles it. */
+                            /* DON'T create dummy idle task — real init will do it.
+                             * Dummy task at 0x107FD000 was interfering with real init. */
+                            if (0) { /* disabled for natural boot */
                                 uint32_t task_off = 0x7FD000;
                                 uint32_t stk_off  = 0x7FDF00;
                                 /* Context switch at 0x10087634 does:
