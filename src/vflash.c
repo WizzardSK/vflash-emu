@@ -2963,22 +2963,44 @@ void vflash_run_frame(VFlash *vf) {
                 for (uint32_t a = 0x1A55B0; a < 0xC00000; a += 4)
                     if (*(uint32_t*)(vf->ram + a) == 0)
                         *(uint32_t*)(vf->ram + a) = 0xE12FFF1E; /* BX LR */
-                /* Disable timer during game init (re-enable when idle reached) */
-                vf->timer.timer[0].ctrl = 0x10; /* disabled */
+                /* Patch BOOT.BIN callback to idle (prevent reboot loop).
+                 * BOOT.BIN header[0x20] = callback addr, originally 0x1880
+                 * (ROM code that triggers warm reboot). Redirect to idle. */
+                *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFF000;
+                /* Disable timer during BOOT.BIN init */
+                vf->timer.timer[0].ctrl = 0x10;
                 vf->timer.timer[0].irq_pending = 0;
                 vf->timer.irq.status = 0;
-                /* Enable NULL trap and jump to game init with IRQ DISABLED */
+                /* Run BOOT.BIN init to register µMORE services.
+                 * Entry at 0x10C0011C does init functions then calls
+                 * callback → idle at 0x10FFF000. */
                 vf->cpu.null_trap_enabled = 1;
                 vf->cpu.cpsr = 0x000000D3; /* SVC, IRQ+FIQ disabled */
+                vf->cpu.r[15] = 0x10C0011C;
+                vf->cpu.r[13] = 0x10FFE000;
+                vf->cpu.r[14] = 0x10FFF000;
+                printf("[BOOT] Running BOOT.BIN init at 0x10C0011C (callback→idle)\n");
+            }
+
+            /* Phase 101: BOOT.BIN init done → idle reached → launch game */
+            if (phase == 100 && (pc == 0x10FFF000 || pc == 0x10FFF00C)) {
+                phase = 101;
+                printf("[BOOT] BOOT.BIN init complete → idle at 0x%08X\n", pc);
+                /* Check if BSS service table got populated */
+                uint32_t svc = *(uint32_t*)(vf->ram + 0x9A0950);
+                printf("[BOOT] BSS[0x109A0950] = 0x%08X (%s)\n",
+                       svc, svc == 0xE12FFF1E ? "BX LR stub" : "populated!");
+                /* Now launch game init */
+                vf->cpu.cpsr = 0x000000D3;
                 vf->cpu.r[15] = 0x10C16CB8;
                 vf->cpu.r[13] = 0x10FFE000;
                 vf->cpu.r[14] = 0x10FFF000;
-                printf("[GAME] Launching game init at 0x10C16CB8 (IRQ off)\n");
+                printf("[GAME] Launching game init at 0x10C16CB8\n");
             }
 
-            /* Phase 101: game init returned to idle → re-enable timer + IRQ */
-            if (phase == 100 && (pc == 0x10FFF000 || pc == 0x10FFF00C)) {
-                phase = 101;
+            /* Phase 102: game init returned to idle → re-enable timer + IRQ */
+            if (phase == 101 && (pc == 0x10FFF000 || pc == 0x10FFF00C)) {
+                phase = 102;
                 vf->timer.timer[0].load = 37500;
                 vf->timer.timer[0].count = 37500;
                 vf->timer.timer[0].ctrl = 0xE2;
