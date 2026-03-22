@@ -285,13 +285,13 @@ Standard ARM dual-timer. Two timers per block at offsets +0x00 and +0x20:
 - **Task dispatch WORKING** — manually populated task_table + task_list_head; µMORE IRQ handler dispatches and exits scheduler loop
 - **Task structures decoded**: TCB at 0xAC7D8 (stride 0x24, $SCB magic at +0xC), large context struct (+0x58 = saved ARM registers for context switch)
 - **Key functions found**: task_init (0x8B6CC), task_start (0x85E88), task_dispatch (0x86AE4), context_switch (0x89BA4), syscall_dispatch (0x8BE40)
-- **GAME CODE RUNNING** — game init executes ~2000 instructions through LCD init, display setup, deep init chain across 10+ BOOT.BIN functions
+- **µMORE KERNEL RUNNING** — complete ROM boot flow: flash remap → PLL/SDRAM cal → memcpy kernel+modules → BSS clear → flash dispatch → kernel entry at 0x1009FFD4. Kernel runs stable at 0x100A14xx in SVC mode with timer + IRQ.
 - **PL111 LCD Controller** — read/write handlers for timing, framebuffer base, control registers; framebuffer blit (RGB565/ARGB)
-- **Page table fix**: added identity mapping for BOOT.BIN at VA 0x10C/0x10D
-- **LCD handle stub**: framebuffer at RAM[0x800000], display struct chain
+- **Flash dispatch fix**: patched flash_buf[0] from remap value (0x118) to kernel entry, preventing infinite reboot loop
+- **Safety nets**: BSS filled with BX LR, NULL pointer trap, full 16MB RAM identity mapping
 
 ### What doesn't work yet
-- **Game rendering** — game init runs through LCD init + display setup but crashes on UNDEF exception in deeper init chain. BSS filled with BX LR safety net + NULL pointer trap catches most NULL calls. Full page table identity mapping for all 16MB RAM. Likely needs complete µMORE kernel init for BSS function pointer population.
+- **Game task dispatch** — µMORE kernel runs but idle-loops waiting for tasks/events. Task table empty, no ATAPI or LCD register access observed. Kernel needs task registration to proceed to game code.
 - **In-game audio** — `.snd` PCM WAV files not decoded (cutscene audio works)
 
 ## MJP / MIAV format
