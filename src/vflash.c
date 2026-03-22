@@ -1280,7 +1280,14 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
 
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
         uint32_t roff = addr - VFLASH_RAM_BASE;
-        /* (mem trace removed) */
+        /* Watchpoint: track writes to scheduler entry */
+        if (roff == 0x10234) {
+            static int wp_count = 0;
+            if (wp_count < 5)
+                printf("[WP] ram[0x10234] = 0x%08X (was 0x%08X) PC=0x%08X\n",
+                       val, *(uint32_t*)(vf->ram + roff), vf->cpu.r[15]);
+            wp_count++;
+        }
         *(uint32_t*)(vf->ram + roff) = val;
         return;
     }

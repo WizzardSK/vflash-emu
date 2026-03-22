@@ -487,6 +487,56 @@ int arm9_step(ARM9 *cpu) {
         /* NULL pointer trap: when game code (LR in BOOT.BIN) calls through
          * a NULL pointer into BSS, auto-return to skip the call.
          * Only active for calls FROM BOOT.BIN code (0x10C00000+). */
+        /* Trace init BLs and scheduler */
+        {
+            /* Trace memcpy: focus on CMN+BNE at 0x328-0x330 */
+            if (inst_addr >= 0x324 && inst_addr <= 0x334) {
+                static int fn_log = 0;
+                if (fn_log < 10) {
+                    printf("[FN2B4] PC=%08X insn=%08X R2=%08X CPSR=%08X Z=%d\n",
+                           inst_addr, i, cpu->r[2], CPSR, (CPSR >> 30) & 1);
+                    fn_log++;
+                }
+            }
+            if (inst_addr == 0x340) {
+                static int mcpy_log = 0;
+                if (mcpy_log < 3) {
+                    printf("[MCPY] STR: *0x%08X = 0x%08X (iter %d)\n",
+                           cpu->r[3], cpu->r[2], mcpy_log);
+                    mcpy_log++;
+                }
+            }
+            /* Trace when 0x10010234 gets written */
+            if (inst_addr == 0x340 && cpu->r[3] == 0x10010234) {
+                printf("[MCPY] *** Writing scheduler: *0x10010234 = 0x%08X ***\n", cpu->r[2]);
+            }
+            /* Check ram[0x10234] after each init BL returns */
+            if (inst_addr >= 0x118 && inst_addr <= 0x138) {
+                uint32_t chk = cpu->mem_read32(cpu->mem_ctx, 0x10010234);
+                static uint32_t last_chk = 0;
+                if (chk != last_chk) {
+                    printf("[CHK] at PC=%08X: ram[0x10234]=%08X\n", inst_addr, chk);
+                    last_chk = chk;
+                }
+            }
+            if (inst_addr >= 0x118 && inst_addr <= 0x138 && (i & 0x0F000000) == 0x0B000000) {
+                static int bl_log = 0;
+                if (bl_log < 10) {
+                    int32_t off = i & 0xFFFFFF;
+                    if (off & 0x800000) off |= (int32_t)0xFF000000;
+                    uint32_t target = inst_addr + 8 + (uint32_t)(off * 4);
+                    printf("[INIT-BL] PC=%08X → BL 0x%08X\n", inst_addr, target);
+                    bl_log++;
+                }
+            }
+            /* Log scheduler entry */
+            if (inst_addr == 0x10010234) {
+                uint32_t val = cpu->mem_read32(cpu->mem_ctx, 0x10010234);
+                printf("[SCHED] Entry: insn=%08X val_at_addr=%08X SP=%08X\n",
+                       i, val, cpu->r[13]);
+            }
+        }
+
         /* HLE service intercept: check BEFORE null trap (services are at zero-init addresses) */
         if (cpu->hle_intercept && cpu->hle_intercept(cpu->hle_ctx, inst_addr)) {
             cpu->cycles += 1;
@@ -504,9 +554,17 @@ int arm9_step(ARM9 *cpu) {
             return 1;
         }
 
+        PC = inst_addr + 8;
         exec_arm(cpu, i);
-        if (PC == inst_addr + 8)
-            PC = inst_addr + 4;
+        /* Detect branch-forward-by-0: if PC == inst_addr+8 AND the
+         * instruction is a B/BL, exec_arm intentionally set PC there.
+         * For non-branch instructions, PC==inst_addr+8 means no change. */
+        if (PC == inst_addr + 8) {
+            if ((i & 0x0E000000) == 0x0A000000 && cond_ok(cpu, i >> 28))
+                { /* branch was taken, PC is correct */ }
+            else
+                PC = inst_addr + 4;
+        }
         cyc = insn_cycles_arm(i);
     }
     cpu->cycles += (uint64_t)cyc;
