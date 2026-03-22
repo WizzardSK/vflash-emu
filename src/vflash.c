@@ -2870,13 +2870,24 @@ void vflash_run_frame(VFlash *vf) {
                     tlb_flush();
                     printf("[SCHED] Mapped VA 0x10C/0x10D → identity\n");
                 }
-                /* Create LCD handle for game init (prevents NULL crash) */
+                /* LCD handle: [BC0A40] → handle_ptr, handle[0x5C] = framebuf.
+                 * LCD init reads [handle+0x5C] and adds 0x20000 for palette.
+                 * Also fill other fields that game code may read. */
                 {
-                    uint32_t h = 0xBF0000;
-                    memset(vf->ram + h, 0, 0x100);
-                    *(uint32_t*)(vf->ram + h + 0x5C) = 0xC0000000; /* PL111 base */
+                    uint32_t h = 0xBF0000, fb = 0x800000;
+                    memset(vf->ram + h, 0, 0x1000);
+                    memset(vf->ram + fb, 0, 0x40000);
+                    *(uint32_t*)(vf->ram + h + 0x5C) = 0x10000000 + fb;
+                    /* Fill more fields to prevent NULL dereferences */
+                    *(uint32_t*)(vf->ram + h + 0x00) = 0x10000000 + h + 0x100; /* sub-struct */
+                    *(uint32_t*)(vf->ram + h + 0x04) = 320;  /* width */
+                    *(uint32_t*)(vf->ram + h + 0x08) = 240;  /* height */
+                    *(uint32_t*)(vf->ram + h + 0x0C) = 16;   /* bpp */
+                    *(uint32_t*)(vf->ram + h + 0x10) = 640;  /* stride */
                     *(uint32_t*)(vf->ram + 0xBC0A40) = 0x10000000 + h;
-                    printf("[SCHED] LCD handle at 0x10%06X\n", h);
+                    vf->lcd.upbase = 0x10000000 + fb;
+                    vf->lcd.control = 0x182B;
+                    printf("[SCHED] LCD handle fb@0x10%06X\n", fb);
                 }
                 /* Jump to game init with IRQ disabled */
                 vf->cpu.cpsr = 0x00000093;

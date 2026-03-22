@@ -483,7 +483,20 @@ int arm9_step(ARM9 *cpu) {
         PC = inst_addr + 8;
 
         /* Game init trace: log BL calls and returns */
-        /* (instruction trace disabled) */
+        /* Trace game init — log until PC leaves BOOT.BIN or hits NOP area */
+        static int gt=0;
+        if (inst_addr==0x10C16CB8) gt=1;
+        if (gt>0 && gt<=2000) {
+            /* Only log BL calls, returns, and NOP */
+            if ((i&0x0F000000)==0x0B000000 || i==0xE49DF004 || i==0xE8BD8000 || i==0) {
+                int32_t bo=(i&0x0F000000)==0x0B000000 ? ((int32_t)(i<<8)>>6) : 0;
+                fprintf(stderr,"[GT] %08X → %08X%s\n", inst_addr,
+                        (i&0x0F000000)==0x0B000000 ? (uint32_t)((int32_t)(inst_addr+8)+bo) : PC,
+                        i==0?" *** NOP ***":"");
+                if (i==0) gt=9999;
+            }
+            gt++;
+        }
 
         exec_arm(cpu, i);
         if (PC == inst_addr + 8)
