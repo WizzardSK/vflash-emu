@@ -1415,7 +1415,12 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                                 uint32_t rv = *(uint32_t*)(vf->rom + ci);
                                 if (rv != 0) *(uint32_t*)(vf->ram + ci) = rv;
                             }
-                            printf("[ROM-PRELOAD] Kernel+modules+code loaded\n");
+                            /* Set sched_state=3 BEFORE ROM init runs.
+                             * µMORE task_start (0x85E88) checks [0x103585E0]==3
+                             * and refuses to register tasks if state != 3.
+                             * On real HW this is set by earlier init stages. */
+                            *(uint32_t*)(vf->ram + 0x3585E0) = 3;
+                            printf("[ROM-PRELOAD] Kernel+modules+code+sched_state=3\n");
                         }
                     }
                 }
@@ -2736,15 +2741,22 @@ void vflash_run_frame(VFlash *vf) {
             /* Phase 1: scheduler loop detected → re-copy modules + redirect */
             if (phase == 0 && (pc >= 0x1007FFC0 && pc <= 0x10080060)) {
                 phase = 1;
-                /* Re-copy modules erased by BSS clear */
+                /* Re-copy modules erased by BSS clear + set sched_state */
                 memcpy(vf->ram + 0xAC000, vf->rom + 0xAE010, 0xF95B0);
                 memcpy(vf->ram + 0x9FFD4, vf->rom + 0xC02C, 0xA1FE4);
-                /* Call µMORE kernel entry directly (0x100A0FA0).
-                 * This initializes µMORE, registers tasks, sets up scheduler.
-                 * The kernel entry expects to be called in SVC mode. */
-                printf("[SCHED] Phase 1: calling µMORE kernel entry at 0x100A0FA0\n");
-                vf->cpu.r[14] = 0x10FFF000; /* return to idle stub */
-                vf->cpu.r[15] = 0x100A0FA0;
+                *(uint32_t*)(vf->ram + 0x3585E0) = 3;
+
+                /* Populate task_table with pointers to task structs
+                 * from module data (0x100AC7D8+). Each has TCB magic. */
+                {
+                    uint32_t tb = 0xAC7D8;
+                    uint32_t n = *(uint32_t*)(vf->ram + 0xAC004); /* slot count */
+                    if (n > 6) n = 6;
+                    for (uint32_t i = 0; i < n; i++)
+                        *(uint32_t*)(vf->ram + 0x1A9440 + i*4) = 0x10000000 + tb + i*0x74;
+                    printf("[SCHED] Phase 1: task_table[0..%u] populated\n", n);
+                }
+                vf->cpu.r[15] = 0x10FFF000;
                 vf->cpu.r[13] = 0x10FFE000;
             }
 
