@@ -285,13 +285,14 @@ Standard ARM dual-timer. Two timers per block at offsets +0x00 and +0x20:
 - **Task dispatch WORKING** — manually populated task_table + task_list_head; µMORE IRQ handler dispatches and exits scheduler loop
 - **Task structures decoded**: TCB at 0xAC7D8 (stride 0x24, $SCB magic at +0xC), large context struct (+0x58 = saved ARM registers for context switch)
 - **Key functions found**: task_init (0x8B6CC), task_start (0x85E88), task_dispatch (0x86AE4), context_switch (0x89BA4), syscall_dispatch (0x8BE40)
-- **µMORE KERNEL RUNNING** — complete ROM boot flow: flash remap → PLL/SDRAM cal → memcpy kernel+modules → BSS clear → flash dispatch → kernel entry at 0x1009FFD4. Kernel runs stable at 0x100A14xx in SVC mode with timer + IRQ.
-- **PL111 LCD Controller** — read/write handlers for timing, framebuffer base, control registers; framebuffer blit (RGB565/ARGB)
-- **Flash dispatch fix**: patched flash_buf[0] from remap value (0x118) to kernel entry, preventing infinite reboot loop
-- **Safety nets**: BSS filled with BX LR, NULL pointer trap, full 16MB RAM identity mapping
+- **Full ROM boot decoded** — flash remap → PLL/SDRAM cal → memcpy (kernel 662KB + modules 1MB) → BSS clear → flash dispatch → scheduler entry at 0x10010234 (from ROM pool at 0xD90)
+- **PL111 LCD Controller** — read/write handlers + framebuffer blit (RGB565/ARGB)
+- **ROM preload**: kernel, modules, ROM code from 0x1000 — full ROM content in RAM
+- **Safety nets**: BSS filled with BX LR, NULL pointer trap, full 16MB identity mapping
+- **Flash dispatch**: patched flash_buf[0] to scheduler entry (0x10010234)
 
 ### What doesn't work yet
-- **Game task dispatch** — µMORE kernel runs but idle-loops waiting for tasks/events. Task table empty, no ATAPI or LCD register access observed. Kernel needs task registration to proceed to game code.
+- **µMORE scheduler init** — scheduler at 0x10010234 runs but exits to unmapped area via BSS function pointer chain. BSS fill (BX LR) catches NULL calls but return values cascade into crashes. Needs complete µMORE init sequence (init BLs at 0x118-0x134) to populate vtables.
 - **In-game audio** — `.snd` PCM WAV files not decoded (cutscene audio works)
 
 ## MJP / MIAV format
