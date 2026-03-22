@@ -2812,12 +2812,13 @@ void vflash_run_frame(VFlash *vf) {
                 /* Set scheduler state and jump to kernel code */
                 *(uint32_t*)(vf->ram + 0x3585E0) = 3;
 
-                /* Instead of idle, call µMORE kernel code directly.
-                 * This bypasses the scheduler and runs game init. */
+                /* Jump to game init (LCD + display setup).
+                 * Found via LCD register (0xC0000084) reference chain. */
                 vf->cpu.cpsr = 0x00000013; /* SVC, IRQ+FIQ enabled */
-                vf->cpu.r[15] = 0x1009FFD4; /* µMORE kernel start */
-                vf->cpu.r[13] = 0x10FFE000; /* stack */
-                printf("[SCHED] Phase 2: jumping to kernel at 0x1009FFD4\n");
+                vf->cpu.r[15] = 0x10C16CB8; /* game init */
+                vf->cpu.r[13] = 0x10FFE000;
+                vf->cpu.r[14] = 0x10FFF000; /* return → idle */
+                printf("[SCHED] Phase 2: → GAME INIT at 0x10C16CB8\n");
             }
         }
 
