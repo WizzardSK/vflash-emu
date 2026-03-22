@@ -3106,16 +3106,44 @@ void vflash_run_frame(VFlash *vf) {
 
             /* µMORE kernel running: enable timer + FIQ after init.
              * Match ANY kernel address after frame 8 (init BLs done by then). */
-            if (phase == 0 && vf->frame_count > 8 &&
+            if (phase == 0 && vf->frame_count > 50 &&
                 pc >= 0x10000000 && pc < 0x10100000 &&
                 (vf->cpu.cpsr & 0x1F) == 0x13) { /* SVC mode */
-                phase = 99; /* skip old phases */
+                phase = 99;
                 vf->timer.timer[0].load = 37500;
                 vf->timer.timer[0].count = 37500;
                 vf->timer.timer[0].ctrl = 0xE2;
                 vf->timer.irq.enable |= 0x01;
-                vf->cpu.cpsr &= ~0x80; /* enable IRQ */
+                vf->cpu.cpsr &= ~0x80; /* enable IRQ only (FIQ when kernel is ready) */
                 vf->cpu.r13_irq = 0x10800000;
+                /* Redirect FIQ vector to our custom timer handler.
+                 * FIQ vector at SDRAM[0x1C] does LDR PC,[0x94].
+                 * Overwrite SDRAM[0x94] with our handler address.
+                 * Handler at RAM[0xFFE000] clears timer + returns. */
+                {
+                    uint32_t h = 0xFFE000;
+                    uint32_t p = h;
+                    *(uint32_t*)(vf->ram + p) = 0xE92D400F; p += 4; /* PUSH {R0-R3,LR} */
+                    *(uint32_t*)(vf->ram + p) = 0xE59F0010; p += 4; /* LDR R0,[PC,#16] */
+                    *(uint32_t*)(vf->ram + p) = 0xE3A01001; p += 4; /* MOV R1,#1 */
+                    *(uint32_t*)(vf->ram + p) = 0xE5801000; p += 4; /* STR R1,[R0] clear timer */
+                    *(uint32_t*)(vf->ram + p) = 0xE8BD400F; p += 4; /* POP {R0-R3,LR} */
+                    *(uint32_t*)(vf->ram + p) = 0xE25EF004; p += 4; /* SUBS PC,LR,#4 return */
+                    *(uint32_t*)(vf->ram + p) = 0x9001000C; p += 4; /* pool: timer IntClr */
+                    /* Point FIQ vector pool to our handler */
+                    *(uint32_t*)(vf->ram + 0x94) = 0x10000000 + h;
+                    /* Overwrite BOTH IRQ and FIQ vectors in SDRAM
+                     * to branch directly to our handler (skip dispatch chain) */
+                    {
+                        int32_t irq_off = (int32_t)(h - (0x18 + 8)) >> 2;
+                        *(uint32_t*)(vf->ram + 0x18) = 0xEA000000 | (irq_off & 0xFFFFFF); /* B handler */
+                        int32_t fiq_off = (int32_t)(h - (0x1C + 8)) >> 2;
+                        *(uint32_t*)(vf->ram + 0x1C) = 0xEA000000 | (fiq_off & 0xFFFFFF); /* B handler */
+                    }
+                    /* Force timer to IRQ (not FIQ) */
+                    vf->timer.irq.fiq_sel = 0;
+                    printf("[IRQ] Direct vector → handler at 0x%08X\n", 0x10000000 + h);
+                }
                 /* Install ARM exception vector table at PA 0 (low_ram[0x00-0x3C]).
                  * Uses separate low_ram buffer so SDRAM writes don't overwrite.
                  * Format: LDR PC,[PC,#0x18] at each vector slot (0x00-0x1C),
