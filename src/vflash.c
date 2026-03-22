@@ -1266,11 +1266,11 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
     /* Fast path: RAM write (most common) */
     if (__builtin_expect(addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE, 1)) {
         uint32_t roff = addr - VFLASH_RAM_BASE;
-        if (roff == 0x359660) {
-            static int fwp = 0;
-            if (fwp < 20) printf("[FWP] ram[0x359660] = 0x%08X (PA=0x%08X PC=0x%08X)\n",
-                                val, addr, vf->cpu.r[15]);
-            fwp++;
+        if (roff == 0x3585E0 && val != 3) {
+            /* Force sched_state to stay at 3.
+             * Kernel code at 0x100843AC resets it to 0, preventing dispatch.
+             * On real HW, scheduler manages this internally. */
+            val = 3;
         }
         *(uint32_t*)(vf->ram + roff) = val;
         return;
