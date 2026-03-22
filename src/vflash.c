@@ -224,6 +224,12 @@ struct VFlash {
         int       frame_skip;
     } mjp_player;
 
+    /* PTX gallery state */
+    CDEntry  *ptx_list;    /* array of PTX entries on disc */
+    int       ptx_count;
+    int       ptx_index;   /* current displayed index */
+    int       ptx_loaded;  /* 1 after gallery scanned */
+
     /* Debugger state */
     uint32_t bp[16];   /* breakpoint addresses (0 = unused) */
     int      bp_hit;   /* set by vflash_step() when BP hit */
@@ -2816,6 +2822,7 @@ void vflash_destroy(VFlash *vf) {
     free(vf->mjp_player.hdr);
     free(vf->sram);
     free(vf->rom);
+    free(vf->ptx_list);
     free(vf);
 }
 
@@ -3202,6 +3209,74 @@ void vflash_run_frame(VFlash *vf) {
                         printf("[PTX] Displayed %s (%ux%u → %ux%u XBGR1555)\n",
                                ptx_entry.name, src_w, src_h,
                                VFLASH_SCREEN_W, VFLASH_SCREEN_H);
+                    }
+                }
+                free(ptx_buf);
+            }
+        }
+    }
+
+    /* PTX gallery: scan disc for all PTX files, navigate with Left/Right */
+    if (!vf->ptx_loaded && vf->cd && vf->cd->is_open) {
+        vf->ptx_loaded = 1;
+        vf->ptx_list = calloc(256, sizeof(CDEntry));
+        vf->ptx_count = 0;
+        /* Recursive scan: list all dirs, then scan each for PTX */
+        uint8_t pvd[2048];
+        if (cdrom_read_sector(vf->cd, 16, pvd)) {
+            uint32_t root_lba  = *(uint32_t*)(pvd + 156 + 2);
+            uint32_t root_size = *(uint32_t*)(pvd + 156 + 10);
+            /* Two-level scan: root → subdir → files (up to 1024 per dir) */
+            CDEntry l1[64];
+            int n1 = cdrom_list_dir(vf->cd, root_lba, root_size, l1, 64);
+            for (int i = 0; i < n1 && vf->ptx_count < 256; i++) {
+                if (!l1[i].is_dir) continue;
+                CDEntry *l2 = malloc(1024 * sizeof(CDEntry));
+                if (!l2) continue;
+                int n2 = cdrom_list_dir(vf->cd, l1[i].lba, l1[i].size, l2, 1024);
+                for (int j = 0; j < n2 && vf->ptx_count < 256; j++) {
+                    char *dot = strrchr(l2[j].name, '.');
+                    if (dot && strcasecmp(dot, ".PTX") == 0)
+                        vf->ptx_list[vf->ptx_count++] = l2[j];
+                }
+                free(l2);
+            }
+        }
+        printf("[PTX-GALLERY] Found %d PTX images on disc\n", vf->ptx_count);
+    }
+    /* Navigate gallery with Left/Right keys */
+    if (vf->ptx_count > 0 && vf->cd && vf->cd->is_open) {
+        uint32_t pressed = vf->input & ~vf->input_prev;
+        int new_idx = vf->ptx_index;
+        if (pressed & VFLASH_BTN_RIGHT) new_idx = (vf->ptx_index + 1) % vf->ptx_count;
+        if (pressed & VFLASH_BTN_LEFT)  new_idx = (vf->ptx_index + vf->ptx_count - 1) % vf->ptx_count;
+        if (new_idx != vf->ptx_index || vf->frame_count == 0) {
+            vf->ptx_index = new_idx;
+            CDEntry *e = &vf->ptx_list[vf->ptx_index];
+            uint8_t *ptx_buf = malloc(e->size);
+            if (ptx_buf) {
+                int rd = cdrom_read_file(vf->cd, e, ptx_buf, 0, e->size);
+                if (rd > 44) {
+                    uint32_t hdr_sz = *(uint32_t*)ptx_buf;
+                    if (hdr_sz >= 12 && hdr_sz <= 256 && hdr_sz < (uint32_t)rd) {
+                        uint32_t pw = 512;
+                        uint32_t total_rows = ((uint32_t)rd - hdr_sz) / (pw * 2);
+                        uint32_t src_h = total_rows / 2;
+                        uint32_t src_w = pw < VFLASH_SCREEN_W ? pw : VFLASH_SCREEN_W;
+                        const uint16_t *px = (const uint16_t*)(ptx_buf + hdr_sz);
+                        for (uint32_t dy = 0; dy < VFLASH_SCREEN_H; dy++) {
+                            uint32_t sy = dy * src_h / VFLASH_SCREEN_H;
+                            for (uint32_t dx = 0; dx < src_w; dx++) {
+                                uint16_t p = px[sy * 2 * pw + dx];
+                                uint8_t b = ((p >> 10) & 0x1F) << 3;
+                                uint8_t g = ((p >> 5)  & 0x1F) << 3;
+                                uint8_t r = ( p        & 0x1F) << 3;
+                                vf->framebuf[dy * VFLASH_SCREEN_W + dx] =
+                                    0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+                            }
+                        }
+                        printf("[PTX-GALLERY] %d/%d: %s (%ux%u)\n",
+                               vf->ptx_index + 1, vf->ptx_count, e->name, src_w, src_h);
                     }
                 }
                 free(ptx_buf);
