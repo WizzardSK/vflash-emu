@@ -3474,8 +3474,8 @@ void vflash_run_frame(VFlash *vf) {
         }
         printf("[MJP] Found %d MJP video files\n", vf->mjp_count);
     }
-    /* Navigate gallery with Left/Right keys */
-    if (vf->ptx_count > 0 && vf->cd && vf->cd->is_open) {
+    /* Navigate gallery with Left/Right keys (only when video not playing) */
+    if (vf->ptx_count > 0 && vf->cd && vf->cd->is_open && !vf->mjp_player.playing) {
         uint32_t pressed = vf->input & ~vf->input_prev;
         int new_idx = vf->ptx_index;
         if (pressed & VFLASH_BTN_RIGHT) new_idx = (vf->ptx_index + 1) % vf->ptx_count;
@@ -3519,29 +3519,35 @@ void vflash_run_frame(VFlash *vf) {
         }
     }
 
-    /* MJP video player — Red button loads next MJP, auto-load first on frame 1 */
+    /* MJP video player — Z=next video, X=stop, auto-load on frame 1 */
     if (vf->cd && vf->cd->is_open && vf->mjp_count > 0) {
         uint32_t pressed = vf->input & ~vf->input_prev;
         int load_mjp = 0;
         if (vf->frame_count == 1 && !vf->mjp_player.playing) {
-            load_mjp = 1; /* auto-load first */
-        }
-        if ((pressed & VFLASH_BTN_RED) && !vf->mjp_player.playing) {
-            vf->mjp_index = (vf->mjp_index + 1) % vf->mjp_count;
             load_mjp = 1;
         }
-        if ((pressed & VFLASH_BTN_YELLOW) && vf->mjp_player.playing) {
-            /* Yellow = stop video, return to gallery */
-            vf->mjp_player.playing = 0;
-            free(vf->mjp_player.data); vf->mjp_player.data = NULL;
-            free(vf->mjp_player.hdr); vf->mjp_player.hdr = NULL;
+        if (pressed & VFLASH_BTN_RED) {
+            /* Z = next video (works even during playback) */
+            vf->mjp_index = (vf->mjp_index + 1) % vf->mjp_count;
+            /* Stop current video first */
+            if (vf->mjp_player.playing) {
+                vf->mjp_player.playing = 0;
+                free(vf->mjp_player.data); vf->mjp_player.data = NULL;
+                free(vf->mjp_player.hdr); vf->mjp_player.hdr = NULL;
+            }
+            load_mjp = 1;
+        }
+        if (pressed & VFLASH_BTN_YELLOW) {
+            /* X = stop video */
+            if (vf->mjp_player.playing) {
+                vf->mjp_player.playing = 0;
+                free(vf->mjp_player.data); vf->mjp_player.data = NULL;
+                free(vf->mjp_player.hdr); vf->mjp_player.hdr = NULL;
+            }
         }
         if (load_mjp) {
             CDEntry mjp_entry = vf->mjp_list[vf->mjp_index];
-            int mjp_found = 1;
-            {
-        }
-        if (mjp_found && mjp_entry.size > 100) {
+        if (mjp_entry.size > 100) {
             printf("[MJP-PLAY] Loading %s (%u bytes)...\n", mjp_entry.name, mjp_entry.size);
             uint32_t load_sz = mjp_entry.size < 16*1024*1024 ? mjp_entry.size : 16*1024*1024;
             vf->mjp_player.data = malloc(load_sz);
@@ -3674,8 +3680,8 @@ void vflash_run_frame(VFlash *vf) {
 
     /* VFF scene viewer: load and display VFF scene on Enter/Up/Down.
      * VFF format: header (0x400) + sections (code, framebuf, data).
-     * Section with RAM addr near 0x107xxxxx often contains XBGR1555 pixels. */
-    if (vf->cd && vf->cd->is_open) {
+     * Only active when video is not playing. */
+    if (vf->cd && vf->cd->is_open && !vf->mjp_player.playing) {
         static int vff_loaded = 0;
         static CDEntry vff_list[32];
         static int vff_count = 0, vff_index = 0;
