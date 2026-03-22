@@ -67,6 +67,8 @@ int mjp_decode_frame(MJPDecoder *dec, const uint8_t *data, uint32_t size) {
 
     int w = cinfo.output_width;
     int h = cinfo.output_height;
+    dec->decoded_w = w;
+    dec->decoded_h = h;
     uint8_t *row = malloc(w * 3);
 
     while ((int)cinfo.output_scanline < h) {

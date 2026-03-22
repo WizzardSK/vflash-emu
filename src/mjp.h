@@ -10,7 +10,9 @@
 struct MJPDecoder {
     int      width;
     int      height;
-    uint32_t *framebuf;  /* RGBA output */
+    int      decoded_w;   /* actual JPEG width of last frame */
+    int      decoded_h;   /* actual JPEG height of last frame */
+    uint32_t *framebuf;   /* RGBA output */
     int      frames_decoded;
 };
 typedef struct MJPDecoder MJPDecoder;

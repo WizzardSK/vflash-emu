@@ -3635,11 +3635,12 @@ void vflash_run_frame(VFlash *vf) {
                 if (csz > 0 && csz < 2000000 && co + 12 + csz <= dsz) {
                     if (mjp_decode_raw(vf->video, d + co + 12, csz,
                                        vf->mjp_player.hdr, vf->mjp_player.hdr_len)) {
-                        /* Scale decoded frame to fill 320×240 display */
+                        /* Scale decoded frame to fill 320×240 display.
+                         * Use actual JPEG dimensions (not MIAV header). */
                         uint32_t *src = mjp_get_framebuf(vf->video);
                         int sw = vf->video->width;
-                        int src_w = vf->mjp_player.vid_w ? vf->mjp_player.vid_w : sw;
-                        int src_h = vf->mjp_player.vid_h ? vf->mjp_player.vid_h : vf->video->height;
+                        int src_w = vf->video->decoded_w ? vf->video->decoded_w : sw;
+                        int src_h = vf->video->decoded_h ? vf->video->decoded_h : vf->video->height;
                         if (src_w > sw) src_w = sw;
                         if (src_h > vf->video->height) src_h = vf->video->height;
                         for (int dy = 0; dy < VFLASH_SCREEN_H; dy++) {
