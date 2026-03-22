@@ -3797,38 +3797,53 @@ void vflash_run_frame(VFlash *vf) {
                     uint32_t frame_sz = 320 * 240 * 2;
                     int stride = (vff_fmt == 3) ? 512 : 320;
                     if (vff_fmt == 3) frame_sz = 512 * 240 * 2;
-                    if (sec_sz[pick] >= frame_sz) {
-                        uint8_t *fb = malloc(frame_sz);
-                        if (fb) {
-                            int fbrd = cdrom_read_file(vf->cd, e, fb, sec_off[pick], frame_sz);
-                            if (fbrd >= (int)frame_sz) {
-                                const char *fmt_names[] = {"XBGR1555","ByteSwap","RGB565","Stride512"};
-                                for (int y = 0; y < 240; y++) {
-                                    for (int x = 0; x < 320; x++) {
-                                        int si = y * stride + x;
-                                        uint16_t p = ((uint16_t)fb[si*2]) | ((uint16_t)fb[si*2+1] << 8);
-                                        if (vff_fmt == 1) /* byte-swap */
-                                            p = ((uint16_t)fb[si*2+1]) | ((uint16_t)fb[si*2] << 8);
-                                        uint8_t r, g, b;
-                                        if (vff_fmt == 2) { /* RGB565 */
-                                            r = ((p >> 11) & 0x1F) << 3;
-                                            g = ((p >> 5) & 0x3F) << 2;
-                                            b = (p & 0x1F) << 3;
-                                        } else { /* XBGR1555 */
-                                            b = ((p >> 10) & 0x1F) << 3;
-                                            g = ((p >> 5) & 0x1F) << 3;
-                                            r = (p & 0x1F) << 3;
+                    /* Composite display: background (last section) + foreground.
+                     * Last section is usually a solid color fill.
+                     * Middle section has XBGR1555 with 0=transparent. */
+                    {
+                        uint32_t frame_px = 320 * 240;
+                        uint32_t frame_bytes = frame_px * 2;
+
+                        /* Step 1: fill background from last section */
+                        if (nsec >= 2 && sec_sz[nsec-1] >= 4) {
+                            uint8_t bg[4];
+                            cdrom_read_file(vf->cd, e, bg, sec_off[nsec-1], 4);
+                            uint16_t bgc = bg[0] | (bg[1] << 8);
+                            uint8_t br = (bgc & 0x1F) << 3;
+                            uint8_t bg_ = ((bgc >> 5) & 0x1F) << 3;
+                            uint8_t bb = ((bgc >> 10) & 0x1F) << 3;
+                            uint32_t bgpx = 0xFF000000|((uint32_t)br<<16)|((uint32_t)bg_<<8)|bb;
+                            for (uint32_t pi = 0; pi < frame_px; pi++)
+                                vf->framebuf[pi] = bgpx;
+                        }
+
+                        /* Step 2: overlay foreground (section 1, or largest non-bg) */
+                        int fg_sec = (nsec >= 3) ? 1 : 0;
+                        if (vff_sec >= 0 && (uint32_t)vff_sec < nsec) fg_sec = vff_sec;
+                        if (sec_sz[fg_sec] >= frame_bytes) {
+                            uint8_t *fb = malloc(frame_bytes);
+                            if (fb) {
+                                int rd = cdrom_read_file(vf->cd, e, fb, sec_off[fg_sec], frame_bytes);
+                                if (rd >= (int)frame_bytes) {
+                                    for (int y = 0; y < 240; y++) {
+                                        for (int x = 0; x < 320; x++) {
+                                            int idx = y * 320 + x;
+                                            uint16_t p = fb[idx*2] | (fb[idx*2+1] << 8);
+                                            if (p != 0) { /* non-zero = visible pixel */
+                                                uint8_t r = (p & 0x1F) << 3;
+                                                uint8_t g = ((p >> 5) & 0x1F) << 3;
+                                                uint8_t b = ((p >> 10) & 0x1F) << 3;
+                                                vf->framebuf[idx] =
+                                                    0xFF000000|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                                            }
                                         }
-                                        vf->framebuf[y * 320 + x] =
-                                            0xFF000000 | ((uint32_t)r<<16) | ((uint32_t)g<<8) | b;
                                     }
                                 }
-                                printf("[VFF] %d/%d: %s sec%d %s (%uKB)\n",
-                                       vff_index+1, vff_count, e->name,
-                                       pick, fmt_names[vff_fmt], sec_sz[pick]/1024);
+                                free(fb);
                             }
-                            free(fb);
                         }
+                        printf("[VFF] %d/%d: %s (bg+fg composite)\n",
+                               vff_index+1, vff_count, e->name);
                     }
                     if (vf->wav_count > 0 && vf->audio && vf->audio->initialized) {
                         int wi = (vff_index * 7) % vf->wav_count;
