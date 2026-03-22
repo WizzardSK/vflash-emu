@@ -3335,27 +3335,25 @@ void vflash_run_frame(VFlash *vf) {
             }
         }
 
-        /* Deliver IRQ if pending and CPSR allows */
-        if (vf->frame_count > 1 && ztimer_irq_pending(&vf->timer)) {
+        /* Deliver IRQ or FIQ if pending and CPSR allows */
+        if (vf->frame_count > 1 &&
+            (ztimer_irq_pending(&vf->timer) || ztimer_fiq_pending(&vf->timer))) {
             if (vf->cpu.r13_irq < 0x10000000u || vf->cpu.r13_irq > 0x10FFFFFFu)
                 vf->cpu.r13_irq = 0x10800000;
-            /* Log first IRQ delivery */
+            /* Deliver as FIQ if fiq_sel routes timer there, else IRQ */
+            int use_fiq = ztimer_fiq_pending(&vf->timer);
             static int irq_logged = 0;
             if (!irq_logged) {
-                uint32_t vec_addr = vf->cpu.cp15.hivec ? 0xFFFF0018 : 0x18;
-                uint32_t pa = mmu_translate(vf, vec_addr);
-                uint32_t vec_insn = mem_read32(vf, vec_addr);
-                printf("[IRQ] First IRQ! PC was 0x%08X, vector VA=0x%08X PA=0x%08X insn=0x%08X\n",
-                       vf->cpu.r[15], vec_addr, pa, vec_insn);
-                printf("[IRQ] RAM[0x18]=0x%08X ROM[0x18]=0x%08X remapped=%d\n",
-                       *(uint32_t*)(vf->ram + 0x18),
-                       vf->rom ? *(uint32_t*)(vf->rom + 0x18) : 0,
-                       vf->rom_remapped);
-                printf("[IRQ] SP_irq=0x%08X CPSR=0x%08X MMU=%d\n",
-                       vf->cpu.r13_irq, vf->cpu.cpsr, vf->cpu.cp15.mmu_enabled);
+                printf("[IRQ] First %s! PC=0x%08X CPSR=0x%08X MMU=%d fiq_sel=0x%X\n",
+                       use_fiq ? "FIQ" : "IRQ",
+                       vf->cpu.r[15], vf->cpu.cpsr, vf->cpu.cp15.mmu_enabled,
+                       vf->timer.irq.fiq_sel);
                 irq_logged = 1;
             }
-            arm9_irq(&vf->cpu);
+            if (use_fiq)
+                arm9_fiq(&vf->cpu);
+            else
+                arm9_irq(&vf->cpu);
         }
     }
 
