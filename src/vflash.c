@@ -2983,10 +2983,23 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     /* Intercept ANY zero-instruction call in µMORE service BSS range
      * (0x109A0000-0x109B0000) and nearby areas. Also catch the specific
      * dispatch table addresses and second-level dispatch addresses. */
-    if (addr >= 0x10190000 && addr < 0x10400000) {
-        /* This is the BSS/uninitialized area — log and return */
+    /* µMORE service handlers: return 1 = "event processed".
+     * Without this, game loops calling these forever. */
+    if (addr == 0x109A0950 || addr == 0x109A09DC ||
+        addr == 0x109A0868 || addr == 0x109A0970 ||
+        addr == 0x109A0A38 || addr == 0x109A0A0C ||
+        addr == 0x109A0A1C || addr == 0x109A09AC ||
+        addr == 0x109A0A98 || addr == 0x109A0AC4 ||
+        addr == 0x109A0D2C || addr == 0x109A0CE4 ||
+        addr == 0x109A0D08) {
+        cpu->r[0] = 1;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+
+    if (addr >= 0x10190000 && addr < 0x10C00000) {
         static int hle_logged = 0;
-        if (hle_logged < 50) {
+        if (hle_logged < 200) {
             printf("[HLE] BSS call 0x%08X R0=0x%08X R1=0x%08X LR=0x%08X\n",
                    addr, cpu->r[0], cpu->r[1], cpu->r[14]);
             hle_logged++;
@@ -3144,14 +3157,35 @@ void vflash_run_frame(VFlash *vf) {
                 printf("[GAME] Launching game init at 0x10C16CB8\n");
             }
 
-            /* Phase 102: game init returned to idle → re-enable timer + IRQ */
+            /* Phase 102: game init done → set up event system + IRQ */
             if (phase == 101 && (pc == 0x10FFF000 || pc == 0x10FFF00C)) {
                 phase = 102;
+
+                /* Create synthetic event context for the game dispatcher.
+                 * Dispatcher at 0x10C1377C takes R0=type, R1=context.
+                 * Callers load context from [0x10B909C0].
+                 * Context structure: +108 (0x6C) = event data pointer.
+                 * Event data: +12=field, +16=field, +20=field, +24=field. */
+                {
+                    uint32_t ctx_base = 0xF00000; /* context struct */
+                    uint32_t evt_base = 0xF01000; /* event data */
+                    memset(vf->ram + ctx_base, 0, 0x2000);
+                    /* context + 0x6C = pointer to event data */
+                    *(uint32_t*)(vf->ram + ctx_base + 0x6C) = 0x10000000 + evt_base;
+                    /* event data fields — start with zeros (safe) */
+                    /* Store context pointer where game expects it */
+                    *(uint32_t*)(vf->ram + 0xB909C0) = 0x10000000 + ctx_base;
+                    printf("[EVENT] Context at 0x%08X, events at 0x%08X\n",
+                           0x10000000 + ctx_base, 0x10000000 + evt_base);
+                }
+
+                printf("[EVENT] Event pump active (C-side, per-frame)\n");
+
                 vf->timer.timer[0].load = 37500;
                 vf->timer.timer[0].count = 37500;
                 vf->timer.timer[0].ctrl = 0xE2;
                 vf->timer.irq.enable |= 0x01;
-                printf("[GAME] Init done → idle at 0x%08X, timer+IRQ re-enabled\n", pc);
+                printf("[GAME] Init done → event system + IRQ enabled\n");
             }
 
             /* Phase 1: scheduler loop detected → re-copy modules + redirect */
@@ -3827,7 +3861,68 @@ void vflash_run_frame(VFlash *vf) {
         }
     }
 
-    vf->input_prev = vf->input;  /* update for next frame's edge detection */
+    /* C-side event pump: call game dispatcher directly each frame.
+     * Bypasses main CPU loop which gets stuck in IRQ mode. */
+    if (vf->has_rom && vf->frame_count > 30 && vf->cd && vf->cd->is_open) {
+        static int pump_active = 0;
+        if (!pump_active && *(uint32_t*)(vf->ram + 0xB909C0) != 0) {
+            pump_active = 1;
+            printf("[EVENT-PUMP] Dispatcher pump active\n");
+        }
+        if (pump_active) {
+            /* Save CPU state */
+            uint32_t save_pc = vf->cpu.r[15];
+            uint32_t save_sp = vf->cpu.r[13];
+            uint32_t save_lr = vf->cpu.r[14];
+            uint32_t save_cpsr = vf->cpu.cpsr;
+            uint32_t save_r0 = vf->cpu.r[0];
+            uint32_t save_r1 = vf->cpu.r[1];
+
+            /* Call dispatcher: cycle through event types 0-7 */
+            vf->cpu.r[0] = (uint32_t)(vf->frame_count % 8);
+            vf->cpu.r[1] = *(uint32_t*)(vf->ram + 0xB909C0);
+            vf->cpu.r[14] = 0x10FFF000; /* return to idle */
+            vf->cpu.r[15] = 0x10C1377C; /* dispatcher entry */
+            vf->cpu.r[13] = 0x10FFD000; /* separate stack */
+            vf->cpu.cpsr = 0x000000D3;  /* SVC, IRQ off */
+
+            /* Run up to 50K instructions */
+            arm9_run(&vf->cpu, 50000);
+
+            /* Check if dispatcher returned to idle or got stuck */
+            uint32_t end_pc = vf->cpu.r[15];
+            if (end_pc == 0x10FFF000 || end_pc == 0x10FFF00C ||
+                (end_pc >= 0x10C13780 && end_pc <= 0x10C13800)) {
+                /* Dispatcher returned normally — keep any side effects */
+                static int pump_log = 0;
+                if (pump_log < 5) {
+                    printf("[EVENT-PUMP] Dispatch returned at 0x%08X\n", end_pc);
+                    pump_log++;
+                }
+            } else {
+                /* Got stuck — restore state */
+                vf->cpu.r[15] = save_pc;
+                vf->cpu.r[13] = save_sp;
+                vf->cpu.r[14] = save_lr;
+                vf->cpu.cpsr = save_cpsr;
+                vf->cpu.r[0] = save_r0;
+                vf->cpu.r[1] = save_r1;
+            }
+            /* Always re-enable timer (game code might have disabled it) */
+            vf->timer.timer[0].load = 37500;
+            vf->timer.timer[0].count = 37500;
+            vf->timer.timer[0].ctrl = 0xE2;
+            vf->timer.irq.enable |= 0x01;
+            vf->timer.timer[0].irq_pending = 0;
+            vf->timer.irq.status = 0;
+            /* Restore CPU to idle with IRQ enabled */
+            vf->cpu.r[15] = 0x10FFF000;
+            vf->cpu.r[13] = 0x10FFE000;
+            vf->cpu.cpsr  = 0x00000053; /* SVC, IRQ enabled, C flag */
+        }
+    }
+
+    vf->input_prev = vf->input;
     vf->frame_count++;
 }
 
