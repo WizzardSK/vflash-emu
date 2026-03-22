@@ -3456,7 +3456,8 @@ void vflash_run_frame(VFlash *vf) {
         }
     }
 
-    ztimer_raise_irq(&vf->timer, IRQ_TIMER0);   /* vsync */
+    /* Don't force-raise timer IRQ — timer fires naturally via ztimer_tick.
+     * Force-raising caused IRQ storm (re-armed after every clear). */
 
     /* (task state dump moved to phase 2 above) */
     if (0 && vf->frame_count == 10 && vf->has_rom) {
