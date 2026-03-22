@@ -490,7 +490,7 @@ int arm9_step(ARM9 *cpu) {
         if (i == 0 && cpu->null_trap_enabled && inst_addr >= 0x10000100 && inst_addr < 0x10C00000) {
             static int ntp = 0;
             if (ntp < 50)
-                fprintf(stderr, "[NULL-TRAP] 0x%08X (from 0x%08X)\n", inst_addr, cpu->r[14]);
+                printf("[NULL-TRAP] 0x%08X (from 0x%08X)\n", inst_addr, cpu->r[14]);
             ntp++;
             /* Write stub: MOV R0,#0 (success); BX LR (return) */
             cpu->mem_write32(cpu->mem_ctx, inst_addr, 0xE3A00000); /* MOV R0,#0 */
