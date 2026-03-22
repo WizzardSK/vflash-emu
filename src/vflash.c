@@ -1589,50 +1589,26 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                              * 2. Enable MMU with page table from ROM
                              * 3. Set PC to kernel loop area */
                             vf->flash_preloaded = 1;
-                            vf->rom_remapped = 1;
-
-                            /* Copy ROM vectors + low code to low_ram (PA 0 space) */
-                            memcpy(vf->low_ram, vf->rom, sizeof(vf->low_ram));
-                            /* Patch low_ram[0] for dual safety:
-                             * - As DATA (LDR from NULL ptr): returns 0 (safe)
-                             * - As CODE (BLX to 0): executes NOP then BX LR (safe return)
-                             * Cannot use MOV R0,#0 at offset 0 because data reads
-                             * would get 0xE3A00000 (the instruction encoding). */
-                            *(uint32_t*)(vf->low_ram + 0x00) = 0x00000000; /* NOP/zero (ANDEQ) */
-                            *(uint32_t*)(vf->low_ram + 0x04) = 0xE3A00000; /* MOV R0, #0 */
-                            *(uint32_t*)(vf->low_ram + 0x08) = 0xE12FFF1E; /* BX LR */
+                            /* Keep rom_remapped=0: PA 0 reads ROM (needed for
+                             * flash init pool values). After MMU enable by init
+                             * function 0x704, VA 0 → SDRAM via page table. */
 
                             /* Build page table at RAM[0xA8000] (VA=0x100A8000).
                              * Boot code normally builds this dynamically. */
-                            /* Build page table matching real init (0x704):
-                             * Identity-map ALL 4096 sections (every 1MB),
-                             * then add cacheable bit for ROM and RAM areas. */
-                            {
-                                uint32_t *pt = (uint32_t*)(vf->ram + 0xA8000);
-                                /* Fill all 4096 entries: identity map, AP=full, domain=15 */
-                                for (int i = 0; i < 4096; i++)
-                                    pt[i] = (i << 20) | 0xDF2;
-                                /* Add cacheable bit (C=1, bit3) for ROM area (0-1MB) */
-                                pt[0x000] |= 0x08;
-                                pt[0x001] |= 0x08;
-                                /* Add cacheable bit for RAM (0x100-0x10F = 16MB) */
-                                for (int i = 0; i < 16; i++)
-                                    pt[0x100 + i] |= 0x08;
-                            }
-                            vf->cpu.cp15.ttb = 0x100A8000;
-                            vf->cpu.cp15.mmu_enabled = 1;
-                            vf->cpu.cp15.control = 0x00005005; /* MMU on, caches on */
-                            vf->cpu.cp15.domain = 0xFFFFFFFF; /* all domains = manager */
-                            tlb_flush();
-                            printf("[ROM-PRELOAD] MMU ON TTB=0x%08X (built page table)\n",
-                                   vf->cpu.cp15.ttb);
+                            /* DON'T enable MMU — let calibration run with MMU off.
+                             * Init function 0x704 in the flash code will build the
+                             * page table and enable MMU naturally after calibration. */
+                            vf->cpu.cp15.mmu_enabled = 0;
+                            vf->cpu.cp15.domain = 0xFFFFFFFF;
+                            printf("[ROM-PRELOAD] MMU OFF (init 0x704 will enable)\n");
 
-                            /* Jump to kernel loop area for Phase 0→99 detection */
-                            vf->cpu.r[15] = 0x100A0008;
-                            vf->cpu.r[13] = 0x10800000;
-                            vf->cpu.r13_irq = 0x107FB000;
-                            vf->cpu.cpsr  = 0x000000D3; /* SVC mode, IRQ disabled */
-                            printf("[ROM-PRELOAD] Kernel at 0x100A0008\n");
+                            /* Let boot continue naturally — DON'T skip calibration.
+                             * SDRAM always works in emulator, so calibration will pass.
+                             * The ROM code at 0x114 (LDR PC,=0xB8000804) will jump
+                             * to the flash window, run PLL+SDRAM cal, then continue
+                             * with init BLs → scheduler → full µMORE boot. */
+                            /* Don't modify PC — let ROM continue from after the STR */
+                            printf("[ROM-PRELOAD] Natural boot (no skip) — SDRAM should auto-pass\n");
                         }
                     }
                 }
