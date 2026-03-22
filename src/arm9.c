@@ -486,8 +486,9 @@ int arm9_step(ARM9 *cpu) {
         /* NULL pointer trap: when game code (LR in BOOT.BIN) calls through
          * a NULL pointer into BSS, auto-return to skip the call.
          * Only active for calls FROM BOOT.BIN code (0x10C00000+). */
-        if (i == 0 && inst_addr >= 0x10100000 && inst_addr < 0x10C00000
-            && cpu->r[14] >= 0x10C00000 && cpu->r[14] < 0x10E00000) {
+        static int game_active = 0;
+        if (inst_addr == 0x10C16CB8) game_active = 1;
+        if (i == 0 && game_active && inst_addr >= 0x10000100 && inst_addr < 0x10C00000) {
             static int ntp = 0;
             if (ntp < 50)
                 fprintf(stderr, "[NULL-TRAP] 0x%08X (from 0x%08X)\n", inst_addr, cpu->r[14]);

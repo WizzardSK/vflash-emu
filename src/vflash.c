@@ -2862,17 +2862,19 @@ void vflash_run_frame(VFlash *vf) {
                 /* Set scheduler state and jump to kernel code */
                 *(uint32_t*)(vf->ram + 0x3585E0) = 3;
 
-                /* Fill BSS area with BX LR (0xE12FFF1E) so any NULL function
-                 * pointer call returns cleanly instead of NOP sliding. */
+                /* Fill zero RAM with BX LR safety net.
+                 * Covers: low ROM BSS (0x10000-0x80000), BSS (0x1A55B0+), heap. */
                 {
-                    uint32_t bss_start = 0x1A55B0, bss_end = 0x3596A4;
-                    for (uint32_t a = bss_start; a < bss_end; a += 4)
-                        *(uint32_t*)(vf->ram + a) = 0xE12FFF1E; /* BX LR */
-                    /* Also fill heap area up to BOOT.BIN */
-                    for (uint32_t a = bss_end; a < 0xC00000; a += 4)
+                    int filled = 0;
+                    /* Low area: skip vectors/trampolines (0-0xFFFF) */
+                    for (uint32_t a = 0x10000; a < 0x80000; a += 4)
                         if (*(uint32_t*)(vf->ram + a) == 0)
-                            *(uint32_t*)(vf->ram + a) = 0xE12FFF1E;
-                    printf("[SCHED] Filled BSS+heap with BX LR (safety net)\n");
+                            { *(uint32_t*)(vf->ram + a) = 0xE12FFF1E; filled++; }
+                    /* BSS + heap */
+                    for (uint32_t a = 0x1A55B0; a < 0xC00000; a += 4)
+                        if (*(uint32_t*)(vf->ram + a) == 0)
+                            { *(uint32_t*)(vf->ram + a) = 0xE12FFF1E; filled++; }
+                    printf("[SCHED] Filled %d zero words with BX LR\n", filled);
                 }
 
                 /* Fix page table: identity map ALL 16MB RAM.
