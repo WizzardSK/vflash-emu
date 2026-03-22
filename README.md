@@ -282,10 +282,13 @@ Standard ARM dual-timer. Two timers per block at offsets +0x00 and +0x20:
 - **ARM LDM S-bit** — CPSR restored from SPSR on interrupt return
 - **Identity mapping** — MMU page table confirmed VA=PA for all 16MB RAM
 - **Preload**: kernel ROM[0xC02C]→RAM[0x9FFD4], modules ROM[0xAE010]→RAM[0xAC000], ROM code above 512KB
-- **Blocking**: µMORE kernel entry (0xA0FA0) runs but doesn't register tasks — execution context (registers, internal state) doesn't match what kernel expects from normal ROM init call chain
+- **Task dispatch WORKING** — manually populated task_table + task_list_head; µMORE IRQ handler dispatches and exits scheduler loop
+- **Task structures decoded**: TCB at 0xAC7D8 (stride 0x24, $SCB magic at +0xC), large context struct (+0x58 = saved ARM registers for context switch)
+- **Key functions found**: task_init (0x8B6CC), task_start (0x85E88), task_dispatch (0x86AE4), context_switch (0x89BA4), syscall_dispatch (0x8BE40)
+- **Blocking**: context switch format at task+0x58 not yet correct — handler dispatches but jumps to wrong address after context restore
 
 ### What doesn't work yet
-- **Game task registration** — kernel entry runs but task_table at 0x1A9440 stays empty; needs correct call context from ROM init (register values, stack state, µMORE internal flags)
+- **Game code execution** — task dispatch works but context switch restores wrong PC (need exact ARM register dump format at task+0x58)
 - **LCD controller** (PL111 at `0xC0000000`) — not implemented; video uses DMA blit path
 - **In-game audio** — `.snd` PCM WAV files not decoded (cutscene audio works)
 
