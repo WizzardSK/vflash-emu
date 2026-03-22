@@ -1421,14 +1421,6 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                     if (val + flush_size > VFLASH_RAM_SIZE)
                         flush_size = VFLASH_RAM_SIZE - val;
                     memcpy(vf->ram + val, vf->flash_buf, flush_size);
-                    /* IMMEDIATELY restore ROM init BLs and NOP hazardous ones.
-                     * Flash flush overwrites RAM[0x118+] with flash code.
-                     * We restore ROM code and NOP first 4 BLs (HW init). */
-                    if (val == 0x118 && vf->rom) {
-                        memcpy(vf->ram + 0x118, vf->rom + 0x118, 0xE00 - 0x118);
-                        for (int bi = 0; bi < 4; bi++)
-                            *(uint32_t*)(vf->ram + 0x118 + bi*4) = 0xE1A00000;
-                    }
                     printf("[FLASH] Remap=0x%X, flushed %u bytes to RAM[0x%X]\n",
                            val, flush_size, val);
 
@@ -1480,16 +1472,9 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                              * and refuses to register tasks if state != 3.
                              * On real HW this is set by earlier init stages. */
                             *(uint32_t*)(vf->ram + 0x3585E0) = 3;
-                            /* Skip flash dispatch loop: jump directly to ROM init
-                             * code at 0x118 AFTER restoring ROM content there.
-                             * This runs the init BLs without triggering flash remap. */
-                            memcpy(vf->ram + 0x118, vf->rom + 0x118, 0xE00 - 0x118);
-                            /* NOP out first 4 BLs that trigger flash remap.
-                             * Keep BL BSS_clear(0x128), BL data_init(0x12C),
-                             * MOV R0(0x130), BL cache_flush(0x134), LDR PC(0x138). */
-                            for (int bi = 0; bi < 4; bi++)
-                                *(uint32_t*)(vf->ram + 0x118 + bi*4) = 0xE1A00000;
-                            printf("[ROM-PRELOAD] ROM init at 0x118 (first 4 BLs nop'd)\n");
+                            /* Jump to scheduler directly (skip flash remap loop) */
+                            *(uint32_t*)(vf->flash_buf) = 0x10010234;
+                            printf("[ROM-PRELOAD] flash_buf → scheduler 0x10010234\n");
                         }
                     }
                 }
