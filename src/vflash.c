@@ -2862,13 +2862,34 @@ void vflash_run_frame(VFlash *vf) {
                 /* Set scheduler state and jump to kernel code */
                 *(uint32_t*)(vf->ram + 0x3585E0) = 3;
 
-                /* Fix page table: map BOOT.BIN at VA 0x10C/0x10D (identity) */
+                /* Fill BSS area with BX LR (0xE12FFF1E) so any NULL function
+                 * pointer call returns cleanly instead of NOP sliding. */
+                {
+                    uint32_t bss_start = 0x1A55B0, bss_end = 0x3596A4;
+                    for (uint32_t a = bss_start; a < bss_end; a += 4)
+                        *(uint32_t*)(vf->ram + a) = 0xE12FFF1E; /* BX LR */
+                    /* Also fill heap area up to BOOT.BIN */
+                    for (uint32_t a = bss_end; a < 0xC00000; a += 4)
+                        if (*(uint32_t*)(vf->ram + a) == 0)
+                            *(uint32_t*)(vf->ram + a) = 0xE12FFF1E;
+                    printf("[SCHED] Filled BSS+heap with BX LR (safety net)\n");
+                }
+
+                /* Fix page table: identity map ALL 16MB RAM.
+                 * BOOT.BIN page table has FAULT for many VA ranges
+                 * (0x10A, 0x10C, etc). Game code needs full access. */
                 {
                     uint32_t ttb_off = vf->cpu.cp15.ttb - 0x10000000;
-                    for (uint32_t mb = 0x10C; mb <= 0x10D; mb++)
-                        *(uint32_t*)(vf->ram + ttb_off + mb * 4) = (mb << 20) | 0xC02;
+                    int fixed = 0;
+                    for (uint32_t mb = 0x100; mb <= 0x10F; mb++) {
+                        uint32_t *l1 = (uint32_t*)(vf->ram + ttb_off + mb * 4);
+                        if ((*l1 & 3) == 0) { /* FAULT → add section mapping */
+                            *l1 = (mb << 20) | 0xC0E; /* section, cacheable, bufferable, AP=full */
+                            fixed++;
+                        }
+                    }
                     tlb_flush();
-                    printf("[SCHED] Mapped VA 0x10C/0x10D → identity\n");
+                    printf("[SCHED] Fixed %d FAULT entries in page table → identity\n", fixed);
                 }
                 /* LCD handle: [BC0A40] → handle_ptr, handle[0x5C] = framebuf.
                  * LCD init reads [handle+0x5C] and adds 0x20000 for palette.
