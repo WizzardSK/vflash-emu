@@ -2814,11 +2814,16 @@ void vflash_run_frame(VFlash *vf) {
 
                 /* Jump to game init (LCD + display setup).
                  * Found via LCD register (0xC0000084) reference chain. */
-                vf->cpu.cpsr = 0x00000013; /* SVC, IRQ+FIQ enabled */
+                /* Disable IRQs during game init to prevent IRQ from
+                 * overriding our PC before game code runs */
+                vf->cpu.cpsr = 0x00000093; /* SVC, IRQ disabled */
                 vf->cpu.r[15] = 0x10C16CB8; /* game init */
                 vf->cpu.r[13] = 0x10FFE000;
                 vf->cpu.r[14] = 0x10FFF000; /* return → idle */
-                printf("[SCHED] Phase 2: → GAME INIT at 0x10C16CB8\n");
+                /* Clear pending IRQ so it doesn't fire immediately */
+                vf->timer.timer[0].irq_pending = 0;
+                vf->timer.irq.status = 0;
+                printf("[SCHED] Phase 2: → GAME INIT at 0x10C16CB8 (IRQ disabled)\n");
             }
         }
 
