@@ -2749,11 +2749,11 @@ void vflash_run_frame(VFlash *vf) {
                 /* Populate task_table with pointers to task structs
                  * from module data (0x100AC7D8+). Each has TCB magic. */
                 {
-                    uint32_t tb = 0xAC7D8;
-                    uint32_t n = *(uint32_t*)(vf->ram + 0xAC004); /* slot count */
+                    uint32_t tb = 0xAC7D8; /* TCB structs, stride 0x24, magic at +0xC */
+                    uint32_t n = *(uint32_t*)(vf->ram + 0xAC004);
                     if (n > 6) n = 6;
                     for (uint32_t i = 0; i < n; i++)
-                        *(uint32_t*)(vf->ram + 0x1A9440 + i*4) = 0x10000000 + tb + i*0x74;
+                        *(uint32_t*)(vf->ram + 0x1A9440 + i*4) = 0x10000000 + tb + i*0x24;
                     printf("[SCHED] Phase 1: task_table[0..%u] populated\n", n);
                 }
                 vf->cpu.r[15] = 0x10FFF000;
