@@ -285,11 +285,12 @@ Standard ARM dual-timer. Two timers per block at offsets +0x00 and +0x20:
 - **Task dispatch WORKING** — manually populated task_table + task_list_head; µMORE IRQ handler dispatches and exits scheduler loop
 - **Task structures decoded**: TCB at 0xAC7D8 (stride 0x24, $SCB magic at +0xC), large context struct (+0x58 = saved ARM registers for context switch)
 - **Key functions found**: task_init (0x8B6CC), task_start (0x85E88), task_dispatch (0x86AE4), context_switch (0x89BA4), syscall_dispatch (0x8BE40)
-- **Blocking**: context switch format at task+0x58 not yet correct — handler dispatches but jumps to wrong address after context restore
+- **GAME CODE RUNNING** — game init at 0x10C16CB8 executes, calls LCD init (PL111 setup), deeper game functions
+- **Page table fix**: BOOT.BIN was unmapped (L1[0x10C] = FAULT) after init; added identity mapping so game code at VA 0x10C00000+ is accessible
+- **LCD handle stub**: allocated at heap area 0x10BF0000 with PL111 base at +0x5C
 
 ### What doesn't work yet
-- **Game code execution** — task dispatch works but context switch restores wrong PC (need exact ARM register dump format at task+0x58)
-- **LCD controller** (PL111 at `0xC0000000`) — not implemented; video uses DMA blit path
+- **Game rendering** — game init runs but LCD controller (PL111) not implemented; display output needs PL111 framebuffer support
 - **In-game audio** — `.snd` PCM WAV files not decoded (cutscene audio works)
 
 ## MJP / MIAV format
