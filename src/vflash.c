@@ -3209,9 +3209,12 @@ void vflash_run_frame(VFlash *vf) {
 
     vf->vid.fb_dirty = 0;
 
-    /* Re-enable timer at frame start (may have been disabled for IRQ delivery) */
-    if (vf->has_rom && vf->timer.timer[0].load > 0 && vf->timer.timer[0].ctrl == 0) {
-        vf->timer.timer[0].ctrl = 0x77;
+    /* Re-enable timer at frame start if it was disabled.
+     * µMORE services may disable the timer; re-enable for IRQ delivery. */
+    if (vf->has_rom && vf->timer.timer[0].load > 0 &&
+        (vf->timer.timer[0].ctrl & 0x80) == 0 && /* not enabled */
+        vf->boot_phase >= 300) { /* only after game launch */
+        vf->timer.timer[0].ctrl = 0xE2; /* enabled, periodic, 32-bit, IRQ */
         vf->timer.timer[0].count = vf->timer.timer[0].load;
     }
 
@@ -3400,26 +3403,46 @@ void vflash_run_frame(VFlash *vf) {
                        *(uint32_t*)(vf->ram + 0xC16CC0));
                 printf("[BOOT] RAM[0xC16D30] = %08X (expect E5933000)\n",
                        *(uint32_t*)(vf->ram + 0xC16D30));
-                /* Service at 0x109D11E0 is populated! Trigger warm reboot
-                 * to let ROM warm boot path use the service entry. */
-                printf("[BOOT] Triggering warm reboot → service at 0x109D11E0\n");
-                vf->misc_regs[0x0C >> 2] |= 0x02; /* warm boot flag */
-                arm9_reset(&vf->cpu);
-                vf->timer.timer[0].ctrl = 0x10;
-                vf->timer.timer[0].irq_pending = 0;
-                vf->timer.irq.status = 0;
-                vf->cpu.r[15] = 0x00000000;
-                vf->cpu.cpsr = 0x000000D3;
-                /* Re-patch SDRAM[0xFF98] for IRQ handling */
+                /* Service at 0x109D11E0 is populated with real code!
+                 * Call it directly with proper register setup. */
+                printf("[BOOT] Service 0x109D11E0 populated — calling directly\n");
+                /* Re-patch IRQ handler (BOOT.BIN init overwrites SDRAM[0xFF98]) */
                 {
                     int32_t b_off2 = (int32_t)(0xFFF040 - (0xFF98 + 8)) >> 2;
                     *(uint32_t*)(vf->ram + 0xFF98) = 0xEA000000 | (b_off2 & 0xFFFFFF);
                 }
-                vf->atapi.reboot_count++;
-                break; /* exit the slice loop to start fresh */
+                /* Re-enable MMU with full RAM identity map */
+                vf->cpu.cp15.ttb = 0x100A8000;
+                vf->cpu.cp15.mmu_enabled = 1;
+                vf->cpu.cp15.control = 0x0000507D;
+                {
+                    uint32_t ttb_off = 0xA8000;
+                    for (uint32_t mb = 0x100; mb <= 0x10F; mb++) {
+                        uint32_t *l1 = (uint32_t*)(vf->ram + ttb_off + mb*4);
+                        if ((*l1 & 3) == 0)
+                            *l1 = (mb << 20) | 0xC0E;
+                    }
+                    tlb_flush();
+                }
+                /* Enable timer */
+                vf->timer.timer[0].load = 37500;
+                vf->timer.timer[0].count = 37500;
+                vf->timer.timer[0].ctrl = 0xE2;
+                vf->timer.irq.enable |= 0x01;
+                vf->timer.irq.fiq_sel = 0;
+                /* Jump to service entry with R0=2 (warm boot mode) */
+                vf->cpu.cpsr = 0x000000D3;
+                vf->cpu.r[15] = 0x109D11E0;
+                vf->cpu.r[13] = 0x10FFD000;
+                vf->cpu.r[14] = 0x10FFF000;
+                vf->cpu.r[0] = 2; /* warm boot indicator */
+                vf->cpu.r13_irq = 0x10800000;
+                vf->cpu.null_trap_enabled = 1;
+                vf->boot_phase = 300;
+                printf("[BOOT] → 0x109D11E0 (R0=2, SP=0x10FFD000)\n");
             }
 
-            /* Phase 101 continued — only reached if warm reboot above didn't fire */
+            /* Phase 101b: old game launch code (kept for reference) */
             if (0) {
                 /* BOOT.BIN init may have overwritten game code area.
                  * Re-load from disc to ensure integrity. */
