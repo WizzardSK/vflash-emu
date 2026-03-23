@@ -1975,11 +1975,28 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                 vf->cpu.cp15.mmu_enabled = 1;
                 vf->cpu.cp15.control = 0x0000507D;
                 tlb_flush();
-                vf->cpu.r[15] = 0x100A0008; /* kernel loop area */
+                /* After warm reboot, go to warm boot entry (BOOT.BIN).
+                 * Reboot handler set RAM[0xFFC8] → BOOT.BIN at 0x10C00010.
+                 * Also fix interrupt routing: force timer to IRQ (not FIQ). */
+                vf->timer.irq.fiq_sel = 0; /* timer → IRQ, not FIQ */
+                /* Patch IRQ vector (SDRAM[0x18]) to branch to our handler
+                 * which clears timer. Real µMORE IRQ dispatch at 0x100873D0
+                 * will be called via the vector chain at RAM[0xFF80+]. */
+                {
+                    uint32_t h = 0xFFE000; /* our timer clear handler */
+                    int32_t irq_off = (int32_t)(h - (0x18 + 8)) >> 2;
+                    *(uint32_t*)(vf->ram + 0x18) = 0xEA000000 | (irq_off & 0xFFFFFF);
+                }
+                /* Disable timer during BOOT.BIN init to prevent IRQ storm */
+                vf->timer.timer[0].ctrl = 0x10; /* disable */
+                vf->timer.timer[0].irq_pending = 0;
+                vf->timer.irq.status = 0;
+                /* Jump to BOOT.BIN entry (warm boot path) */
+                vf->cpu.r[15] = 0x10C00010;
                 vf->cpu.r[13] = 0x10FFE000;
                 vf->cpu.r13_irq = 0x10800000;
-                vf->cpu.cpsr = 0x000000D3; /* SVC, IRQ disabled */
-                printf("[REBOOT] Skip ROM re-boot → kernel 0x100A0008\n");
+                vf->cpu.cpsr = 0x000000D3; /* SVC, IRQ+FIQ disabled */
+                printf("[REBOOT] → BOOT.BIN at 0x10C00010 (IRQ off, BOOT.BIN enables)\n");
             }
             return;
         }
