@@ -546,17 +546,16 @@ int arm9_step(ARM9 *cpu) {
                     sbl++;
                 }
             }
-            /* Detect exception taken during game init */
-            if (inst_addr == 0x10000004 || inst_addr == 0x10000008 ||
-                inst_addr == 0x1000000C || inst_addr == 0x10000010) {
-                static int exc_log = 0;
-                if (exc_log < 3) {
-                    const char *names[] = {"","UNDEF","SWI","PABT","DABT"};
-                    int idx = (inst_addr - 0x10000000) / 4;
-                    printf("[EXCEPTION] %s at PC=0x%08X LR=0x%08X CPSR=0x%08X\n",
-                           idx < 5 ? names[idx] : "?",
-                           inst_addr, cpu->r[14], CPSR);
-                    exc_log++;
+            /* Track when game code (0x10C00000+) transitions to low addr */
+            {
+                static int game_started = 0, crash_log = 0;
+                if (inst_addr >= 0x10C00000 && inst_addr < 0x10E00000)
+                    game_started = 1;
+                if (game_started && !crash_log && inst_addr < 0x10001000 &&
+                    inst_addr != 0x18 && inst_addr != 0x1C) {
+                    printf("[GAME-CRASH] PC=0x%08X insn=0x%08X LR=0x%08X SP=0x%08X CPSR=0x%08X\n",
+                           inst_addr, i, cpu->r[14], cpu->r[13], CPSR);
+                    crash_log = 1;
                 }
             }
             /* Trace task_start function */
@@ -568,6 +567,22 @@ int arm9_step(ARM9 *cpu) {
                     ts_log++;
                 }
             }
+        }
+
+        /* Catch BLX to NULL (address 0) — game code calls NULL func pointers */
+        if (inst_addr == 0 && cpu->null_trap_enabled) {
+            static int null_blx = 0;
+            if (null_blx < 5)
+                printf("[NULL-BLX] PC=0 LR=0x%08X R0=0x%08X SP=0x%08X\n",
+                       cpu->r[14], cpu->r[0], cpu->r[13]);
+            null_blx++;
+            cpu->r[0] = 0;
+            if (cpu->r[14] != 0)
+                PC = cpu->r[14] & ~3u;
+            else
+                PC = 0x10FFF000; /* fallback to idle */
+            cpu->cycles += 1;
+            return 1;
         }
 
         /* HLE service intercept: check BEFORE null trap (services are at zero-init addresses) */
