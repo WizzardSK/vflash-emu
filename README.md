@@ -31,8 +31,8 @@ Background voice/SFX audio plays automatically from 561 WAV files on disc.
 
 ## Status
 
-**Full boot chain working** — ROM → µMORE kernel → BOOT.BIN init (with MMU) → game init.
-Game code executes from BOOT.BIN, calls µMORE services via HLE.
+**µMORE RTOS kernel running natively** — ROM → kernel → BOOT.BIN init → µMORE service entry → native scheduler.
+BOOT.BIN init populates real ARM code at service entry points. µMORE scheduler executes natively with timer IRQs.
 
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spider-Man.
 
@@ -48,16 +48,18 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | Task registration ($TCB) | ✅ 0x100AC0E0 |
 | Timer + IRQ vector chain | ✅ ROM→SDRAM[0xFF98]→handler |
 | **BOOT.BIN init** | ✅ Runs with own MMU (TTB=0x10C08000) |
-| **Game init (0x10C16CC0)** | ✅ Calls µMORE services |
-| **Game main loop** | 🔧 Stuck — needs µMORE service HLE |
+| **Service entry (0x109D11E0)** | ✅ Real code, launches µMORE scheduler |
+| **µMORE native scheduler** | ✅ Runs at 0x10A1xxxx with timer IRQs |
+| **Event controller** | ✅ Bit5 status for event pending |
+| **Display init** | 🔧 Stuck in NOR flash polling loop |
 
 ### Remaining for gameplay
 
-Game init executes from BOOT.BIN and calls µMORE RTOS services (interrupt
-control, event dispatch, heap allocation). Currently HLE stubs return safe
-defaults but the game can't complete initialization without real service
-implementations. Need to HLE key µMORE primitives: int_disable/restore,
-event_wait, heap_alloc, service_register.
+µMORE kernel runs natively after BOOT.BIN init populates service entry at 0x109D11E0.
+Scheduler executes real kernel code at 0x10A219xx/0x10A1C5xx with timer IRQs (~66/frame).
+Currently stuck in display initialization loop that polls NOR flash status (0xB8000004)
+and RAM completion flags at 0x10BBCFFx. Need to emulate flash write completion sequence
+or identify the exact loop exit condition.
 
 ### Asset Browser
 
@@ -91,7 +93,8 @@ ROM[0x00] → flash copy → flash remap (0x118)
   → scheduler (0x10010234) → heap (1MB) → task_start ($TCB)
   → timer + IRQ (ROM→SDRAM[0xFF98]→handler)
   → BOOT.BIN init (0x10C0011C, own MMU at TTB=0x10C08000)
-  → game init (0x10C16CC0) → µMORE service calls
+  → service entry (0x109D11E0, real code from BOOT.BIN init)
+  → µMORE native scheduler (0x10A219xx, timer IRQs active)
 ```
 
 ### Physical Memory Map (ZEVIO 1020)
@@ -128,8 +131,11 @@ ROM[0x00] → flash copy → flash remap (0x118)
 | Timer IRQ during init | BOOT.BIN crashed on IRQ storm | Disable timer during BOOT.BIN init |
 | NULL BLX (PC=0) | Game crash on NULL function ptr | Catch and return to caller |
 | IRQ vector via low_ram | IRQ never reached handler (PA 0 = ROM) | Patch SDRAM[0xFF98] in ROM vector chain |
+| BOOT.BIN overwrites IRQ | SDRAM[0xFF98] restored by init | Re-patch after BOOT.BIN init completes |
 | Game init at 0x10C16CB8 | POP {PC} = immediate return | Use real entry at 0x10C16CC0 |
 | Phase 100 PC range | Kernel idle at 0x10095Bxx not detected | Widen range to 0x10090000-0x10110000 |
+| Event controller bit5 | Scheduler stuck in event wait | Return bit5 when timer IRQ pending |
+| HLE blocked real code | Service at 0x109D11E0 intercepted | Skip HLE when memory is non-zero |
 
 ### Subsystems
 - ATAPI CD-ROM: INQUIRY, READ(10), READ CD, READ TOC, READ CAPACITY, MODE SENSE
