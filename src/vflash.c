@@ -3123,6 +3123,14 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     }
 
     if (addr >= 0x10190000 && addr < 0x10C00000) {
+        /* Only intercept if memory contains zeros (unpopulated BSS).
+         * If real code exists (written by BOOT.BIN init), let it execute. */
+        {
+            VFlash *vfp = (VFlash *)ctx;
+            uint32_t roff = addr - 0x10000000;
+            if (roff < VFLASH_RAM_SIZE && *(uint32_t*)(vfp->ram + roff) != 0)
+                return 0; /* real code present, don't intercept */
+        }
         static int hle_logged = 0;
         if (hle_logged < 200) {
             /* Only log unique addresses (not repeated int_disable) */
@@ -3315,10 +3323,8 @@ void vflash_run_frame(VFlash *vf) {
                 }
             }
 
-            /* After kernel stabilizes, launch BOOT.BIN init.
-             * DISABLED: let natural warm reboot flow handle this instead.
-             * Phase 200 (force init task) → warm reboot → ROM warm boot. */
-            if (0 && phase == 99 && vf->frame_count > 55 &&
+            /* After kernel stabilizes, launch BOOT.BIN init. */
+            if (phase == 99 && vf->frame_count > 55 &&
                 pc >= 0x10090000 && pc < 0x10110000) {
                 phase = 100;
                 /* Fix page table: identity map ALL RAM */
@@ -3376,6 +3382,14 @@ void vflash_run_frame(VFlash *vf) {
                 uint32_t svc = *(uint32_t*)(vf->ram + 0x9A0950);
                 printf("[BOOT] BSS[0x109A0950] = 0x%08X (%s)\n",
                        svc, svc == 0xE12FFF1E ? "BX LR stub" : "populated!");
+                /* Check µMORE service entry at 0x109D11E0 */
+                printf("[BOOT] [0x109D11E0] = %08X %08X %08X %08X\n",
+                       *(uint32_t*)(vf->ram+0x9D11E0), *(uint32_t*)(vf->ram+0x9D11E4),
+                       *(uint32_t*)(vf->ram+0x9D11E8), *(uint32_t*)(vf->ram+0x9D11EC));
+                /* Check warm boot vectors */
+                printf("[BOOT] [0x10FFC8] = %08X %08X %08X %08X\n",
+                       *(uint32_t*)(vf->ram+0xFFC8), *(uint32_t*)(vf->ram+0xFFCC),
+                       *(uint32_t*)(vf->ram+0xFFD0), *(uint32_t*)(vf->ram+0xFFD4));
                 /* Check idle stub integrity after BOOT.BIN init */
                 printf("[BOOT] Idle stub: [0xFFF000]=%08X [0xFFF004]=%08X [0xFFF008]=%08X [0xFFF00C]=%08X\n",
                        *(uint32_t*)(vf->ram + 0xFFF000), *(uint32_t*)(vf->ram + 0xFFF004),
@@ -3386,6 +3400,27 @@ void vflash_run_frame(VFlash *vf) {
                        *(uint32_t*)(vf->ram + 0xC16CC0));
                 printf("[BOOT] RAM[0xC16D30] = %08X (expect E5933000)\n",
                        *(uint32_t*)(vf->ram + 0xC16D30));
+                /* Service at 0x109D11E0 is populated! Trigger warm reboot
+                 * to let ROM warm boot path use the service entry. */
+                printf("[BOOT] Triggering warm reboot → service at 0x109D11E0\n");
+                vf->misc_regs[0x0C >> 2] |= 0x02; /* warm boot flag */
+                arm9_reset(&vf->cpu);
+                vf->timer.timer[0].ctrl = 0x10;
+                vf->timer.timer[0].irq_pending = 0;
+                vf->timer.irq.status = 0;
+                vf->cpu.r[15] = 0x00000000;
+                vf->cpu.cpsr = 0x000000D3;
+                /* Re-patch SDRAM[0xFF98] for IRQ handling */
+                {
+                    int32_t b_off2 = (int32_t)(0xFFF040 - (0xFF98 + 8)) >> 2;
+                    *(uint32_t*)(vf->ram + 0xFF98) = 0xEA000000 | (b_off2 & 0xFFFFFF);
+                }
+                vf->atapi.reboot_count++;
+                break; /* exit the slice loop to start fresh */
+            }
+
+            /* Phase 101 continued — only reached if warm reboot above didn't fire */
+            if (0) {
                 /* BOOT.BIN init may have overwritten game code area.
                  * Re-load from disc to ensure integrity. */
                 if (vf->cd && vf->cd->is_open) {
