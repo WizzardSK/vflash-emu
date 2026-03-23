@@ -3339,6 +3339,28 @@ void vflash_run_frame(VFlash *vf) {
                 printf("[GAME] Init done → event system + IRQ enabled\n");
             }
 
+            /* Phase 300: BOOT.BIN done → idle → launch game init */
+            if ((phase == 99 || phase == 200) && vf->frame_count > 110 &&
+                (pc == 0x10FFF00C || pc == 0x10FFF000)) {
+                phase = 300;
+                printf("[GAME] BOOT.BIN init done! Launching game at 0x10C16CB8\n");
+                /* Check if BOOT.BIN populated BSS service functions */
+                printf("[GAME] BSS[0x109A0950]=%08X BSS[0x109A0868]=%08X\n",
+                       *(uint32_t*)(vf->ram + 0x9A0950),
+                       *(uint32_t*)(vf->ram + 0x9A0868));
+                vf->cpu.null_trap_enabled = 1;
+                vf->cpu.r[15] = 0x10C16CB8;
+                vf->cpu.r[13] = 0x10FFE000;
+                vf->cpu.r[14] = 0x10FFF000;
+                vf->cpu.cpsr  = 0x000000D3; /* SVC, IRQ off during init */
+                /* Re-enable timer for game */
+                vf->timer.timer[0].load = 37500;
+                vf->timer.timer[0].count = 37500;
+                vf->timer.timer[0].ctrl = 0xE2;
+                vf->timer.irq.enable |= 0x01;
+                vf->timer.irq.fiq_sel = 0;
+            }
+
             /* Phase 200: force task launch after scheduler stabilizes.
              * Scheduler can't dispatch tasks (IRQ chain broken).
              * Directly switch CPU to task entry point. */
