@@ -925,6 +925,7 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
     if (addr >= VFLASH_IO_BASE) {
         uint32_t off = addr - VFLASH_IO_BASE;
 
+
         /* Primary IRQ + timers: 0x80000000+0x000–0x1FF */
         if (off < 0x200)
             return ztimer_read(&vf->timer, off);
@@ -963,9 +964,12 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             if (foff < 0x800) {
                 /* Controller status registers */
                 switch (foff) {
-                    case 0x00: return 0x80;   /* Flash ready (bit7) */
-                    case 0x04: return 0x80;   /* Flash ready (bit7) */
-                    case 0x08: return 0;      /* Operation complete */
+                    /* NOR flash status: return 0 (no data) so polling loops
+                     * see empty accumulator and take the "complete" path. */
+                    case 0x00: return 0;
+                    case 0x04: return 0;
+                    case 0x08: return 0;
+                    case 0x0C: return 0;
                     case 0x34: return 0x40;   /* Status: ready */
                     case 0x40: return 1;
                 }
