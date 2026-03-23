@@ -963,7 +963,8 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             if (foff < 0x800) {
                 /* Controller status registers */
                 switch (foff) {
-                    case 0x00: return 0;
+                    case 0x00: return 0x80;   /* Flash ready (bit7) */
+                    case 0x04: return 0x80;   /* Flash ready (bit7) */
                     case 0x08: return 0;      /* Operation complete */
                     case 0x34: return 0x40;   /* Status: ready */
                     case 0x40: return 1;
@@ -1169,7 +1170,8 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             uint32_t ureg = off - 0x10020000u;
             switch (ureg) {
                 case 0x00: return vf->timer.irq.status & vf->timer.irq.enable; /* IRQ status */
-                case 0x14: return 0; /* event controller: no pending events */
+                case 0x14: /* event controller status: bit5 = event pending */
+                    return (vf->timer.irq.status & vf->timer.irq.enable) ? 0x20 : 0;
                 case 0x18: return 0x90;      /* UARTFR: TX empty, RX empty */
                 case 0x24: return 0;         /* UARTIBRD */
                 case 0x28: return 0;         /* UARTFBRD */
@@ -3249,6 +3251,30 @@ void vflash_run_frame(VFlash *vf) {
                 vf->boot_phase = 301;
                 printf("[SCHED] Force-enabled IRQ at frame %llu PC=0x%08X\n",
                        vf->frame_count, pc);
+                /* Dump scheduler idle loop code */
+                printf("[SCHED] Idle loop disassembly:\n");
+                for (uint32_t da = 0xA21980; da < 0xA21A20; da += 4) {
+                    uint32_t insn = *(uint32_t*)(vf->ram + da);
+                    printf("[SCHED]  %08X: %08X\n", 0x10000000+da, insn);
+                }
+                /* Also dump the next loop area (detected at runtime) */
+                printf("[SCHED] Area at 0x10A1C540:\n");
+                for (uint32_t da = 0xA1C540; da < 0xA1C5A0; da += 4) {
+                    uint32_t insn = *(uint32_t*)(vf->ram + da);
+                    printf("[SCHED]  %08X: %08X\n", 0x10000000+da, insn);
+                }
+            }
+
+            /* Dump scheduler loop once at frame 85 (disabled) */
+            if (0 && vf->boot_phase >= 300 && vf->boot_phase < 400 && vf->frame_count == 85) {
+                vf->boot_phase = 400;
+                printf("[SCHED] Loop dump at frame 85, PC=0x%08X:\n", pc);
+                /* Dump around current PC */
+                uint32_t dump_base = (pc - 0x10000000) & ~0x3F;
+                for (uint32_t da = dump_base; da < dump_base + 0x80; da += 4) {
+                    if (da < VFLASH_RAM_SIZE)
+                        printf("[SCHED]  %08X: %08X\n", 0x10000000+da, *(uint32_t*)(vf->ram+da));
+                }
             }
 
             /* µMORE kernel running: enable timer + FIQ after init.
