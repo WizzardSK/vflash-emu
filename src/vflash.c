@@ -3142,10 +3142,39 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
 
     if (addr >= 0x10190000 && addr < 0x10C00000) {
         static int hle_logged = 0;
-        if (hle_logged < 50) {
-            printf("[HLE] BSS call 0x%08X R0=0x%08X R1=0x%08X LR=0x%08X\n",
-                   addr, cpu->r[0], cpu->r[1], cpu->r[14]);
+        if (hle_logged < 200) {
+            /* Only log unique addresses (not repeated int_disable) */
+            static uint32_t last_addr = 0;
+            static int repeat_count = 0;
+            if (addr == last_addr) {
+                repeat_count++;
+                if (repeat_count <= 3 || (repeat_count % 100 == 0))
+                    printf("[HLE] BSS call 0x%08X R0=0x%08X R1=0x%08X LR=0x%08X (x%d)\n",
+                           addr, cpu->r[0], cpu->r[1], cpu->r[14], repeat_count);
+            } else {
+                if (repeat_count > 3)
+                    printf("[HLE] ... (repeated %d times)\n", repeat_count);
+                repeat_count = 1;
+                last_addr = addr;
+                printf("[HLE] BSS call 0x%08X R0=0x%08X R1=0x%08X LR=0x%08X\n",
+                       addr, cpu->r[0], cpu->r[1], cpu->r[14]);
+            }
             hle_logged++;
+        }
+
+        /* Log call chain for ALL BSS calls */
+        {
+            static int chain_logged = 0;
+            if (chain_logged < 20) {
+                VFlash *vfp = (VFlash *)ctx;
+                uint32_t caller = (cpu->r[14] & ~3u) - 4;
+                uint32_t caller_insn = 0;
+                if (caller >= 0x10000000 && caller < 0x11000000)
+                    caller_insn = *(uint32_t*)(vfp->ram + (caller - 0x10000000));
+                printf("[HLE] Chain: caller=%08X insn=%08X → target=%08X R2=%08X R3=%08X\n",
+                       caller, caller_insn, addr, cpu->r[2], cpu->r[3]);
+                chain_logged++;
+            }
         }
 
         /* HLE for specific µMORE services */
@@ -3160,6 +3189,8 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
             cpu->r[15] = cpu->r[14] & ~3u;
             return 1;
         }
+
+        /* (chain logging moved above) */
 
         /* Default: return safe stub address */
         {
@@ -3360,6 +3391,11 @@ void vflash_run_frame(VFlash *vf) {
                 uint32_t svc = *(uint32_t*)(vf->ram + 0x9A0950);
                 printf("[BOOT] BSS[0x109A0950] = 0x%08X (%s)\n",
                        svc, svc == 0xE12FFF1E ? "BX LR stub" : "populated!");
+                /* Check idle stub integrity after BOOT.BIN init */
+                printf("[BOOT] Idle stub: [0xFFF000]=%08X [0xFFF004]=%08X [0xFFF008]=%08X [0xFFF00C]=%08X\n",
+                       *(uint32_t*)(vf->ram + 0xFFF000), *(uint32_t*)(vf->ram + 0xFFF004),
+                       *(uint32_t*)(vf->ram + 0xFFF008), *(uint32_t*)(vf->ram + 0xFFF00C));
+                printf("[BOOT] TTB=0x%08X MMU=%d\n", vf->cpu.cp15.ttb, vf->cpu.cp15.mmu_enabled);
                 /* Check BOOT.BIN integrity at game launch */
                 printf("[BOOT] RAM[0xC16CC0] = %08X (expect E52DE004)\n",
                        *(uint32_t*)(vf->ram + 0xC16CC0));
