@@ -3293,12 +3293,11 @@ void vflash_run_frame(VFlash *vf) {
                 }
                 /* Redirect IRQ vector chain to our handler.
                  * ROM[0x18] → ROM[0xD44]=0x1000FF98 → SDRAM[0xFF98].
-                 * Overwrite SDRAM[0xFF98] with branch to our timer handler.
-                 * This bypasses µMORE's uninitialized IRQ dispatcher. */
+                 * µMORE IRQ dispatch at 0x100873D0 crashes with uninitialized tables.
+                 * Patch SDRAM[0xFF98] to branch to our simple timer handler. */
                 {
                     int32_t b_off = (int32_t)(0xFFF040 - (0xFF98 + 8)) >> 2;
                     *(uint32_t*)(vf->ram + 0xFF98) = 0xEA000000 | (b_off & 0xFFFFFF);
-                    /* Also BX LR stub for other exceptions */
                     *(uint32_t*)(vf->ram + 0xFFF080) = 0xE1B0F00E; /* MOVS PC,LR */
                 }
                 /* IRQ wrapper at 0xFFF040 */
