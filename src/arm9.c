@@ -546,17 +546,22 @@ int arm9_step(ARM9 *cpu) {
                     sbl++;
                 }
             }
-            /* Trace the actual I/O read in dispatch path */
-            if (inst_addr == 0x10095B20) { /* LDR R3,[R3,R2,LSL#16] */
-                static int io_log = 0;
-                if (io_log < 3) {
-                    uint32_t base = cpu->r[3];
-                    uint32_t bank = cpu->r[2];
-                    uint32_t addr = base + (bank << 16);
-                    printf("[IO-READ] base=0x%08X bank=%d addr=0x%08X\n",
-                           base, bank, addr);
+            /* Trace scheduler when it exits wait loop (event detected) */
+            if (inst_addr == 0x10095B38) { /* after BEQ skip → event path */
+                static int evt_log = 0;
+                if (evt_log < 3)
+                    printf("[SCHED-EVT] Event! R0=%08X R1=%08X R2=%08X R3=%08X SP=%08X\n",
+                           cpu->r[0], cpu->r[1], cpu->r[2], cpu->r[3], cpu->r[13]);
+                evt_log++;
+            }
+            /* Detect when PC goes to garbage (>0x11000000) */
+            {
+                static int garbage_log = 0;
+                if (inst_addr > 0x11000000 && inst_addr < 0xF0000000 && garbage_log < 3) {
+                    printf("[GARBAGE] PC=%08X insn=%08X LR=%08X SP=%08X CPSR=%08X\n",
+                           inst_addr, i, cpu->r[14], cpu->r[13], CPSR);
+                    garbage_log++;
                 }
-                io_log++;
             }
             /* Trace task_start function */
             if (inst_addr >= 0x10085E50 && inst_addr <= 0x10085F50) {
