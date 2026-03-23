@@ -3291,11 +3291,14 @@ void vflash_run_frame(VFlash *vf) {
                     vf->timer.irq.fiq_sel = 0;
                     printf("[IRQ] Direct vector → handler at 0x%08X\n", 0x10000000 + h);
                 }
-                /* Redirect IRQ vector chain to our handler.
-                 * ROM[0x18] → ROM[0xD44]=0x1000FF98 → SDRAM[0xFF98].
-                 * µMORE IRQ dispatch at 0x100873D0 crashes with uninitialized tables.
-                 * Patch SDRAM[0xFF98] to branch to our simple timer handler. */
+                /* Fix µMORE IRQ dispatcher: populate dispatch table entries.
+                 * µMORE handler at 0x100873D0 reads [0x100857B8] for handler addr.
+                 * Point it to our timer handler so dispatch works properly.
+                 * Also keep SDRAM[0xFF98] redirect as fallback. */
                 {
+                    /* Populate dispatch table with our timer handler */
+                    *(uint32_t*)(vf->ram + 0x857B8) = 0x10FFF040;
+                    /* Also redirect SDRAM[0xFF98] as insurance */
                     int32_t b_off = (int32_t)(0xFFF040 - (0xFF98 + 8)) >> 2;
                     *(uint32_t*)(vf->ram + 0xFF98) = 0xEA000000 | (b_off & 0xFFFFFF);
                     *(uint32_t*)(vf->ram + 0xFFF080) = 0xE1B0F00E; /* MOVS PC,LR */
@@ -3413,12 +3416,30 @@ void vflash_run_frame(VFlash *vf) {
                         printf("[BOOT] Re-loaded BOOT.BIN (%u bytes)\n", max_sz);
                     }
                 }
-                /* Now launch game init */
+                /* Re-patch IRQ handler — BOOT.BIN init overwrites SDRAM[0xFF98]
+                 * with its own vector table (LDR PC,[PC,#0x18]). Re-install
+                 * our simple timer handler to prevent crash. */
+                {
+                    int32_t b_off = (int32_t)(0xFFF040 - (0xFF98 + 8)) >> 2;
+                    *(uint32_t*)(vf->ram + 0xFF98) = 0xEA000000 | (b_off & 0xFFFFFF);
+                    printf("[BOOT] Re-patched SDRAM[0xFF98] → timer handler\n");
+                }
+
+                /* Set init flags so game code progresses:
+                 * [0x10BBAE40] = 5: game_init_poll returns 1 (ready)
+                 * [0x10BE49E0] = 1: game main doesn't skip (state != 0) */
+                *(uint32_t*)(vf->ram + 0xBBAE40) = 5;
+                *(uint16_t*)(vf->ram + 0xBE49E0) = 1;
+                printf("[GAME] Set init flags: [0x10BBAE40]=5 [0x10BE49E0]=1\n");
+
+                /* Launch game main function (0x10CFAEA0).
+                 * This is the full game entry: prologue → init → game loop.
+                 * Function: PUSH {R4-R11,LR}; ...; BL game_init; game_loop */
                 vf->cpu.cpsr = 0x000000D3;
-                vf->cpu.r[15] = 0x10C16CC0;
-                vf->cpu.r[13] = 0x10FFE000;
+                vf->cpu.r[15] = 0x10CFAEA0;
+                vf->cpu.r[13] = 0x10FFD000; /* plenty of stack */
                 vf->cpu.r[14] = 0x10FFF000;
-                printf("[GAME] Launching game init at 0x10C16CC0\n");
+                printf("[GAME] Launching game main at 0x10CFAEA0\n");
             }
 
             /* Phase 102: game init done → set up event system + IRQ */
