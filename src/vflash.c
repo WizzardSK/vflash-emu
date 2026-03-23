@@ -3312,6 +3312,25 @@ void vflash_run_frame(VFlash *vf) {
                 printf("[GAME] Init done → event system + IRQ enabled\n");
             }
 
+            /* Phase 200: force task launch after scheduler stabilizes.
+             * Scheduler can't dispatch tasks (IRQ chain broken).
+             * Directly switch CPU to task entry point. */
+            if (phase == 99 && vf->frame_count > 100 &&
+                pc >= 0x10000000 && pc < 0x10100000) {
+                phase = 200;
+                /* Task TCB at 0x100AC0E0:
+                 * entry=0x100113DC, stack=0x101D42A8, size=0x4000 */
+                uint32_t task_entry = 0x100113DC;
+                uint32_t task_stack = 0x101D42A8;
+                vf->cpu.r[15] = task_entry;
+                vf->cpu.r[13] = task_stack;
+                vf->cpu.r[14] = 0x10095B54; /* return to scheduler idle */
+                vf->cpu.cpsr  = 0x00000053; /* SVC, IRQ enabled */
+                vf->cpu.null_trap_enabled = 1;
+                printf("[TASK-LAUNCH] Forcing task at 0x%08X SP=0x%08X\n",
+                       task_entry, task_stack);
+            }
+
             /* Phase 1: scheduler loop detected → re-copy modules + redirect */
             if (phase == 0 && (pc >= 0x1007FFC0 && pc <= 0x10080060)) {
                 phase = 1;
