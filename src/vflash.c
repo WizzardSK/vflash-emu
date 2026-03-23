@@ -1185,7 +1185,10 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             if (rreg >= 0xF0 && rreg < 0x100)
                 return vf->rtc_regs[(rreg - 0xF0) >> 2];
             switch (rreg) {
-                case 0x00:  return 0x67000000; /* RTCDR: time */
+                case 0x00:  { /* RTCDR: running time counter */
+                    static uint32_t rtc_counter = 0x67000000;
+                    return rtc_counter++;
+                }
                 case 0x14:  return 0;          /* RTCRIS */
                 case 0xFE0: return 0x31;       /* PL031 PID0 */
                 case 0xFE4: return 0x10;       /* PL031 PID1 */
@@ -1833,7 +1836,7 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
              * ROM callback at 0x1880 writes 1 here to reboot.
              * Simulate warm reboot: set warm boot flag (bit1 of
              * boot status at 0x900A000C) and restart from ROM addr 0. */
-            if (sreg == 0x08 && val == 1 && vf->has_rom) {
+            if (sreg == 0x08 && (val == 1 || val == 2) && vf->has_rom) {
                 vf->atapi.reboot_count++;
                 printf("[REBOOT] Warm reboot #%d triggered (write 1 to 0x900A0008)\n",
                        vf->atapi.reboot_count);
@@ -3016,9 +3019,16 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         }
     }
 
-    /* Intercept scheduler init: set sched_state=3 before task_start.
-     * task_start at 0x10085E50 checks sched_state and refuses if != 3.
-     * BSS clear zeros it, but nothing sets it back before task_start. */
+    /* Intercept sleep/wait function at 0x10011D88.
+     * This function polls I/O waiting for events. On real HW,
+     * it sleeps and is woken by timer IRQ. Return 0 = success. */
+    if (addr == 0x10011D88) {
+        cpu->r[0] = 0; /* event received */
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+
+    /* Intercept scheduler init: set sched_state=3 before task_start. */
     if (addr == 0x10085E50) {
         VFlash *vfp = (VFlash *)ctx;
         /* Fix guards for task_start */

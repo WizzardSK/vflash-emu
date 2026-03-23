@@ -546,21 +546,17 @@ int arm9_step(ARM9 *cpu) {
                     sbl++;
                 }
             }
-            /* Trace scheduler when it exits wait loop (event detected) */
-            if (inst_addr == 0x10095B38) { /* after BEQ skip → event path */
-                static int evt_log = 0;
-                if (evt_log < 3)
-                    printf("[SCHED-EVT] Event! R0=%08X R1=%08X R2=%08X R3=%08X SP=%08X\n",
-                           cpu->r[0], cpu->r[1], cpu->r[2], cpu->r[3], cpu->r[13]);
-                evt_log++;
-            }
-            /* Detect when PC goes to garbage (>0x11000000) */
-            {
-                static int garbage_log = 0;
-                if (inst_addr > 0x11000000 && inst_addr < 0xF0000000 && garbage_log < 3) {
-                    printf("[GARBAGE] PC=%08X insn=%08X LR=%08X SP=%08X CPSR=%08X\n",
-                           inst_addr, i, cpu->r[14], cpu->r[13], CPSR);
-                    garbage_log++;
+            /* Trace task entry function calls after launch */
+            if (inst_addr >= 0x100113DC && inst_addr <= 0x10011500 &&
+                (i & 0x0F000000) == 0x0B000000) {
+                static int tbl_log = 0;
+                if (tbl_log < 10) {
+                    int32_t boff = i & 0xFFFFFF;
+                    if (boff & 0x800000) boff |= (int32_t)0xFF000000;
+                    uint32_t tgt = inst_addr + 8 + (uint32_t)(boff * 4);
+                    printf("[TASK-BL] 0x%08X → BL 0x%08X R0=%08X\n",
+                           inst_addr, tgt, cpu->r[0]);
+                    tbl_log++;
                 }
             }
             /* Trace task_start function */
