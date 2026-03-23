@@ -3095,7 +3095,15 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
                    addr, cpu->r[0], cpu->r[1], cpu->r[14]);
             hle_logged++;
         }
-        cpu->r[0] = 0;
+        /* Return address of a safe "return 0" stub instead of 0.
+         * Game code does BLX R0 — if R0=0, crashes to address 0.
+         * Stub at RAM[0xFFE080]: MOV R0,#0; BX LR */
+        {
+            VFlash *vfp = (VFlash *)ctx;
+            *(uint32_t*)(vfp->ram + 0xFFE080) = 0xE3A00000; /* MOV R0,#0 */
+            *(uint32_t*)(vfp->ram + 0xFFE084) = 0xE12FFF1E; /* BX LR */
+        }
+        cpu->r[0] = 0x10FFE080; /* safe stub address */
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }

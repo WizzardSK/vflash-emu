@@ -569,18 +569,24 @@ int arm9_step(ARM9 *cpu) {
             }
         }
 
-        /* Catch BLX to NULL (address 0) — game code calls NULL func pointers */
-        if (inst_addr == 0 && cpu->null_trap_enabled) {
+        /* Catch BLX to NULL (address 0) — game code calls NULL func pointers.
+         * Also catch any instruction fetch at low SDRAM addresses that
+         * shouldn't be executing (0x10000000-0x10001000 = kernel vectors) */
+        if ((inst_addr == 0 || (inst_addr >= 0x10000000 && inst_addr < 0x10000100))
+            && cpu->null_trap_enabled) {
             static int null_blx = 0;
-            if (null_blx < 5)
-                printf("[NULL-BLX] PC=0 LR=0x%08X R0=0x%08X SP=0x%08X\n",
-                       cpu->r[14], cpu->r[0], cpu->r[13]);
+            if (null_blx < 10)
+                printf("[NULL-BLX] PC=0x%08X LR=0x%08X R0=0x%08X SP=0x%08X\n",
+                       inst_addr, cpu->r[14], cpu->r[0], cpu->r[13]);
             null_blx++;
             cpu->r[0] = 0;
-            if (cpu->r[14] != 0)
+            if (cpu->r[14] != 0 && cpu->r[14] != inst_addr)
                 PC = cpu->r[14] & ~3u;
-            else
-                PC = 0x10FFF000; /* fallback to idle */
+            else {
+                /* Can't return — go to idle, let scheduler take over */
+                PC = 0x10FFF000;
+                cpu->cpsr = 0x000000D3; /* SVC, IRQ off */
+            }
             cpu->cycles += 1;
             return 1;
         }
