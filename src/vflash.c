@@ -880,6 +880,18 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
     /* Fast path: RAM (most common — ~90% of all accesses) */
     if (__builtin_expect(addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE, 1)) {
         uint32_t roff = addr - VFLASH_RAM_BASE;
+        /* Trace RAM reads from scheduler loop */
+        {
+            uint32_t caller = vf->cpu.r[15];
+            if (vf->boot_phase >= 300 && caller >= 0x10A1C540 && caller <= 0x10A1C5F0) {
+                static int ram_trace = 0;
+                if (ram_trace < 30 && roff > 0xA1D000) { /* skip code/pool reads */
+                    uint32_t val = *(uint32_t*)(vf->ram + roff);
+                    printf("[RAM-TRACE] PC=%08X read [%08X]=%08X\n", caller, addr, val);
+                    ram_trace++;
+                }
+            }
+        }
         if (roff == 0x1C9C && vf->atapi.reboot_count >= 2) {
             static int rd_wp = 0;
             uint32_t v = *(uint32_t*)(vf->ram + 0x1C9C);
@@ -915,8 +927,20 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
     }
 
     /* RAM */
-    if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE)
+    if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
+        /* Trace RAM reads from scheduler loop to find the blocking variable */
+        uint32_t caller = vf->cpu.r[15];
+        if (vf->boot_phase >= 300 && caller >= 0x10A1C540 && caller <= 0x10A1C5F0) {
+            static int ram_trace = 0;
+            uint32_t roff = addr - VFLASH_RAM_BASE;
+            uint32_t val = *(uint32_t*)(vf->ram + roff);
+            if (ram_trace < 20 && roff != 0xA1C590) { /* skip pool reads */
+                printf("[RAM-TRACE] PC=%08X read [%08X]=%08X\n", caller, addr, val);
+                ram_trace++;
+            }
+        }
         return *(uint32_t*)(vf->ram + (addr - VFLASH_RAM_BASE));
+    }
 
     /* Internal SRAM / TCM */
     if (addr >= VFLASH_SRAM_BASE && addr < VFLASH_SRAM_BASE + VFLASH_SRAM_SIZE)
@@ -3245,6 +3269,21 @@ void vflash_run_frame(VFlash *vf) {
             uint32_t pc = vf->cpu.r[15];
             static int phase = 0;
 
+            /* Skip LCD vsync wait loop at 0x10A1C5xx.
+             * µMORE code polls [0x10BBCFF4] waiting for LCD frame complete.
+             * We don't generate LCD vsync interrupts, so skip after timeout. */
+            if (vf->boot_phase >= 300 && pc >= 0x10A1C540 && pc <= 0x10A1C590) {
+                static int vsync_wait = 0;
+                vsync_wait++;
+                if (vsync_wait > 50) { /* force quickly */
+                    /* Set the flag the loop checks */
+                    *(uint32_t*)(vf->ram + 0xBBCFF4) = 0x80808080;
+                    *(uint32_t*)(vf->ram + 0xBBCFF8) = 0x80808080;
+                    vsync_wait = 0;
+                    printf("[VSYNC] Forced vsync complete at frame %llu\n", vf->frame_count);
+                }
+            }
+
             /* After µMORE scheduler runs for a while, force-enable IRQ.
              * The scheduler idle loop has IRQ disabled (CPSR bit7=1).
              * Timer IRQs are needed to dispatch tasks. */
@@ -3500,6 +3539,12 @@ void vflash_run_frame(VFlash *vf) {
                     *(uint32_t*)(vf->ram + 0xACC78) = 0x10000000 + task;
                     printf("[BOOT] Registered game task at 0x%08X\n", 0x10000000 + task);
                 }
+
+                /* Set flash completion flags that µMORE scheduler polls.
+                 * Loop at 0x10A1C5xx reads [0x10BBCFF4/F8] and [0x10BBD00C]. */
+                *(uint32_t*)(vf->ram + 0xBBCFF4) = 1;
+                *(uint32_t*)(vf->ram + 0xBBCFF8) = 1;
+                *(uint32_t*)(vf->ram + 0xBBD00C) |= 1;
 
                 vf->boot_phase = 300;
                 printf("[BOOT] → 0x109D11E0 (R0=2, SP=0x10FFD000)\n");
