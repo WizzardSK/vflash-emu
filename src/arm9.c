@@ -546,17 +546,17 @@ int arm9_step(ARM9 *cpu) {
                     sbl++;
                 }
             }
-            /* Trace task entry function calls after launch */
-            if (inst_addr >= 0x100113DC && inst_addr <= 0x10011500 &&
-                (i & 0x0F000000) == 0x0B000000) {
-                static int tbl_log = 0;
-                if (tbl_log < 10) {
-                    int32_t boff = i & 0xFFFFFF;
-                    if (boff & 0x800000) boff |= (int32_t)0xFF000000;
-                    uint32_t tgt = inst_addr + 8 + (uint32_t)(boff * 4);
-                    printf("[TASK-BL] 0x%08X → BL 0x%08X R0=%08X\n",
-                           inst_addr, tgt, cpu->r[0]);
-                    tbl_log++;
+            /* Detect exception taken during game init */
+            if (inst_addr == 0x10000004 || inst_addr == 0x10000008 ||
+                inst_addr == 0x1000000C || inst_addr == 0x10000010) {
+                static int exc_log = 0;
+                if (exc_log < 3) {
+                    const char *names[] = {"","UNDEF","SWI","PABT","DABT"};
+                    int idx = (inst_addr - 0x10000000) / 4;
+                    printf("[EXCEPTION] %s at PC=0x%08X LR=0x%08X CPSR=0x%08X\n",
+                           idx < 5 ? names[idx] : "?",
+                           inst_addr, cpu->r[14], CPSR);
+                    exc_log++;
                 }
             }
             /* Trace task_start function */
