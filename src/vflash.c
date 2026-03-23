@@ -1127,6 +1127,13 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
+        /* Unknown peripheral at 0xA1000000 (off = 0x21000000) */
+        if (off >= 0x21000000u && off < 0x21100000u) {
+            /* BOOT.BIN reads 0xA100001C and checks bit 7 (ready flag).
+             * Return 0x80 = ready. */
+            return 0x80;
+        }
+
         /* GPIO at 0x90000000 (off = 0x10000000) */
         if (off >= 0x10000000u && off < 0x10001000u) {
             uint32_t greg = off - 0x10000000u;
@@ -1948,11 +1955,15 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                      * Second reboot: patch callback to idle (prevent loop).
                      * On 2nd run, BOOT.BIN should enter game mode (µMORE initialized). */
                     if (vf->atapi.reboot_count >= 2) {
-                        /* Patch callback: addr must have bit7 set (code checks it).
-                         * Use 0x10FFE080 (MOV R0,#0; BX LR) which has bit7=1. */
-                        *(uint32_t*)(vf->ram + 0xFFE080) = 0xE3A00000;
-                        *(uint32_t*)(vf->ram + 0xFFE084) = 0xE12FFF1E;
-                        *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFE080;
+                        /* Patch callback: code reads *[0x10001C9C] and checks bit 7.
+                         * The pointer at 0x1C9C = 0x10C00020 (callback header addr).
+                         * 0x10C00020 & 0x80 = 0 → fails. Change pointer to addr with bit7.
+                         * Also patch the callback value at the new address. */
+                        *(uint32_t*)(vf->ram + 0xFFE080) = 0xE3A00000; /* MOV R0,#0 */
+                        *(uint32_t*)(vf->ram + 0xFFE084) = 0xE12FFF1E; /* BX LR */
+                        *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFE080; /* callback value */
+                        /* Change the pointer in µMORE table to an address with bit7 set */
+                        *(uint32_t*)(vf->ram + 0x1C9C) = 0x10FFE080;
                     }
 
                     /* Set warm boot entry to BOOT.BIN instead of idle loop */
