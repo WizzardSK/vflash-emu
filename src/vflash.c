@@ -3239,7 +3239,17 @@ void vflash_run_frame(VFlash *vf) {
             uint32_t pc = vf->cpu.r[15];
             static int phase = 0;
 
-            /* Boot phase 200 removed — game launch happens directly in reboot handler */
+            /* After µMORE scheduler runs for a while, force-enable IRQ.
+             * The scheduler idle loop has IRQ disabled (CPSR bit7=1).
+             * Timer IRQs are needed to dispatch tasks. */
+            if (vf->boot_phase == 300 && vf->frame_count > 75 &&
+                pc >= 0x10900000 && pc < 0x10B00000 &&
+                (vf->cpu.cpsr & 0x80)) {
+                vf->cpu.cpsr &= ~0x80; /* enable IRQ */
+                vf->boot_phase = 301;
+                printf("[SCHED] Force-enabled IRQ at frame %llu PC=0x%08X\n",
+                       vf->frame_count, pc);
+            }
 
             /* µMORE kernel running: enable timer + FIQ after init.
              * Match ANY kernel address after frame 8 (init BLs done by then). */
@@ -3403,6 +3413,10 @@ void vflash_run_frame(VFlash *vf) {
                        *(uint32_t*)(vf->ram + 0xC16CC0));
                 printf("[BOOT] RAM[0xC16D30] = %08X (expect E5933000)\n",
                        *(uint32_t*)(vf->ram + 0xC16D30));
+                /* Check task state after BOOT.BIN init */
+                printf("[BOOT] Task list: [0x3585C0]=%08X sched_state: [0x3585E0]=%08X\n",
+                       *(uint32_t*)(vf->ram+0x3585C0), *(uint32_t*)(vf->ram+0x3585E0));
+                printf("[BOOT] Heap: [0x359660]=%08X\n", *(uint32_t*)(vf->ram+0x359660));
                 /* Service at 0x109D11E0 is populated with real code!
                  * Call it directly with proper register setup. */
                 printf("[BOOT] Service 0x109D11E0 populated — calling directly\n");
@@ -3438,6 +3452,25 @@ void vflash_run_frame(VFlash *vf) {
                 vf->cpu.r[0] = 2; /* warm boot indicator */
                 vf->cpu.r13_irq = 0x10800000;
                 vf->cpu.null_trap_enabled = 1;
+                /* Register a game task in the µMORE task list.
+                 * Task struct layout: $TCB magic, entry point, stack, state.
+                 * Use heap area for the task struct (0x104000+). */
+                {
+                    uint32_t task = 0xF00000; /* task struct in high RAM */
+                    memset(vf->ram + task, 0, 0x100);
+                    *(uint32_t*)(vf->ram + task + 0x00) = 0x42435124; /* $QCB magic */
+                    *(uint32_t*)(vf->ram + task + 0x08) = 1;          /* flags: active */
+                    *(uint32_t*)(vf->ram + task + 0x20) = 4;          /* state: ready */
+                    /* Saved context at +0x58 */
+                    *(uint32_t*)(vf->ram + task + 0x58) = 0x10CFAEA0; /* saved PC: game main */
+                    *(uint32_t*)(vf->ram + task + 0x5C) = 0x00000053; /* saved CPSR: SVC+IRQ en */
+                    *(uint32_t*)(vf->ram + task + 0x60) = 0x10FFD000; /* saved SP */
+                    /* Register in task list */
+                    *(uint32_t*)(vf->ram + 0x3585C0) = 0x10000000 + task;
+                    *(uint32_t*)(vf->ram + 0xACC78) = 0x10000000 + task;
+                    printf("[BOOT] Registered game task at 0x%08X\n", 0x10000000 + task);
+                }
+
                 vf->boot_phase = 300;
                 printf("[BOOT] → 0x109D11E0 (R0=2, SP=0x10FFD000)\n");
             }
