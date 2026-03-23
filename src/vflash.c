@@ -1880,7 +1880,7 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                 printf("[REBOOT] BOOT[0x20] callback = 0x%08X\n",
                        *(uint32_t*)(vf->ram + 0xC00020));
 
-                if (vf->atapi.reboot_count > 3) {
+                if (vf->atapi.reboot_count > 5) {
                     printf("[REBOOT] Too many reboots, stopping reboot loop\n");
                     return;
                 }
@@ -1943,11 +1943,12 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                     }
                     printf("[REBOOT] IRQ wrapper at 0x10FFF040\n");
 
-                    /* After warm boot, redirect to BOOT.BIN entry so it runs
-                     * its init functions again. This second run should register
-                     * tasks since µMORE kernel is now in RAM.
-                     * Patch callback to idle stub (prevent infinite reboot). */
-                    *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFF000;
+                    /* After warm boot, run BOOT.BIN.
+                     * First reboot: let original callback (0x1880) run → triggers 2nd reboot.
+                     * Second reboot: patch callback to idle (prevent loop).
+                     * On 2nd run, BOOT.BIN should enter game mode (µMORE initialized). */
+                    if (vf->atapi.reboot_count >= 2)
+                        *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFF000;
 
                     /* Set warm boot entry to BOOT.BIN instead of idle loop */
                     {
