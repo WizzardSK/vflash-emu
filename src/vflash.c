@@ -1146,17 +1146,7 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             uint32_t ureg = off - 0x10020000u;
             switch (ureg) {
                 case 0x00: return vf->timer.irq.status & vf->timer.irq.enable; /* IRQ status */
-                case 0x14: {
-                    /* Scheduler event status — return bit5 when timer event ready.
-                     * Our IRQ handler sets RAM[0xFFE100] as "event occurred" flag.
-                     * Clear the flag after read (edge-triggered). */
-                    uint32_t flag = *(uint32_t*)(vf->ram + 0xFFE100);
-                    if (flag) {
-                        *(uint32_t*)(vf->ram + 0xFFE100) = 0; /* clear after read */
-                        return 0x20; /* bit5 = event ready */
-                    }
-                    return 0;
-                }
+                case 0x14: return 0; /* event controller: no pending events */
                 case 0x18: return 0x90;      /* UARTFR: TX empty, RX empty */
                 case 0x24: return 0;         /* UARTIBRD */
                 case 0x28: return 0;         /* UARTFBRD */
@@ -1808,15 +1798,17 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
         /* GPIO write at 0x90000000 — silently accept */
         if (off >= 0x10000000u && off < 0x10001000u) return;
 
-        /* PL011 UART write at 0x90020000 */
+        /* Event controller / UART write at 0x90020000 */
         if (off >= 0x10020000u && off < 0x10021000u) {
             uint32_t ureg = off - 0x10020000u;
             if (ureg == 0x00) {
-                /* UARTDR: TX data — print to stderr */
                 char c = (char)(val & 0xFF);
                 if (c >= 0x20 || c == '\n')
                     fprintf(stderr, "%c", c);
             }
+            /* Any write to event controller clears the event flag */
+            if (ureg >= 0x08 && ureg <= 0x18)
+                *(uint32_t*)(vf->ram + 0xFFE100) = 0;
             return;
         }
 
@@ -3141,21 +3133,18 @@ void vflash_run_frame(VFlash *vf) {
                  * Overwrite SDRAM[0x94] with our handler address.
                  * Handler at RAM[0xFFE000] clears timer + returns. */
                 {
+                    /* Simple IRQ handler: clear timer only.
+                     * µMORE IRQ dispatch (0x872A4) crashes on uninitialized tables.
+                     * Task dispatch needs a different approach. */
                     uint32_t h = 0xFFE000;
                     uint32_t p = h;
-                    *(uint32_t*)(vf->ram + p) = 0xE92D400F; p += 4; /* PUSH {R0-R3,LR} */
-                    /* Clear timer interrupt */
-                    *(uint32_t*)(vf->ram + p) = 0xE59F001C; p += 4; /* LDR R0,[PC,#28] → timer */
+                    *(uint32_t*)(vf->ram + p) = 0xE92D500F; p += 4; /* PUSH {R0-R3,R12,LR} */
+                    *(uint32_t*)(vf->ram + p) = 0xE59F000C; p += 4; /* LDR R0,[PC,#12] */
                     *(uint32_t*)(vf->ram + p) = 0xE3A01001; p += 4; /* MOV R1,#1 */
-                    *(uint32_t*)(vf->ram + p) = 0xE5801000; p += 4; /* STR R1,[R0] clear timer */
-                    /* Set event flag at RAM[0xFFE100] for scheduler */
-                    *(uint32_t*)(vf->ram + p) = 0xE59F0014; p += 4; /* LDR R0,[PC,#20] → flag */
-                    *(uint32_t*)(vf->ram + p) = 0xE5801000; p += 4; /* STR R1,[R0] set flag=1 */
-                    /* Return */
-                    *(uint32_t*)(vf->ram + p) = 0xE8BD400F; p += 4; /* POP {R0-R3,LR} */
-                    *(uint32_t*)(vf->ram + p) = 0xE25EF004; p += 4; /* SUBS PC,LR,#4 return */
+                    *(uint32_t*)(vf->ram + p) = 0xE5801000; p += 4; /* STR R1,[R0] clear */
+                    *(uint32_t*)(vf->ram + p) = 0xE8BD500F; p += 4; /* POP {R0-R3,R12,LR} */
+                    *(uint32_t*)(vf->ram + p) = 0xE25EF004; p += 4; /* SUBS PC,LR,#4 */
                     *(uint32_t*)(vf->ram + p) = 0x9001000C; p += 4; /* pool: timer IntClr */
-                    *(uint32_t*)(vf->ram + p) = 0x10FFE100; p += 4; /* pool: event flag addr */
                     /* Point FIQ vector pool to our handler */
                     *(uint32_t*)(vf->ram + 0x94) = 0x10000000 + h;
                     /* Overwrite BOTH IRQ and FIQ vectors in SDRAM
