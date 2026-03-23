@@ -3142,14 +3142,26 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
 
     if (addr >= 0x10190000 && addr < 0x10C00000) {
         static int hle_logged = 0;
-        if (hle_logged < 200) {
+        if (hle_logged < 50) {
             printf("[HLE] BSS call 0x%08X R0=0x%08X R1=0x%08X LR=0x%08X\n",
                    addr, cpu->r[0], cpu->r[1], cpu->r[14]);
             hle_logged++;
         }
-        /* Return address of a safe "return 0" stub instead of 0.
-         * Game code does BLX R0 — if R0=0, crashes to address 0.
-         * Stub at RAM[0xFFE080]: MOV R0,#0; BX LR */
+
+        /* HLE for specific µMORE services */
+
+        /* 0x10A15CA0: int_disable() — saves CPSR, disables IRQ+FIQ.
+         * Called as: old_cpsr = int_disable(); ... int_restore(old_cpsr);
+         * R0 = current CPSR on first call, return saved CPSR value. */
+        if (addr == 0x10A15CA0) {
+            uint32_t old_cpsr = cpu->cpsr;
+            cpu->cpsr |= 0xC0; /* disable IRQ + FIQ */
+            cpu->r[0] = old_cpsr;
+            cpu->r[15] = cpu->r[14] & ~3u;
+            return 1;
+        }
+
+        /* Default: return safe stub address */
         {
             VFlash *vfp = (VFlash *)ctx;
             *(uint32_t*)(vfp->ram + 0xFFE080) = 0xE3A00000; /* MOV R0,#0 */
@@ -3348,12 +3360,30 @@ void vflash_run_frame(VFlash *vf) {
                 uint32_t svc = *(uint32_t*)(vf->ram + 0x9A0950);
                 printf("[BOOT] BSS[0x109A0950] = 0x%08X (%s)\n",
                        svc, svc == 0xE12FFF1E ? "BX LR stub" : "populated!");
+                /* Check BOOT.BIN integrity at game launch */
+                printf("[BOOT] RAM[0xC16CC0] = %08X (expect E52DE004)\n",
+                       *(uint32_t*)(vf->ram + 0xC16CC0));
+                printf("[BOOT] RAM[0xC16D30] = %08X (expect E5933000)\n",
+                       *(uint32_t*)(vf->ram + 0xC16D30));
+                /* BOOT.BIN init may have overwritten game code area.
+                 * Re-load from disc to ensure integrity. */
+                if (vf->cd && vf->cd->is_open) {
+                    CDEntry boot_entry;
+                    if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &boot_entry)) {
+                        uint32_t dest = 0xC00000;
+                        uint32_t max_sz = VFLASH_RAM_SIZE - dest;
+                        if (boot_entry.size < max_sz) max_sz = boot_entry.size;
+                        cdrom_read_file(vf->cd, &boot_entry,
+                            vf->ram + dest, 0, max_sz);
+                        printf("[BOOT] Re-loaded BOOT.BIN (%u bytes)\n", max_sz);
+                    }
+                }
                 /* Now launch game init */
                 vf->cpu.cpsr = 0x000000D3;
-                vf->cpu.r[15] = 0x10C16CB8;
+                vf->cpu.r[15] = 0x10C16CC0;
                 vf->cpu.r[13] = 0x10FFE000;
                 vf->cpu.r[14] = 0x10FFF000;
-                printf("[GAME] Launching game init at 0x10C16CB8\n");
+                printf("[GAME] Launching game init at 0x10C16CC0\n");
             }
 
             /* Phase 102: game init done → set up event system + IRQ */
@@ -3400,13 +3430,13 @@ void vflash_run_frame(VFlash *vf) {
             if ((phase == 99 || phase == 200) && vf->frame_count > 110 &&
                 (pc == 0x10FFF00C || pc == 0x10FFF000)) {
                 phase = 300;
-                printf("[GAME] BOOT.BIN init done! Launching game at 0x10C16CB8\n");
+                printf("[GAME] BOOT.BIN init done! Launching game at 0x10C16CC0\n");
                 /* Check if BOOT.BIN populated BSS service functions */
                 printf("[GAME] BSS[0x109A0950]=%08X BSS[0x109A0868]=%08X\n",
                        *(uint32_t*)(vf->ram + 0x9A0950),
                        *(uint32_t*)(vf->ram + 0x9A0868));
                 vf->cpu.null_trap_enabled = 1;
-                vf->cpu.r[15] = 0x10C16CB8;
+                vf->cpu.r[15] = 0x10C16CC0;
                 vf->cpu.r[13] = 0x10FFE000;
                 vf->cpu.r[14] = 0x10FFF000;
                 vf->cpu.cpsr  = 0x000000D3; /* SVC, IRQ off during init */
@@ -3564,13 +3594,13 @@ void vflash_run_frame(VFlash *vf) {
                 /* Jump to game init with NULL trap enabled */
                 vf->cpu.null_trap_enabled = 1;
                 vf->cpu.cpsr = 0x00000093;
-                vf->cpu.r[15] = 0x10C16CB8;
+                vf->cpu.r[15] = 0x10C16CC0;
                 vf->cpu.r[13] = 0x10FFE000;
                 vf->cpu.r[14] = 0x10FFF000; /* return → idle */
                 /* Clear pending IRQ so it doesn't fire immediately */
                 vf->timer.timer[0].irq_pending = 0;
                 vf->timer.irq.status = 0;
-                printf("[SCHED] Phase 2: → GAME INIT at 0x10C16CB8 (IRQ disabled)\n");
+                printf("[SCHED] Phase 2: → GAME INIT at 0x10C16CC0 (IRQ disabled)\n");
             }
         }
 
