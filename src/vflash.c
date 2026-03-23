@@ -1096,7 +1096,11 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             switch (sreg) {
                 case 0x00: return 0x01000010; /* Model ID */
                 case 0x04: return 0;
-                case 0x0C: return vf->misc_regs[0x0C >> 2]; /* Boot status: 0=cold, bit1=warm */
+                case 0x0C: {
+                    uint32_t v = vf->misc_regs[0x0C >> 2];
+                    if (v) printf("[BOOT-FLAG] Read 0x900A000C = 0x%08X (warm=%d)\n", v, (v>>1)&1);
+                    return v;
+                }
                 case 0x28: return 0x00000000; /* ASIC ID low */
                 case 0x2C: return 0x00000000; /* ASIC ID high */
                 default:
@@ -1994,47 +1998,25 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                     printf("[REBOOT] Timer0 configured: load=%u\n", vf->timer.timer[0].load);
                 }
 
-                /* Set warm boot flag and restart.
-                 * On real HW, ROM re-runs from 0 and detects warm boot flag.
-                 * We skip ROM boot entirely — go straight to kernel. */
+                /* Set warm boot flag and let ROM run from 0.
+                 * ROM detects bit1=1 at 0x900A000C and takes warm boot path
+                 * at ROM[0xA0], which skips BSS clear and jumps to scheduler
+                 * via SDRAM vector chain at 0xFFC8+. */
                 vf->misc_regs[0x0C >> 2] |= 0x02;
-                arm9_reset(&vf->cpu);
-                /* Restore MMU (reset cleared it) */
-                vf->cpu.cp15.ttb = 0x100A8000;
-                vf->cpu.cp15.mmu_enabled = 1;
-                vf->cpu.cp15.control = 0x0000507D;
-                tlb_flush();
-                /* After warm reboot, go to warm boot entry (BOOT.BIN).
-                 * Reboot handler set RAM[0xFFC8] → BOOT.BIN at 0x10C00010.
-                 * Also fix interrupt routing: force timer to IRQ (not FIQ). */
-                vf->timer.irq.fiq_sel = 0; /* timer → IRQ, not FIQ */
-                /* Patch IRQ vector (SDRAM[0x18]) to branch to our handler
-                 * which clears timer. Real µMORE IRQ dispatch at 0x100873D0
-                 * will be called via the vector chain at RAM[0xFF80+]. */
-                {
-                    uint32_t h = 0xFFE000; /* our timer clear handler */
-                    int32_t irq_off = (int32_t)(h - (0x18 + 8)) >> 2;
-                    *(uint32_t*)(vf->ram + 0x18) = 0xEA000000 | (irq_off & 0xFFFFFF);
-                }
-                /* Disable timer during BOOT.BIN init to prevent IRQ storm */
-                vf->timer.timer[0].ctrl = 0x10; /* disable */
-                vf->timer.timer[0].irq_pending = 0;
-                vf->timer.irq.status = 0;
-                /* On 2nd+ reboot, force BOOT.BIN "version mismatch" path.
-                 * BOOT.BIN compares REL markers at offsets 0x18 and 0x10C.
-                 * If they match → calls callback (warm reboot loop).
-                 * If different → checks peripheral status and continues to game init.
-                 * Corrupt one marker to force mismatch. */
                 if (vf->atapi.reboot_count > 5) {
                     printf("[REBOOT] Too many reboots, stopping\n");
                     return;
                 }
-                /* Jump to BOOT.BIN entry (warm boot path) */
-                vf->cpu.r[15] = 0x10C00010;
-                vf->cpu.r[13] = 0x10FFE000;
-                vf->cpu.r13_irq = 0x10800000;
-                vf->cpu.cpsr = 0x000000D3; /* SVC, IRQ+FIQ disabled */
-                printf("[REBOOT] → BOOT.BIN at 0x10C00010 (IRQ off, BOOT.BIN enables)\n");
+                arm9_reset(&vf->cpu);
+                /* Disable timer during ROM init */
+                vf->timer.timer[0].ctrl = 0x10;
+                vf->timer.timer[0].irq_pending = 0;
+                vf->timer.irq.status = 0;
+                vf->timer.irq.fiq_sel = 0;
+                /* Let ROM run from 0 — it will detect warm boot flag */
+                vf->cpu.r[15] = 0x00000000;
+                vf->cpu.cpsr = 0x000000D3;
+                printf("[REBOOT] → ROM at 0x00000000 (warm boot flag set)\n");
             }
             return;
         }
@@ -3333,9 +3315,10 @@ void vflash_run_frame(VFlash *vf) {
                 }
             }
 
-            /* After kernel stabilizes (~20 frames), launch game init.
-             * Kernel idles in scheduler loop at 0x10090000-0x10100000. */
-            if (phase == 99 && vf->frame_count > 55 &&
+            /* After kernel stabilizes, launch BOOT.BIN init.
+             * DISABLED: let natural warm reboot flow handle this instead.
+             * Phase 200 (force init task) → warm reboot → ROM warm boot. */
+            if (0 && phase == 99 && vf->frame_count > 55 &&
                 pc >= 0x10090000 && pc < 0x10110000) {
                 phase = 100;
                 /* Fix page table: identity map ALL RAM */
