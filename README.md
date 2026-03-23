@@ -31,36 +31,33 @@ Background voice/SFX audio plays automatically from 561 WAV files on disc.
 
 ## Status
 
-**µMORE RTOS boots natively** — full ROM boot with SDRAM calibration, kernel init,
-heap allocation, and task registration. Asset browser for images/video/audio.
+**Complete natural boot flow** — ROM → µMORE RTOS → warm reboot → BOOT.BIN init → game code.
+BSS service dispatch table populated with real code. Game code executes from BOOT.BIN.
 
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spider-Man.
 
-### µMORE RTOS Boot (fully working)
+### Boot Flow (complete!)
 
 | Step | Status |
 |------|--------|
 | ROM boot + flash remap | ✅ |
-| SDRAM calibration | ✅ Passes (emulated SDRAM always works) |
-| PLL / clock setup | ✅ |
-| Kernel memcpy (ROM → SDRAM) | ✅ Three copy phases |
-| BSS clear | ✅ |
-| MMU page table + enable | ✅ Built natively by ROM init |
-| Cache invalidate | ✅ |
-| Scheduler entry (0x10010234) | ✅ |
-| µMORE heap init (1MB) | ✅ Free-list allocator at 0x103596B0 |
-| Task registration ($TCB) | ✅ Task at 0x100AC0E0, entry 0x100113DC |
-| Timer (SP804 periodic) | ✅ 37500 cycles, IRQ delivery |
-| Custom IRQ handler | ✅ Clears timer, returns to kernel |
-| Scheduler active loop | ✅ Polls I/O for events |
-| **Task dispatch** | 🔧 Scheduler polls but doesn't wake task |
+| SDRAM calibration | ✅ Passes naturally |
+| 7 init functions (PLL, memcpy, BSS, MMU, cache) | ✅ All native |
+| µMORE scheduler | ✅ Active at 0x10010234 |
+| Heap init (1MB free-list) | ✅ 0x103596B0 |
+| Task registration ($TCB) | ✅ 0x100AC0E0 |
+| Init task execution | ✅ RTC wait, peripheral setup |
+| **Warm reboot** | ✅ Write 2 to 0x900A0008 |
+| **BOOT.BIN init** | ✅ At 0x10C00010, callback → idle |
+| **BSS services populated** | ✅ Real LDR instructions! |
+| **Game init (0x10C16CB8)** | ✅ Executes with real services |
+| **Game code (0x10CAAD84)** | 🔧 Runs but some NULL pointers |
 
 ### Remaining for gameplay
 
-The scheduler polls peripheral status registers (0x90020014) waiting for events.
-On real hardware, the timer interrupt handler wakes tasks via context switch.
-Our custom IRQ handler clears the timer but doesn't call the µMORE task wakeup.
-Need: either fix the VIC interrupt dispatch chain or implement task wakeup in the IRQ handler.
+Game code runs from BOOT.BIN with real µMORE services but hits 3 NULL function
+pointer calls in dynamically allocated service structures. Need to trace which
+specific service registrations are missing from BOOT.BIN init.
 
 ### Asset Browser
 
@@ -91,11 +88,10 @@ ROM[0x00] → flash copy → flash remap (0x118)
   → 64KB memcpy (0x288) → large memcpy (0x2B4)
   → BSS clear (0x5D0) → page table + MMU (0x704)
   → cache invalidate (0x7D0)
-  → scheduler entry (0x10010234)
-    → kernel init (0x1009CFB4) — heap 1MB
-    → task_start (0x10085E50) — $TCB registered
-    → scheduler idle loop (0x10095Bxx)
-    → timer IRQ → custom handler → kernel active
+  → scheduler (0x10010234) → heap (1MB) → task_start ($TCB)
+  → init task (0x100113DC) → RTC wait → warm reboot!
+  → BOOT.BIN init (0x10C00010) → BSS services populated
+  → game init (0x10C16CB8) → game code (0x10CAAD84)
 ```
 
 ### Physical Memory Map (ZEVIO 1020)
@@ -125,6 +121,12 @@ ROM[0x00] → flash copy → flash remap (0x118)
 | PA 0 / SDRAM aliasing | IRQ vectors corrupted by game code | Separate low_ram buffer |
 | UART reg 0x14 returned 0 | Scheduler stuck in idle loop | Return bit5=1 (event present) |
 | Forced vsync IRQ raise | IRQ storm after every clear | Let timer fire naturally |
+| RTC constant value | Init task stuck in RTC wait loop | Increment RTC on each read |
+| Sleep/wait blocking | Init task never completes | Intercept 0x10011D88, return 0 |
+| Warm reboot val=2 | Reboot not recognized | Accept val=1 or val=2 |
+| sched_state reset to 0 | Scheduler refused to dispatch | Force sched_state=3 on write |
+| Timer IRQ during init | BOOT.BIN crashed on IRQ storm | Disable timer during BOOT.BIN init |
+| NULL BLX (PC=0) | Game crash on NULL function ptr | Catch and return to caller |
 
 ### Subsystems
 - ATAPI CD-ROM: INQUIRY, READ(10), READ CD, READ TOC, READ CAPACITY, MODE SENSE
