@@ -1101,7 +1101,7 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             switch (preg) {
                 case 0x00: return vf->pmu_regs[0] ? vf->pmu_regs[0] : 0x00141002;
                 case 0x04: return vf->pmu_regs[1]; /* wake_mask */
-                case 0x08: return 0x2000;     /* PMU status */
+                case 0x08: return 0x2080;     /* PMU status: bit7=PLL locked */
                 case 0x0C: return 0;
                 case 0x14: return vf->pmu_regs[0x14>>2] | 0x01; /* PLL lock always set */
                 case 0x18: return vf->pmu_regs[0x18>>2];
@@ -1947,8 +1947,13 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                      * First reboot: let original callback (0x1880) run → triggers 2nd reboot.
                      * Second reboot: patch callback to idle (prevent loop).
                      * On 2nd run, BOOT.BIN should enter game mode (µMORE initialized). */
-                    if (vf->atapi.reboot_count >= 2)
-                        *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFF000;
+                    if (vf->atapi.reboot_count >= 2) {
+                        /* Patch callback: addr must have bit7 set (code checks it).
+                         * Use 0x10FFE080 (MOV R0,#0; BX LR) which has bit7=1. */
+                        *(uint32_t*)(vf->ram + 0xFFE080) = 0xE3A00000;
+                        *(uint32_t*)(vf->ram + 0xFFE084) = 0xE12FFF1E;
+                        *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFE080;
+                    }
 
                     /* Set warm boot entry to BOOT.BIN instead of idle loop */
                     {

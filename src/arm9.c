@@ -546,6 +546,21 @@ int arm9_step(ARM9 *cpu) {
                     sbl++;
                 }
             }
+            /* Track PLL wait loop (VA 0x18E0, not 0x100018E0) */
+            if (inst_addr == 0x18E0 || inst_addr == 0x100018E0) {
+                static int pll_log = 0;
+                if (pll_log < 3) {
+                    printf("[PLL-WAIT] R0=%08X R3=%08X SP=%08X\n",
+                           cpu->r[0], cpu->r[3], cpu->r[13]);
+                    pll_log++;
+                }
+            }
+            if (inst_addr == 0x18E4 || inst_addr == 0x100018E4) {
+                static int pll_ret = 0;
+                if (pll_ret < 3)
+                    printf("[PLL-RET] R0=%08X (bit7=%d)\n", cpu->r[0], (cpu->r[0]>>7)&1);
+                pll_ret++;
+            }
             /* Track when game code (0x10C00000+) transitions to low addr */
             {
                 static int game_started = 0, crash_log = 0;
