@@ -247,6 +247,8 @@ struct VFlash {
     uint32_t bp[16];   /* breakpoint addresses (0 = unused) */
     int      bp_hit;   /* set by vflash_step() when BP hit */
 
+    int      boot_phase; /* Boot flow phase tracking */
+
     uint32_t  framebuf[VFLASH_SCREEN_W * VFLASH_SCREEN_H];
 };
 
@@ -876,8 +878,18 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
     addr = mmu_translate(vf, addr);
 
     /* Fast path: RAM (most common — ~90% of all accesses) */
-    if (__builtin_expect(addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE, 1))
-        return *(uint32_t*)(vf->ram + (addr - VFLASH_RAM_BASE));
+    if (__builtin_expect(addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE, 1)) {
+        uint32_t roff = addr - VFLASH_RAM_BASE;
+        if (roff == 0x1C9C && vf->atapi.reboot_count >= 2) {
+            static int rd_wp = 0;
+            uint32_t v = *(uint32_t*)(vf->ram + 0x1C9C);
+            if (rd_wp < 5)
+                printf("[RD-1C9C] read 0x%08X PC=0x%08X reboot=%d\n",
+                       v, vf->cpu.r[15], vf->atapi.reboot_count);
+            rd_wp++;
+        }
+        return *(uint32_t*)(vf->ram + roff);
+    }
 
     /* Physical address 0:
      * Before flash remap: 512KB read-only NOR flash
@@ -1129,9 +1141,9 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
 
         /* Unknown peripheral at 0xA1000000 (off = 0x21000000) */
         if (off >= 0x21000000u && off < 0x21100000u) {
-            /* BOOT.BIN reads 0xA100001C and checks bit 7 (ready flag).
-             * Return 0x80 = ready. */
-            return 0x80;
+            /* BOOT.BIN reads 0xA100001C and checks bit 7 (ready) and bit 0 (status).
+             * Return 0x81 = ready + status OK. */
+            return 0x81;
         }
 
         /* GPIO at 0x90000000 (off = 0x10000000) */
@@ -1286,6 +1298,11 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
     /* Fast path: RAM write (most common) */
     if (__builtin_expect(addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE, 1)) {
         uint32_t roff = addr - VFLASH_RAM_BASE;
+        /* µMORE dispatch table slot at 0x1C9C: BOOT.BIN checks bit7.
+         * Force to 0x1880 ONLY after 2nd reboot (not during SDRAM cal). */
+        if (roff == 0x1C9C && vf->atapi.reboot_count >= 2) {
+            val = 0x00001880;
+        }
         if (roff == 0x3585E0 && val != 3) {
             /* Force sched_state to stay at 3.
              * Kernel code at 0x100843AC resets it to 0, preventing dispatch.
@@ -1955,15 +1972,10 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                      * Second reboot: patch callback to idle (prevent loop).
                      * On 2nd run, BOOT.BIN should enter game mode (µMORE initialized). */
                     if (vf->atapi.reboot_count >= 2) {
-                        /* Patch callback: code reads *[0x10001C9C] and checks bit 7.
-                         * The pointer at 0x1C9C = 0x10C00020 (callback header addr).
-                         * 0x10C00020 & 0x80 = 0 → fails. Change pointer to addr with bit7.
-                         * Also patch the callback value at the new address. */
-                        *(uint32_t*)(vf->ram + 0xFFE080) = 0xE3A00000; /* MOV R0,#0 */
-                        *(uint32_t*)(vf->ram + 0xFFE084) = 0xE12FFF1E; /* BX LR */
-                        *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFE080; /* callback value */
-                        /* Change the pointer in µMORE table to an address with bit7 set */
-                        *(uint32_t*)(vf->ram + 0x1C9C) = 0x10FFE080;
+                        /* Safe stub for callback */
+                        *(uint32_t*)(vf->ram + 0xFFE080) = 0xE3A00000;
+                        *(uint32_t*)(vf->ram + 0xFFE084) = 0xE12FFF1E;
+                        *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFE080;
                     }
 
                     /* Set warm boot entry to BOOT.BIN instead of idle loop */
@@ -2008,6 +2020,15 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                 vf->timer.timer[0].ctrl = 0x10; /* disable */
                 vf->timer.timer[0].irq_pending = 0;
                 vf->timer.irq.status = 0;
+                /* On 2nd+ reboot, force BOOT.BIN "version mismatch" path.
+                 * BOOT.BIN compares REL markers at offsets 0x18 and 0x10C.
+                 * If they match → calls callback (warm reboot loop).
+                 * If different → checks peripheral status and continues to game init.
+                 * Corrupt one marker to force mismatch. */
+                if (vf->atapi.reboot_count > 5) {
+                    printf("[REBOOT] Too many reboots, stopping\n");
+                    return;
+                }
                 /* Jump to BOOT.BIN entry (warm boot path) */
                 vf->cpu.r[15] = 0x10C00010;
                 vf->cpu.r[13] = 0x10FFE000;
@@ -3053,6 +3074,20 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         }
     }
 
+    /* Skip bit7 wait loop after 2nd reboot.
+     * BOOT.BIN loops at VA 0x18D4-0x18F0 checking bit7 of a status register.
+     * Skip directly to 0x18F4 (code after loop). */
+    if (addr == 0x18D4 && ((VFlash*)ctx)->atapi.reboot_count >= 2) {
+        static int skip_count = 0;
+        if (skip_count == 0)
+            printf("[SKIP] Bit7 wait loop at 0x18D4 → skip to 0x18F4\n");
+        skip_count++;
+        if (skip_count > 100) { /* let it loop a few times first */
+            cpu->r[15] = 0x18F4;
+            return 1;
+        }
+    }
+
     /* Intercept sleep/wait function at 0x10011D88.
      * This function polls I/O waiting for events. On real HW,
      * it sleeps and is woken by timer IRQ. Return 0 = success. */
@@ -3168,6 +3203,8 @@ void vflash_run_frame(VFlash *vf) {
             uint32_t pc = vf->cpu.r[15];
             static int phase = 0;
 
+            /* Boot phase 200 removed — game launch happens directly in reboot handler */
+
             /* µMORE kernel running: enable timer + FIQ after init.
              * Match ANY kernel address after frame 8 (init BLs done by then). */
             if (phase == 0 && vf->frame_count > 50 &&
@@ -3211,20 +3248,14 @@ void vflash_run_frame(VFlash *vf) {
                     vf->timer.irq.fiq_sel = 0;
                     printf("[IRQ] Direct vector → handler at 0x%08X\n", 0x10000000 + h);
                 }
-                /* Install ARM exception vector table at PA 0 (low_ram[0x00-0x3C]).
-                 * Uses separate low_ram buffer so SDRAM writes don't overwrite.
-                 * Format: LDR PC,[PC,#0x18] at each vector slot (0x00-0x1C),
-                 * with target addresses at 0x20-0x3C. */
+                /* Redirect IRQ vector chain to our handler.
+                 * ROM[0x18] → ROM[0xD44]=0x1000FF98 → SDRAM[0xFF98].
+                 * Overwrite SDRAM[0xFF98] with branch to our timer handler.
+                 * This bypasses µMORE's uninitialized IRQ dispatcher. */
                 {
-                    uint32_t ldr = 0xE59FF018; /* LDR PC,[PC,#0x18] */
-                    for (int vi = 0; vi < 8; vi++)
-                        *(uint32_t*)(vf->low_ram + vi * 4) = ldr;
-                    /* All exceptions → BX LR stub except IRQ → wrapper */
-                    uint32_t bxlr_addr = 0x10FFF080; /* BX LR stub */
-                    for (int vi = 0; vi < 8; vi++)
-                        *(uint32_t*)(vf->low_ram + 0x20 + vi * 4) = bxlr_addr;
-                    *(uint32_t*)(vf->low_ram + 0x38) = 0x10FFF040; /* IRQ → wrapper */
-                    /* Write BX LR at the stub address (in SDRAM) */
+                    int32_t b_off = (int32_t)(0xFFF040 - (0xFF98 + 8)) >> 2;
+                    *(uint32_t*)(vf->ram + 0xFF98) = 0xEA000000 | (b_off & 0xFFFFFF);
+                    /* Also BX LR stub for other exceptions */
                     *(uint32_t*)(vf->ram + 0xFFF080) = 0xE1B0F00E; /* MOVS PC,LR */
                 }
                 /* IRQ wrapper at 0xFFF040 */
@@ -3257,9 +3288,10 @@ void vflash_run_frame(VFlash *vf) {
                 }
             }
 
-            /* After kernel stabilizes (~20 frames), launch game init */
-            if (phase == 99 && vf->frame_count > 20 &&
-                pc >= 0x100A0000 && pc < 0x100A2000) {
+            /* After kernel stabilizes (~20 frames), launch game init.
+             * Kernel idles in scheduler loop at 0x10090000-0x10100000. */
+            if (phase == 99 && vf->frame_count > 55 &&
+                pc >= 0x10090000 && pc < 0x10110000) {
                 phase = 100;
                 /* Fix page table: identity map ALL RAM */
                 uint32_t ttb_off = vf->cpu.cp15.ttb;
