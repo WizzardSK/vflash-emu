@@ -1447,6 +1447,15 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
     if (addr >= VFLASH_IO_BASE) {
         uint32_t off = addr - VFLASH_IO_BASE;
 
+        /* Trace ALL I/O writes after boot_phase 400 (init task) */
+        if (vf->boot_phase >= 400 && (vf->cpu.cpsr & 0x1F) == 0x13) {
+            static int init_iow = 0;
+            if (init_iow < 30) {
+                printf("[INIT-WR] write 0x%08X = 0x%08X PC=%08X\n",
+                       addr, val, vf->cpu.r[15]);
+                init_iow++;
+            }
+        }
         /* Trace I/O writes during FIQ/IRQ handler */
         if (((vf->cpu.cpsr & 0x1F) == 0x11 || (vf->cpu.cpsr & 0x1F) == 0x12) && vf->boot_phase >= 300) {
             static int fiq_iow = 0;
@@ -3234,14 +3243,17 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         }
     }
 
-    /* Intercept sleep/wait function at 0x10011D88.
-     * This function polls I/O waiting for events. On real HW,
-     * it sleeps and is woken by timer IRQ. Return 0 = success. */
+    /* Intercept sleep/wait functions.
+     * 0x10011D88: static sleep function from ROM.
+     * µMORE also generates dynamic event_wait wrappers.
+     * Detect stuck-at-address pattern and skip after timeout. */
     if (addr == 0x10011D88) {
-        cpu->r[0] = 0; /* event received */
+        cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
+    /* Dynamic event_wait skip DISABLED — corrupts task state.
+     * Need proper event signaling instead. */
 
     /* Intercept scheduler init: set sched_state=3 before task_start. */
     if (addr == 0x10085E50) {
@@ -3410,7 +3422,11 @@ void vflash_run_frame(VFlash *vf) {
                 if (loop_1e40 == 0) {
                     vf->cpu.cpsr &= ~0xC0;
                     vf->rtc_regs[0x8C >> 2] = 1;
-                    printf("[SCHED] µMORE init halt — enabling IRQ\n");
+                    /* Patch IRQ vector to use µMORE dispatch at 0x100873D0
+                     * instead of int_disable at 0x10A15CA0. The vector table
+                     * chain: ROM[0x18]→SDRAM[0xFF98]→SDRAM[0xFFB8]. */
+                    *(uint32_t*)(vf->ram + 0xFFB8) = 0x100873D0;
+                    printf("[SCHED] µMORE init halt — patched IRQ dispatch + enabling IRQ\n");
                 }
                 loop_1e40++;
                 /* After 500 ticks at halt, µMORE services are stable.
@@ -4004,7 +4020,7 @@ void vflash_run_frame(VFlash *vf) {
             /* Log IRQ delivery details after µMORE init */
             if (vf->boot_phase >= 300) {
                 static int irq2_log = 0;
-                if (irq2_log < 10 && !(vf->cpu.cpsr & 0x80)) { /* only when IRQ enabled */
+                if (irq2_log < 30 && !(vf->cpu.cpsr & 0x80)) { /* only when IRQ enabled */
                     printf("[IRQ2] Delivering %s: PC=%08X CPSR=%08X\n",
                            use_fiq ? "FIQ" : "IRQ", vf->cpu.r[15], vf->cpu.cpsr);
                     printf("[IRQ2] SDRAM[0xFF98]=%08X [0xFF9C]=%08X [0xFFB8]=%08X [0xFFDC]=%08X\n",
