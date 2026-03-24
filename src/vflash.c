@@ -5037,6 +5037,22 @@ void vflash_run_frame(VFlash *vf) {
         }
     }
 
+    /* Scan for BOOT.BIN callback pointers in µMORE area */
+    if (vf->has_rom && vf->frame_count == 119 && vf->boot_phase >= 100) {
+        printf("[CB-SCAN] Scanning for BOOT.BIN pointers in µMORE area...\n");
+        int found = 0;
+        for (uint32_t a = 0x90000; a < 0xC00000; a += 4) {
+            uint32_t v = *(uint32_t*)(vf->ram + a);
+            if (v >= 0x10C00000 && v < 0x10E00000) {
+                printf("[CB-SCAN] [0x%08X] = 0x%08X (BOOT.BIN ptr)\n",
+                       0x10000000+a, v);
+                found++;
+                if (found > 30) { printf("[CB-SCAN] ... (truncated)\n"); break; }
+            }
+        }
+        printf("[CB-SCAN] Found %d BOOT.BIN pointers\n", found);
+    }
+
     /* Auto-launch game task after µMORE init stabilizes.
      * On frame 120 (after init + bootstrap), find TCB with largest stack
      * and launch it directly. Simple, no complex state tracking. */
