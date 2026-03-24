@@ -26,12 +26,14 @@ void ztimer_tick(ZevioTimer *zt, uint32_t cycles) {
 
     for (int i = 0; i < 2; i++) {
         Timer *t = &zt->timer[i];
-        /* SP804: bit7=enable, bit6=periodic, bit5=IntEnable */
-        if (!(t->ctrl & 0x80)) continue;  /* Not enabled */
+        /* ZEVIO timer: bit0=enable (NOT SP804 bit7!).
+         * Accept either bit0 or bit7 as enable for compatibility. */
+        if (!(t->ctrl & 0x81)) continue;  /* Not enabled */
 
         if (t->count <= cycles) {
-            t->count = (t->ctrl & 0x40) ? t->load : 0;  /* Periodic reload */
-            if (t->ctrl & 0x20) {  /* IntEnable */
+            t->count = (t->ctrl & 0x40) ? t->load : 0;  /* Periodic reload (bit6) */
+            /* IntEnable: bit5 (SP804) or assume always enabled for ZEVIO */
+            if (t->ctrl & 0x21) {  /* IntEnable or just enabled */
                 t->irq_pending = 1;
                 ztimer_raise_irq(zt, IRQ_TIMER0 + i);
             }
@@ -78,7 +80,11 @@ void ztimer_write(ZevioTimer *zt, uint32_t reg, uint32_t val) {
     switch (reg) {
         case REG_IRQ_ENABLE: zt->irq.enable = val; break;
         case REG_IRQ_CLEAR:  zt->irq.status &= ~val; break;
-        case REG_FIQ_SELECT: zt->irq.fiq_sel = val; break;
+        case REG_FIQ_SELECT:
+            if (val != zt->irq.fiq_sel)
+                printf("[ZTIMER] FIQ select: 0x%08X → 0x%08X\n", zt->irq.fiq_sel, val);
+            zt->irq.fiq_sel = val;
+            break;
         case REG_T0_LOAD:    zt->timer[0].load = zt->timer[0].count = val; break;
         case REG_T0_CTRL:    zt->timer[0].ctrl = val; break;
         case REG_T0_CLEAR:   zt->timer[0].irq_pending = 0; ztimer_clear_irq(zt, IRQ_TIMER0); break;

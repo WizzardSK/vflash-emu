@@ -883,7 +883,9 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         uint32_t roff = addr - VFLASH_RAM_BASE;
         /* Flash completion: µMORE loop checks [0x10BBCFF4] and [0x10BBD010].
          * Force bit 0 on both to signal operation complete. */
-        if (vf->boot_phase >= 300 && (roff == 0xBBCFF4 || roff == 0xBBD010)) {
+        /* Flash completion flags — always return with bit0 set.
+         * µMORE flash write/erase code checks these for completion. */
+        if (roff == 0xBBCFF4 || roff == 0xBBD010) {
             return *(uint32_t*)(vf->ram + roff) | 1;
         }
         if (roff == 0x1C9C && vf->atapi.reboot_count >= 2) {
@@ -3267,6 +3269,25 @@ void vflash_run_frame(VFlash *vf) {
             uint32_t pc = vf->cpu.r[15];
             static int phase = 0;
 
+            /* Detect new wait loop at 0x109D1E40 */
+            if (vf->boot_phase >= 300 && pc == 0x109D1E40) {
+                static int loop_1e40 = 0;
+                if (loop_1e40 == 0) {
+                    printf("[SCHED] New loop at 0x109D1E40, dumping:\n");
+                    for (uint32_t da = 0x9D1E20; da < 0x9D1E80; da += 4)
+                        printf("[SCHED]  %08X: %08X\n", 0x10000000+da, *(uint32_t*)(vf->ram+da));
+                    printf("[SCHED] R0=%08X R1=%08X R2=%08X R3=%08X SP=%08X LR=%08X\n",
+                           vf->cpu.r[0], vf->cpu.r[1], vf->cpu.r[2], vf->cpu.r[3],
+                           vf->cpu.r[13], vf->cpu.r[14]);
+                }
+                loop_1e40++;
+                /* Force IRQ enable after some iterations */
+                if (loop_1e40 == 100) {
+                    vf->cpu.cpsr &= ~0x80;
+                    printf("[SCHED] Force-enabled IRQ at 0x109D1E40\n");
+                }
+            }
+
             /* Flash operation completion: µMORE loop at 0x10A1C5xx polls
              * [0x10BBCFF4] bit 0. Set it periodically to simulate flash
              * write/erase completion. This flag is normally set by a flash
@@ -3561,14 +3582,12 @@ void vflash_run_frame(VFlash *vf) {
                         printf("[BOOT] Re-loaded BOOT.BIN (%u bytes)\n", max_sz);
                     }
                 }
-                /* Re-patch IRQ handler — BOOT.BIN init overwrites SDRAM[0xFF98]
-                 * with its own vector table (LDR PC,[PC,#0x18]). Re-install
-                 * our simple timer handler to prevent crash. */
-                {
-                    int32_t b_off = (int32_t)(0xFFF040 - (0xFF98 + 8)) >> 2;
-                    *(uint32_t*)(vf->ram + 0xFF98) = 0xEA000000 | (b_off & 0xFFFFFF);
-                    printf("[BOOT] Re-patched SDRAM[0xFF98] → timer handler\n");
-                }
+                /* After BOOT.BIN init, µMORE IRQ handler is initialized.
+                 * SDRAM[0xFF98] was set to LDR PC,[PC,#0x18] → SDRAM[0xFFB8]
+                 * which points to µMORE dispatch at 0x100873D0.
+                 * Let the native µMORE handler run (don't re-patch). */
+                printf("[BOOT] Using µMORE native IRQ handler: SDRAM[0xFF98]=%08X → [0xFFB8]=%08X\n",
+                       *(uint32_t*)(vf->ram + 0xFF98), *(uint32_t*)(vf->ram + 0xFFB8));
 
                 /* Set init flags so game code progresses:
                  * [0x10BBAE40] = 5: game_init_poll returns 1 (ready)
