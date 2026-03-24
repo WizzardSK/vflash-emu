@@ -3781,6 +3781,31 @@ void vflash_run_frame(VFlash *vf) {
                         }
                     }
                     printf("[BOOT] Found %d $QCB task structs\n", qcb_count);
+                    /* If we found the BOOT.BIN task struct, populate it with
+                     * game entry point so scheduler can dispatch it. */
+                    if (*(uint32_t*)(vf->ram + 0xB908E0) == 0x42435124) {
+                        printf("[BOOT] Populating $QCB at 0x10B908E0 with game entry\n");
+                        /* Set task as ready with saved context pointing to BOOT.BIN.
+                         * Try different offsets for entry point and stack. */
+                        uint32_t t = 0xB908E0;
+                        /* Try common µMORE TCB layouts:
+                         * +0x04 = next task pointer
+                         * +0x08 = priority/flags
+                         * +0x0C = entry point
+                         * +0x10 = stack pointer
+                         * +0x14 = state (0=inactive, 1=ready, 2=running)
+                         */
+                        *(uint32_t*)(vf->ram + t + 0x08) = 1;          /* priority */
+                        *(uint32_t*)(vf->ram + t + 0x0C) = 0x10C0011C; /* entry = BOOT.BIN init */
+                        *(uint32_t*)(vf->ram + t + 0x10) = 0x10FFD000; /* stack */
+                        *(uint32_t*)(vf->ram + t + 0x14) = 1;          /* state = ready */
+                        /* Also try TI-Nspire style: saved context at end */
+                        *(uint32_t*)(vf->ram + t + 0x58) = 0x10C0011C; /* saved PC */
+                        *(uint32_t*)(vf->ram + t + 0x5C) = 0x000000D3; /* saved CPSR */
+                        *(uint32_t*)(vf->ram + t + 0x60) = 0x10FFD000; /* saved SP */
+                        /* Register in task list */
+                        *(uint32_t*)(vf->ram + 0x3585C0) = 0x10B908E0;
+                    }
                 }
                 /* Service at 0x109D11E0 is populated with real code!
                  * Call it directly. SDRAM vectors at 0xFF80+ from reboot #1. */
