@@ -3766,7 +3766,7 @@ void vflash_run_frame(VFlash *vf) {
                     sleep_skip = 0;
                 }
                 sleep_skip++;
-                if (sleep_skip == 500) {
+                if (sleep_skip > 0 && sleep_skip % 500 == 0) {
                     /* Ensure timer is running so IRQ can wake the sleep.
                      * µMORE sleep waits for timer IRQ to context-switch. */
                     if (!(vf->timer.timer[0].ctrl & 0x81)) {
