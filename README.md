@@ -31,8 +31,8 @@ Background voice/SFX audio plays automatically from 561 WAV files on disc.
 
 ## Status
 
-**Full 3-reboot chain working** — µMORE v4.0 RTOS boots completely with 3 warm reboots,
-version banner printed, IRQ handler works, scheduler runs in idle loop.
+**Game task executing** — µMORE v4.0 RTOS boots, 10 task TCBs discovered via Nucleus RTOS
+RE, game task (128KB stack) launched directly. Game code runs through µMORE kernel services.
 
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spider-Man.
 
@@ -52,18 +52,19 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **BOOT.BIN bootstrap → warm reboot #3** | ✅ Callback 0x1880 |
 | **ROM warm boot → scheduler idle** | ✅ 0x10A219xx loop |
 | **Secondary VIC (0xDC000000)** | ✅ Timer IRQ clear |
-| **Game task dispatch** | 🔧 Scheduler idle — no tasks registered |
+| **Nucleus TCB discovery** | ✅ 10 tasks found, entry points + stacks |
+| **Game task launch** | ✅ Task #10 (128KB stack) executing µMORE code |
 
 ### Remaining for gameplay
 
-µMORE scheduler runs stably. BOOT.BIN bootstrap callback intercepted with game
-trampoline. BOOT.BIN init funcs run but only do kernel-level init — they don't
-populate game context (0x10B668A0 still empty after init). Game task registration
-happens via µMORE scheduler dispatch chain which we can't trigger.
+Game task executes µMORE kernel code (0x10A06Exx, 0x10A157xx). Need to trace
+whether game reaches BOOT.BIN code, accesses CD-ROM for assets, or writes to
+LCD framebuffer. Currently no visible output — task runs kernel service calls.
 
-**Interrupt controller** implemented per TI-Nspire Firebird reference (acknowledge,
-end-of-interrupt, priority). **Multi-game support**: dynamic service entry from
-SDRAM vectors. Tested: Cars + Incredibles show µMORE banner, others vary.
+**Nucleus RTOS** confirmed via Ndless/Nspire RE (NU_ API). TCB format reverse-engineered:
+`$QCB` magic, `$QBT` sub-magic, entry at +0x2C, stack at +0x30/+0x34, priority at +0x3C.
+**Firebird-style interrupt controller** at 0xDC000000 (ACK, EOI, priority).
+**Multi-game**: dynamic service entry from SDRAM vectors. Tested 6 games.
 
 ### Asset Browser
 
