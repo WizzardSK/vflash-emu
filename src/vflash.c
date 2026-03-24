@@ -5051,6 +5051,16 @@ void vflash_run_frame(VFlash *vf) {
             }
         }
         printf("[CB-SCAN] Found %d BOOT.BIN pointers\n", found);
+        /* Callback context at 0x10BE4BA8 — inject BOOT.BIN entries.
+         * Try populating with game callback at various offsets.
+         * On real HW, BOOT.BIN init fills this during warm reboot chain. */
+        printf("[CB-CTX] Injecting BOOT.BIN callback at 0x10BE4BA8\n");
+        /* Typical Nucleus event callback table: array of function pointers.
+         * Each entry: {callback_fn, user_data}. Try first 8 slots. */
+        for (int s = 0; s < 8; s++) {
+            *(uint32_t*)(vf->ram + 0xBE4BA8 + s * 8) = 0x10C0011C; /* BOOT.BIN init */
+            *(uint32_t*)(vf->ram + 0xBE4BA8 + s * 8 + 4) = 0; /* user data */
+        }
         /* Dump area around first cluster at 0x1009D160-0x1009D190 */
         printf("[CB-SCAN] Context around first cluster:\n");
         for (uint32_t d = 0x9D160; d < 0x9D1C0; d += 16)
