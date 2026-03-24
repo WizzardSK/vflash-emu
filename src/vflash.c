@@ -3529,6 +3529,24 @@ void vflash_run_frame(VFlash *vf) {
                 }
             }
 
+            /* Dump scheduler dispatch code once */
+            if (vf->boot_phase >= 300 && vf->frame_count == 150) {
+                static int sched_dump = 0;
+                if (!sched_dump) {
+                    sched_dump = 1;
+                    printf("[SCHED-CODE] Scheduler idle loop at 0x10A219xx:\n");
+                    for (uint32_t da = 0xA21980; da < 0xA21A20; da += 4)
+                        printf("  %08X: %08X\n", 0x10000000+da, *(uint32_t*)(vf->ram+da));
+                    printf("[SCHED-CODE] Dispatch area at 0x109D1B30:\n");
+                    for (uint32_t da = 0x9D1B30; da < 0x9D1B80; da += 4)
+                        printf("  %08X: %08X\n", 0x10000000+da, *(uint32_t*)(vf->ram+da));
+                    /* Also dump the event_wait/scheduler tick area */
+                    printf("[SCHED-CODE] Event area at 0x10A157xx:\n");
+                    for (uint32_t da = 0xA15780; da < 0xA157E0; da += 4)
+                        printf("  %08X: %08X\n", 0x10000000+da, *(uint32_t*)(vf->ram+da));
+                }
+            }
+
             /* Track init task — log boot_phase at specific frames */
             if (vf->frame_count == 110 || vf->frame_count == 200) {
                 static int bp_log = 0;
