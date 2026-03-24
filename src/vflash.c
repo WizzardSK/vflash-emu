@@ -3507,12 +3507,12 @@ void vflash_run_frame(VFlash *vf) {
                         printf("[SCHED]  %08X: %08X\n", 0x10000000+da, *(uint32_t*)(vf->ram+da));
                 }
                 if (loop_1e40 == 200) {
-                    /* µMORE services registered. Now run init task (0x100113DC)
-                     * which does peripheral setup and calls BOOT.BIN callback.
-                     * Callback at RAM[0xC00020] is patched to idle.
-                     * Init task may register game task in scheduler along the way. */
-                    printf("[SCHED] Running init task 0x100113DC (callback→idle)\n");
-                    /* Re-load BOOT.BIN (service entry may have modified it) */
+                    /* µMORE services registered. Run BOOT.BIN bootstrap.
+                     * Bootstrap calls init funcs that populate µMORE structures.
+                     * Intercept callback (0x1880) → redirect to game init
+                     * instead of warm reboot. */
+                    printf("[SCHED] Launching BOOT.BIN bootstrap (callback→game)\n");
+                    /* Re-load BOOT.BIN */
                     if (vf->cd && vf->cd->is_open) {
                         CDEntry be;
                         if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &be)) {
@@ -3522,31 +3522,54 @@ void vflash_run_frame(VFlash *vf) {
                             cdrom_read_file(vf->cd, &be, vf->ram + dest, 0, msz);
                         }
                     }
-                    /* Let callback trigger warm reboot #3 (0x1880).
-                     * Reboot #3 handler will run ROM warm boot naturally. */
-                    /* Don't patch: *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFF000; */
-                    /* Enable timer for init task */
-                    vf->timer.timer[0].load = 37500;
-                    vf->timer.timer[0].count = 37500;
-                    vf->timer.timer[0].ctrl = 0xE2;
-                    vf->timer.irq.enable |= 0x01;
-                    /* Set task dispatch flag AFTER µMORE init (so it persists).
-                     * IRQ handler checks *(0x10BC2BC0) before task_dispatch. */
-                    *(uint32_t*)(vf->ram + 0xBC2BC0) = 1;
-                    printf("[SCHED] Set late task dispatch flag [0x10BC2BC0]=1\n");
-                    /* Launch init task */
-                    vf->cpu.cpsr = 0x00000053; /* SVC, IRQ enabled, FIQ disabled */
-                    vf->cpu.r[15] = 0x100113DC;
-                    vf->cpu.r[13] = 0x101D42A8; /* init task stack */
-                    vf->cpu.r[14] = 0x10FFF000; /* return to idle */
-                    vf->boot_phase = 400;
+                    /* Write game trampoline at 0x10FFE100.
+                     * Called instead of warm reboot callback.
+                     * Calls game init wrapper, then idles with IRQ. */
+                    {
+                        uint32_t t = 0xFFE100;
+                        /* Game trampoline:
+                         * LDR R0, =context  ; game context pointer
+                         * LDR SP, =stack    ; fresh stack
+                         * BL game_main      ; call game
+                         * B .               ; idle after return
+                         * pool: context, stack */
+                        *(uint32_t*)(vf->ram+t+0x00) = 0xE59F0010; /* LDR R0,[PC,#+16] → pool[0x18] */
+                        *(uint32_t*)(vf->ram+t+0x04) = 0xE59FD010; /* LDR SP,[PC,#+16] → pool[0x1C] */
+                        *(uint32_t*)(vf->ram+t+0x08) = 0xE28FE004; /* ADR LR,+12 (return to B .) */
+                        /* Call game init wrapper 0x10C16D84.
+                         * Returns: 1 = success, 0/-1 = fail.
+                         * We call in a loop until it returns 1, then
+                         * call game_main with proper context. */
+                        int32_t off = (int32_t)(0xC16D84 - (t+0x0C+8)) >> 2;
+                        *(uint32_t*)(vf->ram+t+0x0C) = 0xEB000000|(off&0xFFFFFF); /* BL game_init_wrapper */
+                        *(uint32_t*)(vf->ram+t+0x10) = 0xE10F0000; /* MRS R0,CPSR */
+                        *(uint32_t*)(vf->ram+t+0x14) = 0xEAFFFFFE; /* B . (idle) */
+                        /* Pool data */
+                        *(uint32_t*)(vf->ram+t+0x18) = 0x10B668A0; /* game context */
+                        *(uint32_t*)(vf->ram+t+0x1C) = 0x10FFD000; /* stack */
+                        /* Also fill game context field that game_main checks */
+                        *(uint8_t*)(vf->ram + 0xB668A0) = 1; /* state byte at context+0 */
+                        *(uint8_t*)(vf->ram + 0xB668C4) = 1; /* context+0x24 */
+                    }
+                    /* Patch callback to trampoline (not 0x1880 warm reboot) */
+                    *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFE100;
+                    /* Set game init flags */
+                    *(uint32_t*)(vf->ram + 0xBBAE40) = 5;
+                    *(uint16_t*)(vf->ram + 0xBE49E0) = 1;
+                    /* LCD */
+                    vf->lcd.upbase = 0x10800000;
+                    vf->lcd.control = 0x182B;
+                    /* Launch bootstrap */
+                    vf->cpu.cpsr = 0x000000D3;
+                    vf->cpu.r[15] = 0x10C00010;
+                    vf->cpu.r[13] = 0x10C0425C;
+                    vf->cpu.r[14] = 0x10FFF000;
+                    vf->boot_phase = 500;
                 }
             }
 
-            /* After init task completes (B . at 0x1001158C), the kernel
-             * is fully initialized. Now we need BOOT.BIN to run.
-             * Directly jump to BOOT.BIN bootstrap which sets up game. */
-            if (vf->boot_phase == 400 && pc == 0x1001158C) {
+            /* POST-INIT disabled — bootstrap launched from init halt instead. */
+            if (0 && vf->boot_phase == 400 && pc == 0x1001158C) {
                 static int post_init = 0;
                 post_init++;
                 if (post_init == 100) { /* let a few ticks pass */
