@@ -31,35 +31,34 @@ Background voice/SFX audio plays automatically from 561 WAV files on disc.
 
 ## Status
 
-**µMORE RTOS kernel running natively** — ROM → kernel → BOOT.BIN init → µMORE service entry → native scheduler.
-BOOT.BIN init populates real ARM code at service entry points. µMORE scheduler executes natively with timer IRQs.
+**µMORE v4.0 RTOS boots natively** — full warm reboot chain, RTOS prints version banner,
+FIQ dispatch with populated vector table. Two warm reboots complete naturally.
 
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spider-Man.
 
-### Boot Flow (complete!)
+### Boot Flow
 
 | Step | Status |
 |------|--------|
 | ROM boot + flash remap | ✅ |
 | SDRAM calibration | ✅ Passes naturally |
 | 7 init functions (PLL, memcpy, BSS, MMU, cache) | ✅ All native |
-| µMORE scheduler | ✅ Active at 0x10010234 |
-| Heap init (1MB free-list) | ✅ 0x103596B0 |
-| Task registration ($TCB) | ✅ 0x100AC0E0 |
-| Timer + IRQ vector chain | ✅ ROM→SDRAM[0xFF98]→handler |
-| **BOOT.BIN init** | ✅ Runs with own MMU (TTB=0x10C08000) |
-| **Service entry (0x109D11E0)** | ✅ Real code, launches µMORE scheduler |
-| **µMORE native scheduler** | ✅ Runs at 0x10A1xxxx with timer IRQs |
-| **Event controller** | ✅ Bit5 status for event pending |
-| **Display init** | 🔧 Stuck in NOR flash polling loop |
+| µMORE scheduler + heap (1MB) | ✅ Active at 0x10010234 |
+| Init task → warm reboot #1 | ✅ 0x100113DC → 0x900A0008 |
+| BOOT.BIN bootstrap → warm reboot #2 | ✅ Init functions + 0x1880 |
+| BOOT.BIN init (0x10C0011C) | ✅ Populates service entry + vectors |
+| **µMORE service entry (0x109D11E0)** | ✅ Registers services, prints banner |
+| **µMORE version banner** | ✅ "µMORE v4.0 SDK ARM9T version" |
+| **FIQ vector dispatch** | ✅ ROM→0xD00→SDRAM[0xFF9C]→0x10A15DA4 |
+| **FIQ handler (0x10A15DA4)** | 🔧 Runs but doesn't clear timer IRQ |
 
 ### Remaining for gameplay
 
-µMORE kernel runs natively after BOOT.BIN init populates service entry at 0x109D11E0.
-Scheduler executes real kernel code at 0x10A219xx/0x10A1C5xx with timer IRQs (~66/frame).
-Currently stuck in display initialization loop that polls NOR flash status (0xB8000004)
-and RAM completion flags at 0x10BBCFFx. Need to emulate flash write completion sequence
-or identify the exact loop exit condition.
+µMORE RTOS boots fully: two warm reboots, BOOT.BIN init populates service entry and
+FIQ vector table, scheduler registers services 2/3/4, prints version banner. Timer FIQ
+fires and dispatches to µMORE FIQ handler at 0x10A15DA4. Handler runs but doesn't clear
+the timer interrupt, causing FIQ re-delivery. Need to debug the FIQ handler's timer
+clear path or fix the VIC register interface.
 
 ### Asset Browser
 
@@ -91,10 +90,11 @@ ROM[0x00] → flash copy → flash remap (0x118)
   → BSS clear (0x5D0) → page table + MMU (0x704)
   → cache invalidate (0x7D0)
   → scheduler (0x10010234) → heap (1MB) → task_start ($TCB)
-  → timer + IRQ (ROM→SDRAM[0xFF98]→handler)
-  → BOOT.BIN init (0x10C0011C, own MMU at TTB=0x10C08000)
-  → service entry (0x109D11E0, real code from BOOT.BIN init)
-  → µMORE native scheduler (0x10A219xx, timer IRQs active)
+  → init task (0x100113DC) → warm reboot #1
+  → BOOT.BIN bootstrap (0x10C00010) → warm reboot #2
+  → BOOT.BIN init (0x10C0011C) → populates 0x109D11E0 + vectors
+  → µMORE service entry → "µMORE v4.0 SDK ARM9T version"
+  → scheduler halt → FIQ dispatch (0x10A15DA4)
 ```
 
 ### Physical Memory Map (ZEVIO 1020)
@@ -136,6 +136,11 @@ ROM[0x00] → flash copy → flash remap (0x118)
 | Phase 100 PC range | Kernel idle at 0x10095Bxx not detected | Widen range to 0x10090000-0x10110000 |
 | Event controller bit5 | Scheduler stuck in event wait | Return bit5 when timer IRQ pending |
 | HLE blocked real code | Service at 0x109D11E0 intercepted | Skip HLE when memory is non-zero |
+| NOR flash write verify | Flash polling loop stuck | Track last written value, return on read |
+| ZEVIO timer bit0 enable | Timer didn't tick (not SP804) | Accept bit0 or bit7 as enable |
+| One-shot timer re-fire | FIQ storm from cnt=0 loop | Disable timer after one-shot fires |
+| µMORE FIQ routing | All IRQs routed to FIQ | Handle fiq_sel=0xFFFFFFFF correctly |
+| RTC 0x8C FIQ flag | ROM FIQ handler skipped dispatch | Store writes, return for FIQ flag |
 
 ### Subsystems
 - ATAPI CD-ROM: INQUIRY, READ(10), READ CD, READ TOC, READ CAPACITY, MODE SENSE
