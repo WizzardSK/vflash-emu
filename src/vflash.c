@@ -3384,9 +3384,13 @@ void vflash_run_frame(VFlash *vf) {
                 loop_1e40++;
                 /* After 500 ticks at halt, µMORE services are stable.
                  * Launch game code directly since scheduler has no tasks. */
-                if (loop_1e40 == 500) {
-                    printf("[SCHED] Launching game main at 0x10CFAEA0\n");
-                    /* Re-load BOOT.BIN for game code */
+                if (loop_1e40 == 200) {
+                    /* µMORE services registered. Now run init task (0x100113DC)
+                     * which does peripheral setup and calls BOOT.BIN callback.
+                     * Callback at RAM[0xC00020] is patched to idle.
+                     * Init task may register game task in scheduler along the way. */
+                    printf("[SCHED] Running init task 0x100113DC (callback→idle)\n");
+                    /* Re-load BOOT.BIN (service entry may have modified it) */
                     if (vf->cd && vf->cd->is_open) {
                         CDEntry be;
                         if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &be)) {
@@ -3396,30 +3400,18 @@ void vflash_run_frame(VFlash *vf) {
                             cdrom_read_file(vf->cd, &be, vf->ram + dest, 0, msz);
                         }
                     }
-                    /* Set init flags for game code:
-                     * [0x10BBAE40] = 5: game_init_poll returns success
-                     * [0x10BE49E0] = 1: game main state != 0
-                     * [0x10B69144] = game context at +0x28A4, must be non-zero
-                     *   (read by getter at 0x10CEA01C, checked by game main) */
-                    *(uint32_t*)(vf->ram + 0xBBAE40) = 5;
-                    *(uint16_t*)(vf->ram + 0xBE49E0) = 1;
-                    *(uint32_t*)(vf->ram + 0xB69144) = 1; /* game context field */
-                    /* Launch game on separate stack.
-                     * Game main at 0x10CFAEA0 expects R0 = game context pointer.
-                     * R0 is saved as R6 and used for byte reads at [R6+offset]. */
-                    vf->cpu.cpsr = 0x00000013; /* SVC, IRQ+FIQ enabled */
-                    vf->cpu.r[15] = 0x10CFAEA0;
-                    vf->cpu.r[13] = 0x10FFD000;
-                    vf->cpu.r[14] = 0x109D1E40; /* return to halt */
-                    /* R0 = game context. Allocate a fake one in high RAM.
-                     * Set key fields: +0x00 = state byte (non-zero to run) */
-                    {
-                        uint32_t ctx = 0xF80000; /* fake game context */
-                        memset(vf->ram + ctx, 0, 0x100);
-                        *(uint8_t*)(vf->ram + ctx + 0x00) = 1; /* state */
-                        *(uint8_t*)(vf->ram + ctx + 0x24) = 1; /* checked by game main */
-                        vf->cpu.r[0] = 0x10000000 + ctx;
-                    }
+                    /* Patch callback to idle (prevent warm reboot) */
+                    *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFF000;
+                    /* Enable timer for init task */
+                    vf->timer.timer[0].load = 37500;
+                    vf->timer.timer[0].count = 37500;
+                    vf->timer.timer[0].ctrl = 0xE2;
+                    vf->timer.irq.enable |= 0x01;
+                    /* Launch init task */
+                    vf->cpu.cpsr = 0x00000053; /* SVC, IRQ enabled, FIQ disabled */
+                    vf->cpu.r[15] = 0x100113DC;
+                    vf->cpu.r[13] = 0x101D42A8; /* init task stack */
+                    vf->cpu.r[14] = 0x10FFF000; /* return to idle */
                     vf->boot_phase = 400;
                 }
             }
