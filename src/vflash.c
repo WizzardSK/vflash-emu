@@ -999,25 +999,51 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             return 0x01; /* generic "ready" status */
         }
 
-        /* Secondary interrupt controller at 0xDC000000 (off = 0x5C000000).
-         * µMORE FIQ handler reads 0xDC000124/128 for interrupt source,
-         * writes 0xDC00012C to clear. Return timer IRQ status. */
+        /* Interrupt controller at 0xDC000000 (Firebird: interrupt.c).
+         * Register layout (group = addr >> 8 & 3):
+         * Group 0 (0x000-0x0FF): IRQ registers
+         * Group 1 (0x100-0x1FF): FIQ registers
+         * Per group:
+         *   0x00: masked status (status & mask)
+         *   0x04: raw status
+         *   0x08: mask set
+         *   0x0C: mask clear
+         *   0x20: current highest priority interrupt (read-only)
+         *   0x24: acknowledge (read: returns current int + lowers pri limit)
+         *   0x28: end-of-interrupt (read: restores pri limit, may clear IRQ)
+         *   0x2C: priority limit */
         if (off >= 0x5C000000u && off < 0x5C001000u) {
             uint32_t sreg = off - 0x5C000000u;
-            /* Secondary interrupt controller at 0xDC000000.
-             * NOT a mirror of primary VIC — separate register layout.
-             * Return timer IRQ status for status registers. */
-            switch (sreg) {
-                case 0x000: /* IRQ status — report all active sources */
-                    return ((vf->timer.irq.status & vf->timer.irq.enable) ? 1 : 0)
-                         | 0xFE; /* all peripheral IRQs active */
-                case 0x024: /* IRQ status (alternate) */
-                    return ((vf->timer.irq.status & vf->timer.irq.enable) ? 1 : 0)
-                         | 0xFE;
-                case 0x028: /* Raw interrupt status */
-                    return vf->timer.irq.status | 0xFE;
-                default: return 0;
+            int group = (sreg >> 8) & 3;
+            int reg = sreg & 0xFF;
+
+            /* Active interrupt sources: bit 0 = timer */
+            uint32_t active = (vf->timer.irq.status & vf->timer.irq.enable) ? 1 : 0;
+
+            if (group < 2) { /* IRQ (0) or FIQ (1) group */
+                switch (reg) {
+                    case 0x00: return active;   /* masked status */
+                    case 0x04: return active;   /* raw status */
+                    case 0x08: return 0xFFFFFFFF; /* mask (all enabled) */
+                    case 0x0C: return 0xFFFFFFFF;
+                    case 0x20: return active ? 0 : (uint32_t)-1; /* current int */
+                    case 0x24: /* ACK: return current int, lower priority */
+                        return active ? 0 : (uint32_t)-1; /* int 0 = timer */
+                    case 0x28: /* EOI: clear interrupt line, return prev pri limit */
+                        vf->timer.irq.status &= ~1; /* clear timer */
+                        vf->timer.timer[0].irq_pending = 0;
+                        return 0;
+                    case 0x2C: return 0; /* priority limit */
+                    default: return 0;
+                }
+            } else if (group == 2) {
+                switch (reg) {
+                    case 0x00: return 0xFFFFFFFF; /* noninverted */
+                    case 0x04: return 0; /* sticky */
+                    default: return 0;
+                }
             }
+            return 0;
         }
 
         /* PL111 LCD Controller at 0xC0000000 (off = 0x40000000) */
@@ -1037,13 +1063,14 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         }
 
         /* PL190 VIC at 0xDC000000 (off = 0x5C000000) */
+        /* Secondary VIC for 16-bit reads: same as 32-bit handler */
         if (off >= 0x5C000000u && off < 0x5C001000u) {
-            uint32_t vreg = off - 0x5C000000u;
-            switch (vreg) {
-                case 0x000: return vf->timer.irq.status & vf->timer.irq.enable; /* IRQStatus */
-                case 0x004: return vf->timer.irq.status & vf->timer.irq.fiq_sel; /* FIQStatus */
-                case 0x008: return vf->timer.irq.status;  /* RawIntr */
-                case 0x010: return vf->timer.irq.enable;   /* IntEnable */
+            uint32_t active = (vf->timer.irq.status & vf->timer.irq.enable) ? 1 : 0;
+            int reg = (off - 0x5C000000u) & 0xFF;
+            switch (reg) {
+                case 0x00: return active;
+                case 0x04: return active;
+                case 0x24: return active ? 0 : (uint32_t)-1;
                 default: return 0;
             }
         }
@@ -1486,12 +1513,18 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
         /* Secondary interrupt controller at 0xDC000000 (off = 0x5C000000) */
         if (off >= 0x5C000000u && off < 0x5C001000u) {
             uint32_t sreg = off - 0x5C000000u;
-            /* Clear interrupt: handler writes 0 to 0x2C */
-            if (sreg == 0x02C) {
-                vf->timer.irq.status &= ~1; /* clear timer bit */
-                vf->timer.timer[0].irq_pending = 0;
+            int group = (sreg >> 8) & 3;
+            int reg = sreg & 0xFF;
+            if (group < 2) {
+                switch (reg) {
+                    case 0x04: /* clear sticky/status bits */
+                        vf->timer.irq.status &= ~val;
+                        vf->timer.timer[0].irq_pending = 0;
+                        break;
+                    case 0x2C: /* priority limit restore (EOI completion) */
+                        break;
+                }
             }
-            /* Absorb all other writes (enable, select, etc.) */
             return;
         }
 
