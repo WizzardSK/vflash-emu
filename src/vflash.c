@@ -3308,14 +3308,17 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     if (addr == 0x10011D88) {
         static int sleep_log = 0;
         if (sleep_log < 10)
-            printf("[SLEEP] 0x10011D88 called from LR=%08X R0=%08X boot_phase=%d\n",
-                   cpu->r[14], cpu->r[0], ((VFlash*)ctx)->boot_phase);
+            printf("[SLEEP] 0x10011D88 from LR=%08X bp=%d\n",
+                   cpu->r[14], ((VFlash*)ctx)->boot_phase);
         sleep_log++;
-        /* Always skip sleep — return 0 immediately.
-         * Native sleep blocks init task and prevents callback call. */
-        cpu->r[0] = 0;
-        cpu->r[15] = cpu->r[14] & ~3u;
-        return 1;
+        /* Skip sleep in early boot (< 600). After boot_phase 600,
+         * let sleep run natively — sleep-wake simulator handles it. */
+        if (((VFlash*)ctx)->boot_phase < 600) {
+            cpu->r[0] = 0;
+            cpu->r[15] = cpu->r[14] & ~3u;
+            return 1;
+        }
+        return 0; /* native execution */
     }
     /* Dynamic event_wait skip DISABLED — corrupts task state.
      * Need proper event signaling instead. */
@@ -3507,11 +3510,11 @@ void vflash_run_frame(VFlash *vf) {
                         printf("[SCHED]  %08X: %08X\n", 0x10000000+da, *(uint32_t*)(vf->ram+da));
                 }
                 if (loop_1e40 == 200) {
-                    /* µMORE services registered. Run BOOT.BIN bootstrap.
-                     * Bootstrap calls init funcs that populate µMORE structures.
-                     * Intercept callback (0x1880) → redirect to game init
-                     * instead of warm reboot. */
-                    printf("[SCHED] Launching BOOT.BIN bootstrap (callback→game)\n");
+                    /* µMORE services registered. Run init task again.
+                     * First run had sleep intercepted (instant return).
+                     * Second run: let sleep-wake simulation work — init task
+                     * should progress past sleep to game registration. */
+                    printf("[SCHED] Re-running init task with sleep-wake\n");
                     /* Re-load BOOT.BIN */
                     if (vf->cd && vf->cd->is_open) {
                         CDEntry be;
@@ -3571,12 +3574,12 @@ void vflash_run_frame(VFlash *vf) {
                     /* LCD */
                     vf->lcd.upbase = 0x10800000;
                     vf->lcd.control = 0x182B;
-                    /* Launch bootstrap */
-                    vf->cpu.cpsr = 0x000000D3;
-                    vf->cpu.r[15] = 0x10C00010;
-                    vf->cpu.r[13] = 0x10C0425C;
+                    /* Launch init task (second run — with sleep-wake) */
+                    vf->cpu.cpsr = 0x00000053; /* SVC, IRQ enabled */
+                    vf->cpu.r[15] = 0x100113DC;
+                    vf->cpu.r[13] = 0x101D42A8;
                     vf->cpu.r[14] = 0x10FFF000;
-                    vf->boot_phase = 600; /* trampoline detection */
+                    vf->boot_phase = 600; /* enable sleep-wake detection */
                 }
             }
 
@@ -3631,6 +3634,37 @@ void vflash_run_frame(VFlash *vf) {
                             printf("[SNAPSHOT-POST]  0x%08X-0x10C00000\n", 0x10000000+run_start);
                     }
                     vf->boot_phase = 700;
+                }
+            }
+
+            /* Simulate µMORE sleep-wake: when init task hits B . (sleep),
+             * skip it after timeout by returning to caller (PC = LR).
+             * This simulates scheduler waking the task after sleep timer. */
+            if (vf->boot_phase >= 600 && pc >= 0x10010000 && pc < 0x10020000 &&
+                *(uint32_t*)(vf->ram + (pc - 0x10000000)) == 0xEAFFFFFE) {
+                static int sleep_skip = 0;
+                static uint32_t last_sleep_pc = 0;
+                if (pc != last_sleep_pc) {
+                    /* New sleep address — reset counter */
+                    printf("[SLEEP-WAKE] Init task sleep at 0x%08X LR=%08X\n",
+                           pc, vf->cpu.r[14]);
+                    last_sleep_pc = pc;
+                    sleep_skip = 0;
+                }
+                sleep_skip++;
+                if (sleep_skip == 500) {
+                    /* Ensure timer is running so IRQ can wake the sleep.
+                     * µMORE sleep waits for timer IRQ to context-switch. */
+                    if (!(vf->timer.timer[0].ctrl & 0x81)) {
+                        printf("[SLEEP-WAKE] Re-enabling timer for sleep wake\n");
+                        vf->timer.timer[0].load = 37500;
+                        vf->timer.timer[0].count = 37500;
+                        vf->timer.timer[0].ctrl = 0xE2;
+                        vf->timer.irq.enable |= 0x01;
+                    }
+                    /* Also ensure IRQ enabled in CPSR */
+                    vf->cpu.cpsr &= ~0xC0;
+                    sleep_skip = 0;
                 }
             }
 
