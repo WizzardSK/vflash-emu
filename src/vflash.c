@@ -2029,22 +2029,75 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                     printf("[REBOOT] Timer0 configured: load=%u\n", vf->timer.timer[0].load);
                 }
 
-                /* Set warm boot flag and let ROM run from 0.
-                 * ROM detects bit1=1 at 0x900A000C and takes warm boot path
-                 * at ROM[0xA0], which skips BSS clear and jumps to scheduler
-                 * via SDRAM vector chain at 0xFFC8+. */
-                vf->misc_regs[0x0C >> 2] |= 0x02;
                 if (vf->atapi.reboot_count > 5) {
                     printf("[REBOOT] Too many reboots, stopping\n");
                     return;
                 }
+
+                if (vf->atapi.reboot_count >= 2) {
+                    /* Reboot #2+: SDRAM vectors at 0xFF80+ populated by reboot #1.
+                     * Re-load BOOT.BIN, run init, then launch service entry.
+                     * The vectors will enable µMORE FIQ dispatch to work properly. */
+                    printf("[REBOOT] Reboot #%d: BOOT.BIN init → service entry\n",
+                           vf->atapi.reboot_count);
+
+                    /* Re-load BOOT.BIN from disc */
+                    if (vf->cd && vf->cd->is_open) {
+                        CDEntry boot_entry;
+                        if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &boot_entry)) {
+                            uint32_t dest = 0xC00000;
+                            uint32_t max_sz = VFLASH_RAM_SIZE - dest;
+                            if (boot_entry.size < max_sz) max_sz = boot_entry.size;
+                            cdrom_read_file(vf->cd, &boot_entry,
+                                vf->ram + dest, 0, max_sz);
+                        }
+                    }
+
+                    /* Log SDRAM vectors (should be populated from reboot #1) */
+                    printf("[REBOOT] Vectors: [0xFF9C]=%08X [0xFFB8]=%08X [0xFFBC]=%08X [0xFFDC]=%08X\n",
+                           *(uint32_t*)(vf->ram+0xFF9C), *(uint32_t*)(vf->ram+0xFFB8),
+                           *(uint32_t*)(vf->ram+0xFFBC), *(uint32_t*)(vf->ram+0xFFDC));
+
+                    /* Patch callback to idle (prevent warm reboot loop) */
+                    *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFF000;
+
+                    /* Fix page table: identity map ALL 16MB RAM */
+                    {
+                        uint32_t ttb_off = 0xA8000; /* ROM page table */
+                        for (uint32_t mb = 0x100; mb <= 0x10F; mb++) {
+                            uint32_t *l1 = (uint32_t*)(vf->ram + ttb_off + mb*4);
+                            if ((*l1 & 3) == 0)
+                                *l1 = (mb << 20) | 0xC0E;
+                        }
+                    }
+
+                    /* Disable timer during init */
+                    vf->timer.timer[0].ctrl = 0x10;
+                    vf->timer.timer[0].irq_pending = 0;
+                    vf->timer.irq.status = 0;
+
+                    /* Run BOOT.BIN init (populates service entry at 0x109D11E0) */
+                    vf->cpu.cp15.ttb = 0x100A8000;
+                    vf->cpu.cp15.mmu_enabled = 1;
+                    vf->cpu.cp15.control = 0x0000507D;
+                    tlb_flush();
+                    vf->cpu.null_trap_enabled = 1;
+                    vf->cpu.cpsr = 0x000000D3;
+                    vf->cpu.r[15] = 0x10C0011C;
+                    vf->cpu.r[13] = 0x10FFE000;
+                    vf->cpu.r[14] = 0x10FFF000;
+                    vf->boot_phase = 100; /* phase 101 will detect idle → launch service */
+                    printf("[REBOOT] → BOOT.BIN init at 0x10C0011C\n");
+                    return;
+                }
+
+                /* Reboot #1: let ROM run from 0 with warm boot flag */
+                vf->misc_regs[0x0C >> 2] |= 0x02;
                 arm9_reset(&vf->cpu);
-                /* Disable timer during ROM init */
                 vf->timer.timer[0].ctrl = 0x10;
                 vf->timer.timer[0].irq_pending = 0;
                 vf->timer.irq.status = 0;
                 vf->timer.irq.fiq_sel = 0;
-                /* Let ROM run from 0 — it will detect warm boot flag */
                 vf->cpu.r[15] = 0x00000000;
                 vf->cpu.cpsr = 0x000000D3;
                 printf("[REBOOT] → ROM at 0x00000000 (warm boot flag set)\n");
@@ -3420,8 +3473,9 @@ void vflash_run_frame(VFlash *vf) {
                 }
             }
 
-            /* After kernel stabilizes, launch BOOT.BIN init. */
-            if (phase == 99 && vf->frame_count > 55 &&
+            /* DISABLED: direct BOOT.BIN init. Let natural warm reboot populate vectors.
+             * Phase 200 (init task) → reboot #1 → BOOT.BIN → reboot #2 → service entry. */
+            if (0 && phase == 99 && vf->frame_count > 55 &&
                 pc >= 0x10090000 && pc < 0x10110000) {
                 phase = 100;
                 /* Fix page table: identity map ALL RAM */
@@ -3471,8 +3525,10 @@ void vflash_run_frame(VFlash *vf) {
                 printf("[BOOT] Running BOOT.BIN init at 0x10C0011C (callback→idle)\n");
             }
 
-            /* Phase 101: BOOT.BIN init done → idle reached → launch game */
-            if (phase == 100 && (pc == 0x10FFF000 || pc == 0x10FFF00C)) {
+            /* Phase 101: BOOT.BIN init done → idle reached → launch service entry.
+             * Triggered by either static phase==100 OR boot_phase==100 (from reboot handler). */
+            if ((phase == 100 || vf->boot_phase == 100) && (pc == 0x10FFF000 || pc == 0x10FFF00C)) {
+                phase = 101; /* sync both */
                 phase = 101;
                 printf("[BOOT] BOOT.BIN init complete → idle at 0x%08X\n", pc);
                 /* Check if BSS service table got populated */
@@ -3502,13 +3558,13 @@ void vflash_run_frame(VFlash *vf) {
                        *(uint32_t*)(vf->ram+0x3585C0), *(uint32_t*)(vf->ram+0x3585E0));
                 printf("[BOOT] Heap: [0x359660]=%08X\n", *(uint32_t*)(vf->ram+0x359660));
                 /* Service at 0x109D11E0 is populated with real code!
-                 * Call it directly with proper register setup. */
+                 * Call it directly. SDRAM vectors at 0xFF80+ from reboot #1. */
                 printf("[BOOT] Service 0x109D11E0 populated — calling directly\n");
-                /* Re-patch IRQ handler (BOOT.BIN init overwrites SDRAM[0xFF98]) */
-                {
-                    int32_t b_off2 = (int32_t)(0xFFF040 - (0xFF98 + 8)) >> 2;
-                    *(uint32_t*)(vf->ram + 0xFF98) = 0xEA000000 | (b_off2 & 0xFFFFFF);
-                }
+                printf("[BOOT] FIQ vectors: [0xFF9C]=%08X [0xFFBC]=%08X\n",
+                       *(uint32_t*)(vf->ram+0xFF9C), *(uint32_t*)(vf->ram+0xFFBC));
+                /* Don't re-patch SDRAM[0xFF98] — let native µMORE FIQ handler run.
+                 * Set FIQ handler flag at RTC[0x8C] for ROM FIQ dispatch. */
+                vf->rtc_regs[0x8C >> 2] = 1;
                 /* Re-enable MMU with full RAM identity map */
                 vf->cpu.cp15.ttb = 0x100A8000;
                 vf->cpu.cp15.mmu_enabled = 1;
