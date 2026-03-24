@@ -1437,6 +1437,13 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
 
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
         uint32_t roff = addr - VFLASH_RAM_BASE;
+        /* µMORE IRQ handler task dispatch flag at 0x10BC2BC0.
+         * BLNE 0x10A15D78 = IRQ return (if flag!=0, return immediately).
+         * If flag==0, handler continues to task dispatch code.
+         * We want dispatch, so FORCE flag to 0. */
+        if (roff == 0xBC2BC0 && val != 0 && vf->boot_phase >= 300) {
+            val = 0; /* force handler to continue to task dispatch */
+        }
         /* Watchpoint: track writes to scheduler entry */
         if (roff == 0x359660 || roff == 0x3596B0 || roff == 0x9CFEC) {
             static int wp_count = 0;
@@ -3490,6 +3497,10 @@ void vflash_run_frame(VFlash *vf) {
                     vf->timer.timer[0].count = 37500;
                     vf->timer.timer[0].ctrl = 0xE2;
                     vf->timer.irq.enable |= 0x01;
+                    /* Set task dispatch flag AFTER µMORE init (so it persists).
+                     * IRQ handler checks *(0x10BC2BC0) before task_dispatch. */
+                    *(uint32_t*)(vf->ram + 0xBC2BC0) = 1;
+                    printf("[SCHED] Set late task dispatch flag [0x10BC2BC0]=1\n");
                     /* Launch init task */
                     vf->cpu.cpsr = 0x00000053; /* SVC, IRQ enabled, FIQ disabled */
                     vf->cpu.r[15] = 0x100113DC;
@@ -3541,8 +3552,23 @@ void vflash_run_frame(VFlash *vf) {
                     for (uint32_t da = 0x9D1B30; da < 0x9D1B80; da += 4)
                         printf("  %08X: %08X\n", 0x10000000+da, *(uint32_t*)(vf->ram+da));
                     /* Also dump the event_wait/scheduler tick area */
-                    printf("[SCHED-CODE] Event area at 0x10A157xx:\n");
-                    for (uint32_t da = 0xA15780; da < 0xA157E0; da += 4)
+                    printf("[SCHED-CODE] IRQ handler at 0x10A15CA0:\n");
+                    for (uint32_t da = 0xA15CA0; da < 0xA15D20; da += 4)
+                        printf("  %08X: %08X\n", 0x10000000+da, *(uint32_t*)(vf->ram+da));
+                    /* Task dispatch function */
+                    printf("[SCHED-CODE] task_dispatch at 0x10A15D78:\n");
+                    for (uint32_t da = 0xA15D78; da < 0xA15DF0; da += 4)
+                        printf("  %08X: %08X\n", 0x10000000+da, *(uint32_t*)(vf->ram+da));
+                    /* Pool values for IRQ handler */
+                    printf("[SCHED-CODE] Pool at 0x10A15E90:\n");
+                    for (uint32_t da = 0xA15E90; da < 0xA15EB0; da += 4)
+                        printf("  %08X: %08X\n", 0x10000000+da, *(uint32_t*)(vf->ram+da));
+                    /* Check dispatch flag value */
+                    printf("[SCHED-CODE] Dispatch flag at [0x10BC2BC0]=%08X\n",
+                           *(uint32_t*)(vf->ram + 0xBC2BC0));
+                    /* Pools referenced by LDR [PC,-#xx] */
+                    printf("[SCHED-CODE] Pools at 0x10A15C80:\n");
+                    for (uint32_t da = 0xA15C80; da < 0xA15CA0; da += 4)
                         printf("  %08X: %08X\n", 0x10000000+da, *(uint32_t*)(vf->ram+da));
                 }
             }
@@ -3799,8 +3825,13 @@ void vflash_run_frame(VFlash *vf) {
                         }
                     }
                     printf("[BOOT] Found %d $QCB task structs\n", qcb_count);
-                    /* If we found the BOOT.BIN task struct, populate it with
-                     * game entry point so scheduler can dispatch it. */
+                    /* Set task dispatch flag at 0x10BC2BC0.
+                     * IRQ handler checks *(0x10BC2BC0) != 0 before calling
+                     * task_dispatch at 0x10A15D78. */
+                    *(uint32_t*)(vf->ram + 0xBC2BC0) = 1;
+                    printf("[BOOT] Set task dispatch flag [0x10BC2BC0]=1\n");
+
+                    /* If we found the BOOT.BIN task struct, populate it */
                     if (*(uint32_t*)(vf->ram + 0xB908E0) == 0x42435124) {
                         printf("[BOOT] Populating $QCB at 0x10B908E0 with game entry\n");
                         /* Set task as ready with saved context pointing to BOOT.BIN.
