@@ -56,11 +56,14 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 
 ### Remaining for gameplay
 
-Complete 3-reboot chain works: init task → BOOT.BIN → µMORE init → BOOT.BIN bootstrap
-→ scheduler. µMORE scheduler runs stably in idle loop (0x10A219xx) with timer IRQs.
-Remaining blocker: no game task registered in scheduler queue. Need to understand
-how BOOT.BIN registers the game task via µMORE API, or manually create a task struct
-in the correct µMORE format.
+µMORE scheduler runs stably. BOOT.BIN bootstrap callback intercepted with game
+trampoline. BOOT.BIN init funcs run but only do kernel-level init — they don't
+populate game context (0x10B668A0 still empty after init). Game task registration
+happens via µMORE scheduler dispatch chain which we can't trigger.
+
+**Interrupt controller** implemented per TI-Nspire Firebird reference (acknowledge,
+end-of-interrupt, priority). **Multi-game support**: dynamic service entry from
+SDRAM vectors. Tested: Cars + Incredibles show µMORE banner, others vary.
 
 ### Asset Browser
 
