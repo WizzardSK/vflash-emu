@@ -3656,6 +3656,38 @@ void vflash_run_frame(VFlash *vf) {
                 }
             }
 
+            /* After TCB scan, launch the game task directly */
+            if (vf->boot_phase >= 600 && pc == 0x1001158C) {
+                static int game_start = 0;
+                if (game_start == 100) {
+                    /* Find task with largest stack (= game task) */
+                    uint32_t best_a = 0, best_sz = 0;
+                    for (uint32_t a = 0x100000; a < 0xC00000; a += 4) {
+                        if (*(uint32_t*)(vf->ram+a) == 0x42435124 &&
+                            *(uint32_t*)(vf->ram+a+0x1C) == 0x42435424) {
+                            uint32_t sz = *(uint32_t*)(vf->ram+a+0x34);
+                            uint32_t entry = *(uint32_t*)(vf->ram+a+0x2C);
+                            if (sz > best_sz && entry >= 0x10090000) {
+                                best_sz = sz; best_a = a;
+                            }
+                        }
+                    }
+                    if (best_a) {
+                        uint32_t entry = *(uint32_t*)(vf->ram+best_a+0x2C);
+                        uint32_t sbase = *(uint32_t*)(vf->ram+best_a+0x30);
+                        uint32_t ssz = *(uint32_t*)(vf->ram+best_a+0x34);
+                        printf("[GAME-TASK] Launching task @0x%08X: entry=%08X stack=%08X+%X\n",
+                               0x10000000+best_a, entry, sbase, ssz);
+                        vf->cpu.cpsr = 0x00000013; /* SVC, IRQ+FIQ enabled */
+                        vf->cpu.r[15] = entry;
+                        vf->cpu.r[13] = sbase + ssz - 4; /* top of stack */
+                        vf->cpu.r[14] = 0x10FFF000; /* return to idle */
+                        vf->boot_phase = 800;
+                    }
+                }
+                game_start++;
+            }
+
             /* TCB scan at init task sleep */
             if (vf->boot_phase >= 600 && pc == 0x1001158C) {
                 static int tcbs = 0;
