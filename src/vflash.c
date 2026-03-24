@@ -3482,7 +3482,11 @@ void vflash_run_frame(VFlash *vf) {
 
             /* µMORE init halt at 0x109D1E40: B . with FIQ disabled.
              * Force FIQ enable so timer interrupt can dispatch tasks. */
-            if (vf->boot_phase >= 300 && pc == 0x109D1E40) {
+            /* Detect µMORE init halt: B . (EAFFFFFE) in kernel area.
+             * Address varies per game — detect by instruction pattern. */
+            if (vf->boot_phase >= 300 &&
+                pc >= 0x10090000 && pc < 0x10FFE000 && /* kernel+heap area, exclude idle */
+                *(uint32_t*)(vf->ram + (pc - 0x10000000)) == 0xEAFFFFFE) {
                 static int loop_1e40 = 0;
                 if (loop_1e40 == 0) {
                     vf->cpu.cpsr &= ~0xC0;
@@ -3815,10 +3819,18 @@ void vflash_run_frame(VFlash *vf) {
                 uint32_t svc = *(uint32_t*)(vf->ram + 0x9A0950);
                 printf("[BOOT] BSS[0x109A0950] = 0x%08X (%s)\n",
                        svc, svc == 0xE12FFF1E ? "BX LR stub" : "populated!");
-                /* Check µMORE service entry at 0x109D11E0 */
-                printf("[BOOT] [0x109D11E0] = %08X %08X %08X %08X\n",
-                       *(uint32_t*)(vf->ram+0x9D11E0), *(uint32_t*)(vf->ram+0x9D11E4),
-                       *(uint32_t*)(vf->ram+0x9D11E8), *(uint32_t*)(vf->ram+0x9D11EC));
+                /* Check µMORE service entry from warm boot vector */
+                {
+                    uint32_t se = *(uint32_t*)(vf->ram + 0xFFCC);
+                    if (se >= 0x10000000 && se < 0x11000000) {
+                        uint32_t se_off = se - 0x10000000;
+                        printf("[BOOT] Service entry [0x%08X] = %08X %08X %08X %08X\n", se,
+                               *(uint32_t*)(vf->ram+se_off), *(uint32_t*)(vf->ram+se_off+4),
+                               *(uint32_t*)(vf->ram+se_off+8), *(uint32_t*)(vf->ram+se_off+12));
+                    } else {
+                        printf("[BOOT] Service entry [0x%08X] (out of SDRAM range)\n", se);
+                    }
+                }
                 /* Check warm boot vectors */
                 printf("[BOOT] [0x10FFC8] = %08X %08X %08X %08X\n",
                        *(uint32_t*)(vf->ram+0xFFC8), *(uint32_t*)(vf->ram+0xFFCC),
@@ -3885,9 +3897,19 @@ void vflash_run_frame(VFlash *vf) {
                         *(uint32_t*)(vf->ram + 0x3585C0) = 0x10B908E0;
                     }
                 }
-                /* Service at 0x109D11E0 is populated with real code!
-                 * Call it directly. SDRAM vectors at 0xFF80+ from reboot #1. */
-                printf("[BOOT] Service 0x109D11E0 populated — calling directly\n");
+                /* Service entry populated. Read address from warm boot vector
+                 * SDRAM[0xFFCC] (second word of LDR PC,[PC] + pool pair). */
+                /* Read service entry from warm boot vector.
+                 * SDRAM[0xFFC8] = LDR PC,[PC] which loads from [0xFFD0].
+                 * SDRAM[0xFFD0] = service entry address. */
+                uint32_t svc_entry = *(uint32_t*)(vf->ram + 0xFFD0);
+                if (svc_entry < 0x10000000 || svc_entry >= 0x11000000) {
+                    /* Try [0xFFCC] as fallback */
+                    svc_entry = *(uint32_t*)(vf->ram + 0xFFCC);
+                    if (svc_entry < 0x10000000 || svc_entry >= 0x11000000)
+                        svc_entry = 0x109D11E0; /* hardcoded fallback */
+                }
+                printf("[BOOT] Service entry at 0x%08X — calling directly\n", svc_entry);
                 printf("[BOOT] FIQ vectors: [0xFF9C]=%08X [0xFFBC]=%08X\n",
                        *(uint32_t*)(vf->ram+0xFF9C), *(uint32_t*)(vf->ram+0xFFBC));
                 /* Don't re-patch SDRAM[0xFF98] — let native µMORE FIQ handler run.
@@ -3913,7 +3935,7 @@ void vflash_run_frame(VFlash *vf) {
                 vf->timer.irq.enable |= 0x01;
                 /* Jump to service entry with R0=2 (warm boot mode) */
                 vf->cpu.cpsr = 0x000000D3;
-                vf->cpu.r[15] = 0x109D11E0;
+                vf->cpu.r[15] = svc_entry;
                 vf->cpu.r[13] = 0x10FFD000;
                 vf->cpu.r[14] = 0x10FFF000;
                 vf->cpu.r[0] = 2; /* warm boot indicator */
@@ -3945,7 +3967,7 @@ void vflash_run_frame(VFlash *vf) {
                 *(uint32_t*)(vf->ram + 0xBBD00C) |= 1;
 
                 vf->boot_phase = 300;
-                printf("[BOOT] → 0x109D11E0 (R0=2, SP=0x10FFD000)\n");
+                printf("[BOOT] → 0x%08X (R0=2, SP=0x10FFD000)\n", svc_entry);
             }
 
             /* Phase 101b: old game launch code (kept for reference) */
