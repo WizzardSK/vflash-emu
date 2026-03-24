@@ -663,7 +663,17 @@ void arm9_irq(ARM9 *cpu) {
 }
 
 void arm9_fiq(ARM9 *cpu) {
-    if(CPSR&ARM9_FLAG_F) return;
+    static int fiq_log = 0;
+    if (fiq_log < 200) {
+        printf("[ARM9-FIQ] CPSR=%08X F=%d → %s PC=%08X\n",
+               CPSR, (CPSR&ARM9_FLAG_F)?1:0, (CPSR&ARM9_FLAG_F)?"BLOCKED":"DELIVER", PC);
+    }
+    if(CPSR&ARM9_FLAG_F) { fiq_log++; return; }
+    if (fiq_log < 200) {
+        printf("[ARM9-FIQ] Delivering: PC=%08X→0x%08X CPSR=%08X→FIQ\n",
+               PC, vec_base(cpu)+0x1C, CPSR);
+        fiq_log++;
+    }
     save_bank(cpu,CPSR&0x1F);
     cpu->spsr_fiq = CPSR;
     cpu->r14_fiq  = PC + 4;

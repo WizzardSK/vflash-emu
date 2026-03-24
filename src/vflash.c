@@ -945,10 +945,38 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
     if (addr >= VFLASH_IO_BASE) {
         uint32_t off = addr - VFLASH_IO_BASE;
 
+        /* Trace I/O reads during FIQ/IRQ handler */
+        if (((vf->cpu.cpsr & 0x1F) == 0x11 || (vf->cpu.cpsr & 0x1F) == 0x12) && vf->boot_phase >= 300) {
+            static int fiq_io = 0;
+            if (fiq_io < 30) {
+                printf("[FIQ-IO] read 0x%08X (off=%08X) PC=%08X\n",
+                       addr, off, vf->cpu.r[15]);
+                fiq_io++;
+            }
+        }
 
         /* Primary IRQ + timers: 0x80000000+0x000–0x1FF */
         if (off < 0x200)
             return ztimer_read(&vf->timer, off);
+
+        /* Secondary interrupt controller at 0xDC000000 (off = 0x5C000000).
+         * µMORE FIQ handler reads 0xDC000124/128 for interrupt source,
+         * writes 0xDC00012C to clear. Return timer IRQ status. */
+        if (off >= 0x5C000000u && off < 0x5C001000u) {
+            uint32_t sreg = off - 0x5C000000u;
+            /* Secondary interrupt controller at 0xDC000000.
+             * NOT a mirror of primary VIC — separate register layout.
+             * Return timer IRQ status for status registers. */
+            switch (sreg) {
+                case 0x000: /* IRQ status (which sources are active) */
+                    return (vf->timer.irq.status & vf->timer.irq.enable) ? 1 : 0;
+                case 0x024: /* IRQ status (alternate) */
+                    return (vf->timer.irq.status & vf->timer.irq.enable) ? 1 : 0;
+                case 0x028: /* Raw interrupt status */
+                    return vf->timer.irq.status ? 1 : 0;
+                default: return 0;
+            }
+        }
 
         /* PL111 LCD Controller at 0xC0000000 (off = 0x40000000) */
         if (off >= 0x40000000u && off < 0x40001000u) {
@@ -986,7 +1014,14 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                  * Return last written value (flash write completes instantly).
                  * If nothing was written, return 0 (erased state). */
                 if (foff < 0x10) {
-                    return vf->flash_last_write; /* last written value */
+                    /* Return last written value if any, else ROM data.
+                     * Flash write verify: read-back must match written data. */
+                    if (vf->flash_last_write)
+                        return vf->flash_last_write;
+                    /* No write yet — return ROM data (flash in read mode) */
+                    if (foff < vf->rom_size)
+                        return *(uint32_t*)(vf->rom + foff);
+                    return 0xFFFFFFFF; /* erased flash */
                 }
                 switch (foff) {
                     case 0x34: return 0x40;   /* Status: ready */
@@ -1381,8 +1416,30 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
     if (addr >= VFLASH_IO_BASE) {
         uint32_t off = addr - VFLASH_IO_BASE;
 
+        /* Trace I/O writes during FIQ/IRQ handler */
+        if (((vf->cpu.cpsr & 0x1F) == 0x11 || (vf->cpu.cpsr & 0x1F) == 0x12) && vf->boot_phase >= 300) {
+            static int fiq_iow = 0;
+            if (fiq_iow < 30) {
+                printf("[FIQ-IO] write 0x%08X = 0x%08X (off=%08X) PC=%08X\n",
+                       addr, val, off, vf->cpu.r[15]);
+                fiq_iow++;
+            }
+        }
+
         /* Primary IRQ + timers */
         if (off < 0x200) { ztimer_write(&vf->timer, off, val); return; }
+
+        /* Secondary interrupt controller at 0xDC000000 (off = 0x5C000000) */
+        if (off >= 0x5C000000u && off < 0x5C001000u) {
+            uint32_t sreg = off - 0x5C000000u;
+            /* Clear interrupt: handler writes 0 to 0x2C */
+            if (sreg == 0x02C) {
+                vf->timer.irq.status &= ~1; /* clear timer bit */
+                vf->timer.timer[0].irq_pending = 0;
+            }
+            /* Absorb all other writes (enable, select, etc.) */
+            return;
+        }
 
         /* PL111 LCD Controller write at 0xC0000000 */
         if (off >= 0x40000000u && off < 0x40001000u) {
@@ -3578,12 +3635,11 @@ void vflash_run_frame(VFlash *vf) {
                     }
                     tlb_flush();
                 }
-                /* Enable timer */
+                /* Enable timer (don't touch fiq_sel — µMORE manages it) */
                 vf->timer.timer[0].load = 37500;
                 vf->timer.timer[0].count = 37500;
                 vf->timer.timer[0].ctrl = 0xE2;
                 vf->timer.irq.enable |= 0x01;
-                vf->timer.irq.fiq_sel = 0;
                 /* Jump to service entry with R0=2 (warm boot mode) */
                 vf->cpu.cpsr = 0x000000D3;
                 vf->cpu.r[15] = 0x109D11E0;
@@ -3719,7 +3775,7 @@ void vflash_run_frame(VFlash *vf) {
                 vf->timer.timer[0].count = 37500;
                 vf->timer.timer[0].ctrl = 0xE2;
                 vf->timer.irq.enable |= 0x01;
-                vf->timer.irq.fiq_sel = 0;
+                /* Don't touch fiq_sel — µMORE manages it */
             }
 
             /* Phase 200: force task launch after scheduler stabilizes.
@@ -3909,6 +3965,15 @@ void vflash_run_frame(VFlash *vf) {
                     printf("[IRQ2] VIC: status=%08X enable=%08X fiq_sel=%08X\n",
                            vf->timer.irq.status, vf->timer.irq.enable, vf->timer.irq.fiq_sel);
                     irq2_log++;
+                }
+            }
+            {
+                static int del_log = 0;
+                if (del_log < 5 && vf->boot_phase >= 300) {
+                    printf("[DELIVER] use_fiq=%d fiq_pending=%d irq_pending=%d fiq_sel=%08X\n",
+                           use_fiq, ztimer_fiq_pending(&vf->timer), ztimer_irq_pending(&vf->timer),
+                           vf->timer.irq.fiq_sel);
+                    del_log++;
                 }
             }
             if (use_fiq)
