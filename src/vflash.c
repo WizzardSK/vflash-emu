@@ -3697,16 +3697,8 @@ void vflash_run_frame(VFlash *vf) {
                             }
                         }
                     }
-                    /* Try each task. Task #7 has 16KB stack (could be game). */
-                    uint32_t pick = 0;
-                    for (uint32_t a = 0x100000; a < 0xC00000; a += 4) {
-                        if (*(uint32_t*)(vf->ram+a) == 0x42435124 &&
-                            *(uint32_t*)(vf->ram+a+0x1C) == 0x42435424) {
-                            uint32_t id = *(uint32_t*)(vf->ram+a+0x28);
-                            if (id == 7) { pick = a; break; } /* try task #7 */
-                        }
-                    }
-                    if (!pick) pick = game_a ? game_a : task1_a;
+                    /* Pick game task (largest stack, 128KB = task #10) */
+                    uint32_t pick = game_a ? game_a : task1_a;
                     if (pick) {
                         uint32_t entry = *(uint32_t*)(vf->ram+pick+0x2C);
                         uint32_t sbase = *(uint32_t*)(vf->ram+pick+0x30);
@@ -3924,6 +3916,7 @@ void vflash_run_frame(VFlash *vf) {
                 pc >= 0x10000000 && pc < 0x10100000 &&
                 (vf->cpu.cpsr & 0x1F) == 0x13) { /* SVC mode */
                 phase = 99;
+                printf("[PHASE99] Triggered at frame %llu PC=%08X\n", vf->frame_count, pc);
                 vf->timer.timer[0].load = 37500;
                 vf->timer.timer[0].count = 37500;
                 vf->timer.timer[0].ctrl = 0xE2;
@@ -4004,9 +3997,9 @@ void vflash_run_frame(VFlash *vf) {
             }
 
             /* Phase 100: launch BOOT.BIN init to populate µMORE services. */
-            if (phase == 99 && vf->frame_count > 55 &&
-                pc >= 0x10090000 && pc < 0x10110000) {
+            if (phase == 99 && vf->frame_count > 55) {
                 phase = 100;
+                vf->boot_phase = 100; /* sync with reboot handler path */
                 /* Fix page table: identity map ALL RAM */
                 uint32_t ttb_off = vf->cpu.cp15.ttb;
                 if (ttb_off >= 0x10000000) ttb_off -= 0x10000000;
@@ -4991,6 +4984,38 @@ void vflash_run_frame(VFlash *vf) {
                     }
                 }
             }
+        }
+    }
+
+    /* Auto-launch game task after µMORE init stabilizes.
+     * On frame 120 (after init + bootstrap), find TCB with largest stack
+     * and launch it directly. Simple, no complex state tracking. */
+    if (vf->has_rom && vf->frame_count == 120 && vf->boot_phase < 800) {
+        uint32_t best_a = 0, best_sz = 0;
+        for (uint32_t a = 0x100000; a < 0xC00000; a += 4) {
+            if (*(uint32_t*)(vf->ram+a) == 0x42435124 &&
+                *(uint32_t*)(vf->ram+a+0x1C) == 0x42435424) {
+                uint32_t sz = *(uint32_t*)(vf->ram+a+0x34);
+                uint32_t entry = *(uint32_t*)(vf->ram+a+0x2C);
+                if (sz > best_sz && entry >= 0x10090000) {
+                    best_sz = sz; best_a = a;
+                }
+            }
+        }
+        if (best_a) {
+            uint32_t entry = *(uint32_t*)(vf->ram+best_a+0x2C);
+            uint32_t sbase = *(uint32_t*)(vf->ram+best_a+0x30);
+            uint32_t ssz = *(uint32_t*)(vf->ram+best_a+0x34);
+            printf("[AUTO-LAUNCH] Game task: entry=%08X stack=%08X+%X\n", entry, sbase, ssz);
+            vf->cpu.cpsr = 0x00000013;
+            vf->cpu.r[15] = entry;
+            vf->cpu.r[13] = sbase + ssz - 4;
+            vf->cpu.r[14] = 0x10FFF000;
+            vf->timer.timer[0].load = 37500;
+            vf->timer.timer[0].count = 37500;
+            vf->timer.timer[0].ctrl = 0xE2;
+            vf->timer.irq.enable |= 0x01;
+            vf->boot_phase = 800;
         }
     }
 
