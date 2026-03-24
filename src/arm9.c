@@ -561,6 +561,29 @@ int arm9_step(ARM9 *cpu) {
                     printf("[PLL-RET] R0=%08X (bit7=%d)\n", cpu->r[0], (cpu->r[0]>>7)&1);
                 pll_ret++;
             }
+            /* Track ALL branches from µMORE kernel area */
+            if (inst_addr >= 0x10090000 && inst_addr < 0x10B00000) {
+                int is_bl = (i & 0x0F000000) == 0x0B000000;
+                int is_blx_reg = (i & 0x0FFFFFF0) == 0x012FFF30; /* BLX Rn */
+                int is_bx = (i & 0x0FFFFFF0) == 0x012FFF10; /* BX Rn */
+                if (is_bl || is_blx_reg || is_bx) {
+                    static int bl_trace = 0;
+                    if (bl_trace < 30) {
+                        uint32_t target = 0;
+                        if (is_bl) {
+                            int32_t imm = i & 0xFFFFFF;
+                            if (imm & 0x800000) imm -= 0x1000000;
+                            target = inst_addr + 8 + imm * 4;
+                        } else {
+                            target = cpu->r[i & 0xF];
+                        }
+                        printf("[EVPUMP] PC=%08X %s 0x%08X R0=%08X\n",
+                               inst_addr, is_bl?"BL":is_blx_reg?"BLX":"BX",
+                               target, cpu->r[0]);
+                        bl_trace++;
+                    }
+                }
+            }
             /* Track when game code (0x10C00000+) transitions to low addr */
             {
                 static int game_started = 0, crash_log = 0;
