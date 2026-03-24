@@ -615,11 +615,25 @@ int arm9_step(ARM9 *cpu) {
 
         if (i == 0 && cpu->null_trap_enabled && inst_addr >= 0x10000100 && inst_addr < 0x10C00000) {
             static int ntp = 0;
-            if (ntp < 200)
-                printf("[NULL-TRAP] 0x%08X (LR=0x%08X R0=0x%08X)\n", inst_addr, cpu->r[14], cpu->r[0]);
+            static uint32_t last_trap = 0;
+            uint32_t lr = cpu->r[14] & ~3u;
+            if (ntp < 50 && inst_addr != last_trap)
+                printf("[NULL-TRAP] 0x%08X (LR=0x%08X R0=0x%08X)\n", inst_addr, lr, cpu->r[0]);
+            last_trap = inst_addr;
             ntp++;
             cpu->r[0] = 0;
-            PC = cpu->r[14] & ~3u;
+            /* Detect NOP-sled looping: if we've been here >1000 times, break out */
+            {
+                static int trap_count = 0;
+                trap_count++;
+                if (trap_count > 1000) {
+                    PC = 0x10FFF000; /* escape to idle */
+                    trap_count = 0;
+                    cpu->cycles += 1;
+                    return 1;
+                }
+            }
+            PC = lr;
             cpu->cycles += 1;
             return 1;
         }
