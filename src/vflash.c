@@ -2185,10 +2185,21 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                     return;
                 }
                 if (vf->atapi.reboot_count >= 3) {
-                    /* Reboot #3+: µMORE is fully initialized.
-                     * Let ROM warm boot run naturally — it will jump to
-                     * SDRAM[0xFFC8] which should dispatch to game code. */
-                    printf("[REBOOT] Reboot #%d: natural warm boot\n", vf->atapi.reboot_count);
+                    printf("[REBOOT] Reboot #%d: checking task registrations\n",
+                           vf->atapi.reboot_count);
+                    printf("[REBOOT] Task list: [0x3585C0]=%08X sched_state: [0x3585E0]=%08X\n",
+                           *(uint32_t*)(vf->ram+0x3585C0), *(uint32_t*)(vf->ram+0x3585E0));
+                    printf("[REBOOT] Task mgr: [0xACC78]=%08X\n",
+                           *(uint32_t*)(vf->ram+0xACC78));
+                    /* Scan for task structs ($QCB magic = 0x42435124) */
+                    for (uint32_t a = 0x100000; a < 0xC00000; a += 4) {
+                        if (*(uint32_t*)(vf->ram + a) == 0x42435124) {
+                            uint32_t pc = *(uint32_t*)(vf->ram + a + 0x58);
+                            uint32_t sp = *(uint32_t*)(vf->ram + a + 0x60);
+                            printf("[REBOOT] Found $QCB at 0x%08X: saved_PC=%08X saved_SP=%08X\n",
+                                   0x10000000+a, pc, sp);
+                        }
+                    }
                 }
 
                 /* Reboot #1: let ROM run from 0 with warm boot flag */
@@ -3753,6 +3764,24 @@ void vflash_run_frame(VFlash *vf) {
                 printf("[BOOT] Task list: [0x3585C0]=%08X sched_state: [0x3585E0]=%08X\n",
                        *(uint32_t*)(vf->ram+0x3585C0), *(uint32_t*)(vf->ram+0x3585E0));
                 printf("[BOOT] Heap: [0x359660]=%08X\n", *(uint32_t*)(vf->ram+0x359660));
+                /* Scan for $QCB task structs after BOOT.BIN init */
+                {
+                    int qcb_count = 0;
+                    for (uint32_t a = 0x100000; a < 0xC00000; a += 4) {
+                        if (*(uint32_t*)(vf->ram + a) == 0x42435124) { /* $QCB */
+                            printf("[BOOT] $QCB at 0x%08X:\n", 0x10000000+a);
+                            for (int d = 0; d < 0x80; d += 16) {
+                                printf("[BOOT]  +%02X: %08X %08X %08X %08X\n", d,
+                                       *(uint32_t*)(vf->ram+a+d),
+                                       *(uint32_t*)(vf->ram+a+d+4),
+                                       *(uint32_t*)(vf->ram+a+d+8),
+                                       *(uint32_t*)(vf->ram+a+d+12));
+                            }
+                            qcb_count++;
+                        }
+                    }
+                    printf("[BOOT] Found %d $QCB task structs\n", qcb_count);
+                }
                 /* Service at 0x109D11E0 is populated with real code!
                  * Call it directly. SDRAM vectors at 0xFF80+ from reboot #1. */
                 printf("[BOOT] Service 0x109D11E0 populated — calling directly\n");
