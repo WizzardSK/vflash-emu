@@ -31,9 +31,14 @@ void ztimer_tick(ZevioTimer *zt, uint32_t cycles) {
         if (!(t->ctrl & 0x81)) continue;  /* Not enabled */
 
         if (t->count <= cycles) {
-            t->count = (t->ctrl & 0x40) ? t->load : 0;  /* Periodic reload (bit6) */
-            /* IntEnable: bit5 (SP804) or assume always enabled for ZEVIO */
-            if (t->ctrl & 0x21) {  /* IntEnable or just enabled */
+            int was_enabled = t->ctrl & 0x21; /* save before modifying */
+            if (t->ctrl & 0x40) {
+                t->count = t->load;  /* Periodic: reload */
+            } else {
+                t->count = 0;
+                t->ctrl &= ~0x81;   /* One-shot: disable after firing */
+            }
+            if (was_enabled) {
                 t->irq_pending = 1;
                 ztimer_raise_irq(zt, IRQ_TIMER0 + i);
             }

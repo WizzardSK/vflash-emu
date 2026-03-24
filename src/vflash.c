@@ -204,7 +204,7 @@ struct VFlash {
                                   * Must NOT alias with SDRAM at 0x10000000 (vf->ram). */
     uint32_t  dma_param_a, dma_param_b, dma_param_c;
     uint32_t  misc_regs[64];   /* Misc system control at 0x900A0000 (read/write) */
-    uint32_t  rtc_regs[16];    /* RTC scratch at 0x900900F0-0x900900FF */
+    uint32_t  rtc_regs[64];    /* RTC/scratch at 0x90090000 (µMORE uses 0x8C for FIQ flag) */
     uint32_t  pmu_regs[16];    /* PMU at 0x900B0000 */
     uint64_t  frame_count;
 
@@ -1229,9 +1229,9 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
          * ROM uses 0x900900F0-0x900900FF as scratch storage (write then read back). */
         if (off >= 0x10090000u && off < 0x10091000u) {
             uint32_t rreg = off - 0x10090000u;
-            /* Scratch registers at 0xF0-0xFF used by ROM SDRAM calibration */
-            if (rreg >= 0xF0 && rreg < 0x100)
-                return vf->rtc_regs[(rreg - 0xF0) >> 2];
+            /* Return stored value for scratch/control registers */
+            if ((rreg >> 2) < 64 && vf->rtc_regs[rreg >> 2] != 0)
+                return vf->rtc_regs[rreg >> 2];
             switch (rreg) {
                 case 0x00:  { /* RTCDR: running time counter */
                     static uint32_t rtc_counter = 0x67000000;
@@ -1879,8 +1879,9 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
         /* RTC write at 0x90090000 — store scratch registers */
         if (off >= 0x10090000u && off < 0x10091000u) {
             uint32_t rreg = off - 0x10090000u;
-            if (rreg >= 0xF0 && rreg < 0x100)
-                vf->rtc_regs[(rreg - 0xF0) >> 2] = val;
+            /* Store ALL RTC/scratch writes (µMORE uses 0x8C for FIQ handler flag) */
+            if ((rreg >> 2) < 64)
+                vf->rtc_regs[rreg >> 2] = val;
             return;
         }
 
@@ -3269,23 +3270,20 @@ void vflash_run_frame(VFlash *vf) {
             uint32_t pc = vf->cpu.r[15];
             static int phase = 0;
 
-            /* Detect new wait loop at 0x109D1E40 */
+            /* µMORE init halt at 0x109D1E40: B . with FIQ disabled.
+             * Force FIQ enable so timer interrupt can dispatch tasks. */
             if (vf->boot_phase >= 300 && pc == 0x109D1E40) {
                 static int loop_1e40 = 0;
                 if (loop_1e40 == 0) {
-                    printf("[SCHED] New loop at 0x109D1E40, dumping:\n");
-                    for (uint32_t da = 0x9D1E20; da < 0x9D1E80; da += 4)
-                        printf("[SCHED]  %08X: %08X\n", 0x10000000+da, *(uint32_t*)(vf->ram+da));
-                    printf("[SCHED] R0=%08X R1=%08X R2=%08X R3=%08X SP=%08X LR=%08X\n",
-                           vf->cpu.r[0], vf->cpu.r[1], vf->cpu.r[2], vf->cpu.r[3],
-                           vf->cpu.r[13], vf->cpu.r[14]);
+                    /* Force FIQ+IRQ enable so timer can interrupt B . loop */
+                    vf->cpu.cpsr &= ~0xC0;
+                    /* Set FIQ handler flag so ROM FIQ vector dispatches to µMORE.
+                     * ROM reads *(0x9009008C) — if non-zero, jumps to *(0x1000FF9C).
+                     * SDRAM[0xFF9C] = LDR PC,[PC,#0x18] → SDRAM[0xFFBC] = µMORE FIQ handler. */
+                    vf->rtc_regs[0x8C >> 2] = 1;
+                    printf("[SCHED] Force-enabled FIQ+IRQ + FIQ handler flag at init halt\n");
                 }
                 loop_1e40++;
-                /* Force IRQ enable after some iterations */
-                if (loop_1e40 == 100) {
-                    vf->cpu.cpsr &= ~0x80;
-                    printf("[SCHED] Force-enabled IRQ at 0x109D1E40\n");
-                }
             }
 
             /* Flash operation completion: µMORE loop at 0x10A1C5xx polls
@@ -3838,6 +3836,24 @@ void vflash_run_frame(VFlash *vf) {
                        vf->cpu.r[15], vf->cpu.cpsr, vf->cpu.cp15.mmu_enabled,
                        vf->timer.irq.fiq_sel);
                 irq_logged = 1;
+            }
+            /* Log IRQ delivery details after µMORE init */
+            if (vf->boot_phase >= 300) {
+                static int irq2_log = 0;
+                if (irq2_log < 10 && !(vf->cpu.cpsr & 0x80)) { /* only when IRQ enabled */
+                    printf("[IRQ2] Delivering %s: PC=%08X CPSR=%08X\n",
+                           use_fiq ? "FIQ" : "IRQ", vf->cpu.r[15], vf->cpu.cpsr);
+                    printf("[IRQ2] SDRAM[0xFF98]=%08X [0xFF9C]=%08X [0xFFB8]=%08X [0xFFDC]=%08X\n",
+                           *(uint32_t*)(vf->ram+0xFF98),
+                           *(uint32_t*)(vf->ram+0xFF9C),
+                           *(uint32_t*)(vf->ram+0xFFB8),
+                           *(uint32_t*)(vf->ram+0xFFDC));
+                    printf("[IRQ2] RTC[0x8C]=%08X (FIQ handler flag)\n",
+                           vf->rtc_regs[0x8C >> 2]);
+                    printf("[IRQ2] VIC: status=%08X enable=%08X fiq_sel=%08X\n",
+                           vf->timer.irq.status, vf->timer.irq.enable, vf->timer.irq.fiq_sel);
+                    irq2_log++;
+                }
             }
             if (use_fiq)
                 arm9_fiq(&vf->cpu);

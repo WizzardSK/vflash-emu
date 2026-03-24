@@ -567,7 +567,8 @@ int arm9_step(ARM9 *cpu) {
                 if (inst_addr >= 0x10C00000 && inst_addr < 0x10E00000)
                     game_started = 1;
                 if (game_started && !crash_log && inst_addr < 0x10001000 &&
-                    inst_addr != 0x18 && inst_addr != 0x1C) {
+                    inst_addr != 0x18 && inst_addr != 0x1C &&
+                    !(inst_addr >= 0xD00 && inst_addr < 0xE00)) { /* ROM FIQ handler */
                     printf("[GAME-CRASH] PC=0x%08X insn=0x%08X LR=0x%08X SP=0x%08X CPSR=0x%08X\n",
                            inst_addr, i, cpu->r[14], cpu->r[13], CPSR);
                     crash_log = 1;
