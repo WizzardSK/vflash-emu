@@ -1437,13 +1437,9 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
 
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
         uint32_t roff = addr - VFLASH_RAM_BASE;
-        /* µMORE IRQ handler task dispatch flag at 0x10BC2BC0.
-         * BLNE 0x10A15D78 = IRQ return (if flag!=0, return immediately).
-         * If flag==0, handler continues to task dispatch code.
-         * We want dispatch, so FORCE flag to 0. */
-        if (roff == 0xBC2BC0 && val != 0 && vf->boot_phase >= 300) {
-            val = 0; /* force handler to continue to task dispatch */
-        }
+        /* Note: 0x10BC2BC0 is µMORE IRQ handler flag.
+         * BLNE at 0x10A15CEC: if flag!=0 → IRQ return; if 0 → continue.
+         * Not manipulated — let µMORE manage it naturally. */
         /* Watchpoint: track writes to scheduler entry */
         if (roff == 0x359660 || roff == 0x3596B0 || roff == 0x9CFEC) {
             static int wp_count = 0;
