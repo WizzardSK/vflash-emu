@@ -1477,6 +1477,11 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
 
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
         uint32_t roff = addr - VFLASH_RAM_BASE;
+        /* Protect game callback pointer at [0x10BBD3C0].
+         * µMORE game task init writes 0 here — prevent clearing. */
+        if (roff == 0xBBD3C0 && val == 0 && vf->boot_phase >= 800) {
+            return; /* don't clear callback */
+        }
         /* Note: 0x10BC2BC0 is µMORE IRQ handler flag.
          * BLNE at 0x10A15CEC: if flag!=0 → IRQ return; if 0 → continue.
          * Not manipulated — let µMORE manage it naturally. */
@@ -5038,8 +5043,18 @@ void vflash_run_frame(VFlash *vf) {
     }
 
     /* Scan for BOOT.BIN callback pointers in µMORE area */
-    if (vf->has_rom && vf->frame_count == 119 && vf->boot_phase >= 100) {
+    if (vf->has_rom && vf->frame_count == 130 && vf->boot_phase >= 100) {
         printf("[CB-SCAN] Scanning for BOOT.BIN pointers in µMORE area...\n");
+        /* Dump full SDRAM for Ghidra analysis */
+        {
+            FILE *df = fopen("/tmp/vflash_ram.bin", "wb");
+            if (df) {
+                fwrite(vf->ram, 1, VFLASH_RAM_SIZE, df);
+                fclose(df);
+                printf("[DUMP] SDRAM dumped to /tmp/vflash_ram.bin (%d MB)\n",
+                       VFLASH_RAM_SIZE / (1024*1024));
+            }
+        }
         int found = 0;
         for (uint32_t a = 0x90000; a < 0xC00000; a += 4) {
             uint32_t v = *(uint32_t*)(vf->ram + a);
@@ -5051,16 +5066,12 @@ void vflash_run_frame(VFlash *vf) {
             }
         }
         printf("[CB-SCAN] Found %d BOOT.BIN pointers\n", found);
-        /* Callback context at 0x10BE4BA8 — inject BOOT.BIN entries.
-         * Try populating with game callback at various offsets.
-         * On real HW, BOOT.BIN init fills this during warm reboot chain. */
-        printf("[CB-CTX] Injecting BOOT.BIN callback at 0x10BE4BA8\n");
-        /* Typical Nucleus event callback table: array of function pointers.
-         * Each entry: {callback_fn, user_data}. Try first 8 slots. */
-        for (int s = 0; s < 8; s++) {
-            *(uint32_t*)(vf->ram + 0xBE4BA8 + s * 8) = 0x10C0011C; /* BOOT.BIN init */
-            *(uint32_t*)(vf->ram + 0xBE4BA8 + s * 8 + 4) = 0; /* user data */
-        }
+        /* Inject BOOT.BIN game callback via Ghidra-discovered pointer.
+         * FUN_10a18d9c stores callback at *[0x10BBD3C0] and userdata at *[0x10BC2640].
+         * Game task calls FUN_10a18a04(0,0) which sets these to NULL.
+         * We write BOOT.BIN game entry here so event dispatch calls it. */
+        *(uint32_t*)(vf->ram + 0xBBD3C0) = 0x10CFAEA0; /* game_main entry */
+        printf("[CB-INJECT] Set *[0x10BBD3C0] = 0x10CFAEA0 (game callback)\n");
         /* Dump area around first cluster at 0x1009D160-0x1009D190 */
         printf("[CB-SCAN] Context around first cluster:\n");
         for (uint32_t d = 0x9D160; d < 0x9D1C0; d += 16)
