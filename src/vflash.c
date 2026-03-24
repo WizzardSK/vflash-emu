@@ -883,10 +883,21 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         uint32_t roff = addr - VFLASH_RAM_BASE;
         /* Flash completion: µMORE loop checks [0x10BBCFF4] and [0x10BBD010].
          * Force bit 0 on both to signal operation complete. */
-        /* Flash completion flags — always return with bit0 set.
-         * µMORE flash write/erase code checks these for completion. */
+        /* Flash completion flags — always return with bit0 set. */
         if (roff == 0xBBCFF4 || roff == 0xBBD010) {
             return *(uint32_t*)(vf->ram + roff) | 1;
+        }
+        /* Trace ALL RAM reads from init task event_wait area. */
+        if (vf->boot_phase >= 400) {
+            uint32_t caller = vf->cpu.r[15];
+            if (caller >= 0x10011000 && caller <= 0x10012000) {
+                static int ew_trace = 0;
+                if (ew_trace < 30) {
+                    printf("[EW-TRACE] PC=%08X read [%08X]=%08X\n",
+                           caller, addr, *(uint32_t*)(vf->ram + roff));
+                    ew_trace++;
+                }
+            }
         }
         if (roff == 0x1C9C && vf->atapi.reboot_count >= 2) {
             static int rd_wp = 0;
@@ -3431,6 +3442,12 @@ void vflash_run_frame(VFlash *vf) {
                 loop_1e40++;
                 /* After 500 ticks at halt, µMORE services are stable.
                  * Launch game code directly since scheduler has no tasks. */
+                /* Dump code at 0x1001158C after init task runs */
+                if (loop_1e40 == 300 && vf->boot_phase >= 400) {
+                    printf("[SCHED] Code at 0x1001158C:\n");
+                    for (uint32_t da = 0x11580; da < 0x115C0; da += 4)
+                        printf("[SCHED]  %08X: %08X\n", 0x10000000+da, *(uint32_t*)(vf->ram+da));
+                }
                 if (loop_1e40 == 200) {
                     /* µMORE services registered. Now run init task (0x100113DC)
                      * which does peripheral setup and calls BOOT.BIN callback.
@@ -3461,6 +3478,24 @@ void vflash_run_frame(VFlash *vf) {
                     vf->cpu.r[13] = 0x101D42A8; /* init task stack */
                     vf->cpu.r[14] = 0x10FFF000; /* return to idle */
                     vf->boot_phase = 400;
+                }
+            }
+
+            /* Track init task — log boot_phase at specific frames */
+            if (vf->frame_count == 110 || vf->frame_count == 200) {
+                static int bp_log = 0;
+                if (bp_log < 5) {
+                    printf("[BP-CHECK] frame=%llu boot_phase=%d PC=%08X\n",
+                           vf->frame_count, vf->boot_phase, pc);
+                    if (pc >= 0x10000000 && pc < 0x11000000) {
+                        uint32_t roff = pc - 0x10000000;
+                        printf("[BP-CHECK] Code@PC: %08X %08X %08X %08X\n",
+                               *(uint32_t*)(vf->ram + roff),
+                               *(uint32_t*)(vf->ram + roff + 4),
+                               *(uint32_t*)(vf->ram + roff + 8),
+                               *(uint32_t*)(vf->ram + roff + 12));
+                    }
+                    bp_log++;
                 }
             }
 
@@ -3598,9 +3633,8 @@ void vflash_run_frame(VFlash *vf) {
                 }
             }
 
-            /* DISABLED: direct BOOT.BIN init. Let natural warm reboot populate vectors.
-             * Phase 200 (init task) → reboot #1 → BOOT.BIN → reboot #2 → service entry. */
-            if (0 && phase == 99 && vf->frame_count > 55 &&
+            /* Phase 100: launch BOOT.BIN init to populate µMORE services. */
+            if (phase == 99 && vf->frame_count > 55 &&
                 pc >= 0x10090000 && pc < 0x10110000) {
                 phase = 100;
                 /* Fix page table: identity map ALL RAM */
