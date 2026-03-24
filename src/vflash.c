@@ -3259,6 +3259,13 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
      * µMORE also generates dynamic event_wait wrappers.
      * Detect stuck-at-address pattern and skip after timeout. */
     if (addr == 0x10011D88) {
+        static int sleep_log = 0;
+        if (sleep_log < 10)
+            printf("[SLEEP] 0x10011D88 called from LR=%08X R0=%08X boot_phase=%d\n",
+                   cpu->r[14], cpu->r[0], ((VFlash*)ctx)->boot_phase);
+        sleep_log++;
+        /* Always skip sleep — return 0 immediately.
+         * Native sleep blocks init task and prevents callback call. */
         cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
@@ -3478,6 +3485,36 @@ void vflash_run_frame(VFlash *vf) {
                     vf->cpu.r[13] = 0x101D42A8; /* init task stack */
                     vf->cpu.r[14] = 0x10FFF000; /* return to idle */
                     vf->boot_phase = 400;
+                }
+            }
+
+            /* After init task completes (B . at 0x1001158C), the kernel
+             * is fully initialized. Now we need BOOT.BIN to run.
+             * Directly jump to BOOT.BIN bootstrap which sets up game. */
+            if (vf->boot_phase == 400 && pc == 0x1001158C) {
+                static int post_init = 0;
+                post_init++;
+                if (post_init == 100) { /* let a few ticks pass */
+                    printf("[POST-INIT] Init task complete → launching BOOT.BIN\n");
+                    /* Re-load BOOT.BIN */
+                    if (vf->cd && vf->cd->is_open) {
+                        CDEntry be;
+                        if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &be)) {
+                            uint32_t dest = 0xC00000;
+                            uint32_t msz = VFLASH_RAM_SIZE - dest;
+                            if (be.size < msz) msz = be.size;
+                            cdrom_read_file(vf->cd, &be, vf->ram + dest, 0, msz);
+                        }
+                    }
+                    /* Run BOOT.BIN bootstrap at 0x10C00010.
+                     * It will set up MMU, run init funcs, call callback.
+                     * Callback = 0x1880 → warm reboot #3. */
+                    vf->cpu.cpsr = 0x000000D3;
+                    vf->cpu.r[15] = 0x10C00010;
+                    vf->cpu.r[13] = 0x10C0425C; /* BOOT.BIN stack */
+                    vf->cpu.r[14] = 0x1001158C; /* return to halt */
+                    vf->boot_phase = 500;
+                    printf("[POST-INIT] → BOOT.BIN at 0x10C00010\n");
                 }
             }
 
