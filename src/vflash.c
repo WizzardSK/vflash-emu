@@ -945,6 +945,18 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
     if (addr >= VFLASH_IO_BASE) {
         uint32_t off = addr - VFLASH_IO_BASE;
 
+        /* Trace I/O reads from init task (SVC mode, PC in kernel area) */
+        if (vf->boot_phase >= 400 && (vf->cpu.cpsr & 0x1F) == 0x13) {
+            uint32_t caller = vf->cpu.r[15];
+            if (caller >= 0x10010000 && caller < 0x10120000) {
+                static int init_io = 0;
+                if (init_io < 30) {
+                    printf("[INIT-IO] read 0x%08X (off=%08X) PC=%08X\n",
+                           addr, off, caller);
+                    init_io++;
+                }
+            }
+        }
         /* Trace I/O reads during FIQ/IRQ handler */
         if (((vf->cpu.cpsr & 0x1F) == 0x11 || (vf->cpu.cpsr & 0x1F) == 0x12) && vf->boot_phase >= 300) {
             static int fiq_io = 0;
@@ -959,6 +971,23 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         if (off < 0x200)
             return ztimer_read(&vf->timer, off);
 
+        /* DMA engine at 0xA0000000 (off = 0x20000000).
+         * Init task reads 0xC0/0xC4 for DMA channel status. */
+        if (off >= 0x20000000u && off < 0x20001000u) {
+            uint32_t dreg = off - 0x20000000u;
+            switch (dreg) {
+                case 0xC0: return 0x01; /* DMA channel 0 complete */
+                case 0xC4: return 0x01; /* DMA channel 1 complete */
+                default: return 0;
+            }
+        }
+
+        /* Unknown peripheral at 0x900D0000 (off = 0x100D0000).
+         * Init task reads 0x18 — possibly clock/power status. */
+        if (off >= 0x100D0000u && off < 0x100D1000u) {
+            return 0x01; /* generic "ready" status */
+        }
+
         /* Secondary interrupt controller at 0xDC000000 (off = 0x5C000000).
          * µMORE FIQ handler reads 0xDC000124/128 for interrupt source,
          * writes 0xDC00012C to clear. Return timer IRQ status. */
@@ -968,12 +997,14 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
              * NOT a mirror of primary VIC — separate register layout.
              * Return timer IRQ status for status registers. */
             switch (sreg) {
-                case 0x000: /* IRQ status (which sources are active) */
-                    return (vf->timer.irq.status & vf->timer.irq.enable) ? 1 : 0;
+                case 0x000: /* IRQ status — report all active sources */
+                    return ((vf->timer.irq.status & vf->timer.irq.enable) ? 1 : 0)
+                         | 0xFE; /* all peripheral IRQs active */
                 case 0x024: /* IRQ status (alternate) */
-                    return (vf->timer.irq.status & vf->timer.irq.enable) ? 1 : 0;
+                    return ((vf->timer.irq.status & vf->timer.irq.enable) ? 1 : 0)
+                         | 0xFE;
                 case 0x028: /* Raw interrupt status */
-                    return vf->timer.irq.status ? 1 : 0;
+                    return vf->timer.irq.status | 0xFE;
                 default: return 0;
             }
         }
@@ -3400,8 +3431,9 @@ void vflash_run_frame(VFlash *vf) {
                             cdrom_read_file(vf->cd, &be, vf->ram + dest, 0, msz);
                         }
                     }
-                    /* Patch callback to idle (prevent warm reboot) */
-                    *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFF000;
+                    /* Let callback trigger warm reboot #3 (0x1880).
+                     * Reboot #3 handler will run ROM warm boot naturally. */
+                    /* Don't patch: *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFF000; */
                     /* Enable timer for init task */
                     vf->timer.timer[0].load = 37500;
                     vf->timer.timer[0].count = 37500;
