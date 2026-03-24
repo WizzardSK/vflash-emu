@@ -3551,12 +3551,20 @@ void vflash_run_frame(VFlash *vf) {
                         *(uint8_t*)(vf->ram + 0xB668A0) = 1; /* state byte at context+0 */
                         *(uint8_t*)(vf->ram + 0xB668C4) = 1; /* context+0x24 */
                     }
-                    /* Patch callback to trampoline.
-                     * When bootstrap calls callback, trampoline runs AFTER
-                     * init funcs have populated µMORE structures. */
+                    /* Snapshot BEFORE bootstrap: count non-zero words in key areas */
+                    {
+                        int nz_heap = 0, nz_bss = 0, nz_high = 0;
+                        for (uint32_t a = 0x400000; a < 0x800000; a += 4)
+                            if (*(uint32_t*)(vf->ram+a)) nz_heap++;
+                        for (uint32_t a = 0x1A55B0; a < 0x400000; a += 4)
+                            if (*(uint32_t*)(vf->ram+a)) nz_bss++;
+                        for (uint32_t a = 0x800000; a < 0xC00000; a += 4)
+                            if (*(uint32_t*)(vf->ram+a)) nz_high++;
+                        printf("[SNAPSHOT-PRE] heap(0x400000-0x800000)=%d BSS(0x1A55B0-0x400000)=%d high(0x800000-0xC00000)=%d\n",
+                               nz_heap, nz_bss, nz_high);
+                    }
+                    /* Patch callback to trampoline */
                     *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFE100;
-                    /* Register callback dump: when trampoline runs, dump game context */
-                    vf->boot_phase = 600; /* signal trampoline detection */
                     /* Set game init flags */
                     *(uint32_t*)(vf->ram + 0xBBAE40) = 5;
                     *(uint16_t*)(vf->ram + 0xBE49E0) = 1;
@@ -3594,6 +3602,33 @@ void vflash_run_frame(VFlash *vf) {
                             printf("[TRAMPOLINE] $QCB at 0x%08X state=%08X\n",
                                    0x10000000+a, v20);
                         }
+                    }
+                    /* Snapshot AFTER bootstrap init funcs */
+                    {
+                        int nz_heap = 0, nz_bss = 0, nz_high = 0;
+                        for (uint32_t a = 0x400000; a < 0x800000; a += 4)
+                            if (*(uint32_t*)(vf->ram+a)) nz_heap++;
+                        for (uint32_t a = 0x1A55B0; a < 0x400000; a += 4)
+                            if (*(uint32_t*)(vf->ram+a)) nz_bss++;
+                        for (uint32_t a = 0x800000; a < 0xC00000; a += 4)
+                            if (*(uint32_t*)(vf->ram+a)) nz_high++;
+                        printf("[SNAPSHOT-POST] heap=%d BSS=%d high=%d\n",
+                               nz_heap, nz_bss, nz_high);
+                        /* Find NEW non-zero words in high area (game data?) */
+                        printf("[SNAPSHOT-POST] Non-zero ranges in 0x10B00000-0x10C00000:\n");
+                        uint32_t run_start = 0;
+                        int in_run = 0;
+                        for (uint32_t a = 0xB00000; a < 0xC00000; a += 4) {
+                            int nz = *(uint32_t*)(vf->ram+a) != 0;
+                            if (nz && !in_run) { run_start = a; in_run = 1; }
+                            if (!nz && in_run) {
+                                printf("[SNAPSHOT-POST]  0x%08X-0x%08X (%d words)\n",
+                                       0x10000000+run_start, 0x10000000+a, (a-run_start)/4);
+                                in_run = 0;
+                            }
+                        }
+                        if (in_run)
+                            printf("[SNAPSHOT-POST]  0x%08X-0x10C00000\n", 0x10000000+run_start);
                     }
                     vf->boot_phase = 700;
                 }
