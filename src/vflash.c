@@ -3551,8 +3551,12 @@ void vflash_run_frame(VFlash *vf) {
                         *(uint8_t*)(vf->ram + 0xB668A0) = 1; /* state byte at context+0 */
                         *(uint8_t*)(vf->ram + 0xB668C4) = 1; /* context+0x24 */
                     }
-                    /* Patch callback to trampoline (not 0x1880 warm reboot) */
+                    /* Patch callback to trampoline.
+                     * When bootstrap calls callback, trampoline runs AFTER
+                     * init funcs have populated µMORE structures. */
                     *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFE100;
+                    /* Register callback dump: when trampoline runs, dump game context */
+                    vf->boot_phase = 600; /* signal trampoline detection */
                     /* Set game init flags */
                     *(uint32_t*)(vf->ram + 0xBBAE40) = 5;
                     *(uint16_t*)(vf->ram + 0xBE49E0) = 1;
@@ -3564,7 +3568,34 @@ void vflash_run_frame(VFlash *vf) {
                     vf->cpu.r[15] = 0x10C00010;
                     vf->cpu.r[13] = 0x10C0425C;
                     vf->cpu.r[14] = 0x10FFF000;
-                    vf->boot_phase = 500;
+                    vf->boot_phase = 600; /* trampoline detection */
+                }
+            }
+
+            /* Dump game context when trampoline runs (PC near 0x10FFE100) */
+            if (vf->boot_phase == 600 && pc >= 0x10FFE100 && pc <= 0x10FFE120) {
+                static int td = 0;
+                if (!td) {
+                    td = 1;
+                    printf("[TRAMPOLINE] Game context at 0x10B668A0:\n");
+                    for (int d = 0; d < 0x30; d += 16) {
+                        printf("[TRAMPOLINE] +%02X: %08X %08X %08X %08X\n", d,
+                               *(uint32_t*)(vf->ram+0xB668A0+d),
+                               *(uint32_t*)(vf->ram+0xB668A0+d+4),
+                               *(uint32_t*)(vf->ram+0xB668A0+d+8),
+                               *(uint32_t*)(vf->ram+0xB668A0+d+12));
+                    }
+                    /* Also check $QCB */
+                    printf("[TRAMPOLINE] Task list: [0x3585C0]=%08X\n",
+                           *(uint32_t*)(vf->ram+0x3585C0));
+                    for (uint32_t a = 0x100000; a < 0xC00000; a += 4) {
+                        if (*(uint32_t*)(vf->ram + a) == 0x42435124) {
+                            uint32_t v20 = *(uint32_t*)(vf->ram+a+0x20);
+                            printf("[TRAMPOLINE] $QCB at 0x%08X state=%08X\n",
+                                   0x10000000+a, v20);
+                        }
+                    }
+                    vf->boot_phase = 700;
                 }
             }
 
