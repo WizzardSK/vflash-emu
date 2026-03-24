@@ -57,14 +57,15 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 
 ### Remaining for gameplay
 
-Game task executes µMORE kernel code (0x10A06Exx, 0x10A157xx). Need to trace
-whether game reaches BOOT.BIN code, accesses CD-ROM for assets, or writes to
-LCD framebuffer. Currently no visible output — task runs kernel service calls.
+Game task runs µMORE event pump but never calls BOOT.BIN game code. The event
+callback context at 0x10BE4BA8 is empty — on real hardware this is filled during
+the warm reboot chain. Need to reverse-engineer the callback table format used by
+the µMORE event dispatch function at 0x109D13B8 to inject BOOT.BIN game handlers.
 
-**Nucleus RTOS** confirmed via Ndless/Nspire RE (NU_ API). TCB format reverse-engineered:
+**Nucleus RTOS** confirmed via Ndless/Nspire RE (NU_ API). TCB format:
 `$QCB` magic, `$QBT` sub-magic, entry at +0x2C, stack at +0x30/+0x34, priority at +0x3C.
-**Firebird-style interrupt controller** at 0xDC000000 (ACK, EOI, priority).
-**Multi-game**: dynamic service entry from SDRAM vectors. Tested 6 games.
+**Interrupt controller** per TI-Nspire Firebird at 0xDC000000 (ACK, EOI, priority).
+**Multi-game**: dynamic service entry, tested 6 games (Cars + Incredibles boot µMORE).
 
 ### Asset Browser
 
