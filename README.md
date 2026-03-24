@@ -31,8 +31,8 @@ Background voice/SFX audio plays automatically from 561 WAV files on disc.
 
 ## Status
 
-**µMORE v4.0 RTOS boots natively** — full warm reboot chain, RTOS prints version banner,
-FIQ dispatch with populated vector table. Two warm reboots complete naturally.
+**Full 3-reboot chain working** — µMORE v4.0 RTOS boots completely with 3 warm reboots,
+version banner printed, IRQ handler works, scheduler runs in idle loop.
 
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spider-Man.
 
@@ -45,20 +45,22 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | 7 init functions (PLL, memcpy, BSS, MMU, cache) | ✅ All native |
 | µMORE scheduler + heap (1MB) | ✅ Active at 0x10010234 |
 | Init task → warm reboot #1 | ✅ 0x100113DC → 0x900A0008 |
-| BOOT.BIN bootstrap → warm reboot #2 | ✅ Init functions + 0x1880 |
-| BOOT.BIN init (0x10C0011C) | ✅ Populates service entry + vectors |
-| **µMORE service entry (0x109D11E0)** | ✅ Registers services, prints banner |
+| ROM warm boot → BOOT.BIN → warm reboot #2 | ✅ |
+| BOOT.BIN init → service entry → µMORE init | ✅ Registers services 2/3/4 |
 | **µMORE version banner** | ✅ "µMORE v4.0 SDK ARM9T version" |
-| **FIQ vector dispatch** | ✅ ROM→0xD00→SDRAM[0xFF9C]→0x10A15DA4 |
-| **FIQ handler (0x10A15DA4)** | 🔧 Runs but doesn't clear timer IRQ |
+| **Init task completes** | ✅ Peripheral setup → B . halt |
+| **BOOT.BIN bootstrap → warm reboot #3** | ✅ Callback 0x1880 |
+| **ROM warm boot → scheduler idle** | ✅ 0x10A219xx loop |
+| **Secondary VIC (0xDC000000)** | ✅ Timer IRQ clear |
+| **Game task dispatch** | 🔧 Scheduler idle — no tasks registered |
 
 ### Remaining for gameplay
 
-µMORE RTOS boots fully: two warm reboots, BOOT.BIN init populates service entry and
-FIQ vector table, scheduler registers services 2/3/4, prints version banner. Timer FIQ
-fires and dispatches to µMORE FIQ handler at 0x10A15DA4. Handler runs but doesn't clear
-the timer interrupt, causing FIQ re-delivery. Need to debug the FIQ handler's timer
-clear path or fix the VIC register interface.
+Complete 3-reboot chain works: init task → BOOT.BIN → µMORE init → BOOT.BIN bootstrap
+→ scheduler. µMORE scheduler runs stably in idle loop (0x10A219xx) with timer IRQs.
+Remaining blocker: no game task registered in scheduler queue. Need to understand
+how BOOT.BIN registers the game task via µMORE API, or manually create a task struct
+in the correct µMORE format.
 
 ### Asset Browser
 
