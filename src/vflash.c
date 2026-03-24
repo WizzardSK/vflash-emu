@@ -3583,7 +3583,26 @@ void vflash_run_frame(VFlash *vf) {
                 }
             }
 
-            /* Dump game context when trampoline runs (PC near 0x10FFE100) */
+            /* Scan for Nucleus TCB structs (magic "TASK"=0x5441534B or "$QCB"=0x42435124) */
+            if (vf->boot_phase == 600 && pc >= 0x10FFE100 && pc <= 0x10FFE120) {
+                static int tcb_scanned = 0;
+                if (!tcb_scanned) {
+                    tcb_scanned = 1;
+                    printf("[TCB-SCAN] Searching for Nucleus TCBs...\n");
+                    for (uint32_t a = 0x100000; a < 0xC00000; a += 4) {
+                        uint32_t magic = *(uint32_t*)(vf->ram + a);
+                        if (magic == 0x5441534B || magic == 0x42435124) {
+                            char tag[5]; memcpy(tag, &magic, 4); tag[4]=0;
+                            uint32_t status = *(uint8_t*)(vf->ram + a + 0x0C);
+                            uint32_t sp = *(uint32_t*)(vf->ram + a + 0x18);
+                            uint32_t entry = *(uint32_t*)(vf->ram + a + 0x2C);
+                            uint32_t sstart = *(uint32_t*)(vf->ram + a + 0x1C);
+                            printf("[TCB-SCAN] '%s' at 0x%08X: status=%d SP=%08X entry=%08X stack=%08X\n",
+                                   tag, 0x10000000+a, status, sp, entry, sstart);
+                        }
+                    }
+                }
+            }
             if (vf->boot_phase == 600 && pc >= 0x10FFE100 && pc <= 0x10FFE120) {
                 static int td = 0;
                 if (!td) {
@@ -3634,6 +3653,32 @@ void vflash_run_frame(VFlash *vf) {
                             printf("[SNAPSHOT-POST]  0x%08X-0x10C00000\n", 0x10000000+run_start);
                     }
                     vf->boot_phase = 700;
+                }
+            }
+
+            /* TCB scan at init task sleep */
+            if (vf->boot_phase >= 600 && pc == 0x1001158C) {
+                static int tcbs = 0;
+                if (!tcbs) {
+                    tcbs = 1;
+                    printf("[TCB-SCAN] Searching for Nucleus TCBs...\n");
+                    for (uint32_t a = 0x100000; a < 0xC00000; a += 4) {
+                        uint32_t magic = *(uint32_t*)(vf->ram + a);
+                        if (magic == 0x5441534B || magic == 0x42435124) {
+                            uint32_t status = *(uint8_t*)(vf->ram+a+0x0C);
+                            uint32_t sp = *(uint32_t*)(vf->ram+a+0x18);
+                            uint32_t entry = *(uint32_t*)(vf->ram+a+0x2C);
+                            uint32_t sstart = *(uint32_t*)(vf->ram+a+0x1C);
+                            char tag[5]; memcpy(tag, vf->ram+a, 4); tag[4]=0;
+                            printf("[TCB] '%s' @0x%08X st=%d SP=%08X entry=%08X stack=%08X\n",
+                                   tag, 0x10000000+a, status, sp, entry, sstart);
+                            /* Dump first 0x40 bytes */
+                            for (int d = 0; d < 0x40; d += 16)
+                                printf("[TCB]  +%02X: %08X %08X %08X %08X\n", d,
+                                       *(uint32_t*)(vf->ram+a+d), *(uint32_t*)(vf->ram+a+d+4),
+                                       *(uint32_t*)(vf->ram+a+d+8), *(uint32_t*)(vf->ram+a+d+12));
+                        }
+                    }
                 }
             }
 
