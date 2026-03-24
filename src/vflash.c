@@ -5051,6 +5051,12 @@ void vflash_run_frame(VFlash *vf) {
             }
         }
         printf("[CB-SCAN] Found %d BOOT.BIN pointers\n", found);
+        /* Dump area around first cluster at 0x1009D160-0x1009D190 */
+        printf("[CB-SCAN] Context around first cluster:\n");
+        for (uint32_t d = 0x9D160; d < 0x9D1C0; d += 16)
+            printf("[CB-SCAN] %08X: %08X %08X %08X %08X\n", 0x10000000+d,
+                   *(uint32_t*)(vf->ram+d), *(uint32_t*)(vf->ram+d+4),
+                   *(uint32_t*)(vf->ram+d+8), *(uint32_t*)(vf->ram+d+12));
     }
 
     /* Auto-launch game task after µMORE init stabilizes.
