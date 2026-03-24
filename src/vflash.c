@@ -3331,8 +3331,24 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
-    /* Dynamic event_wait skip DISABLED — corrupts task state.
-     * Need proper event signaling instead. */
+    /* (event loop intercept moved before BSS check) */
+
+    /* Intercept µMORE event dispatch loop (0x10A17100).
+     * Game task calls with R0=0, R1=0 (null callback).
+     * Inject BOOT.BIN game entry as callback. */
+    if (addr == 0x10A17100 && ((VFlash*)ctx)->boot_phase >= 800) {
+        static int evl = 0;
+        if (evl < 5) {
+            printf("[EV-LOOP] R0=%08X R1=%08X LR=%08X\n",
+                   cpu->r[0], cpu->r[1], cpu->r[14]);
+            evl++;
+        }
+        if (cpu->r[1] == 0) {
+            cpu->r[1] = 0x10CFAEA0;
+            printf("[EV-LOOP] Injected game callback!\n");
+        }
+        return 0;
+    }
 
     /* Intercept scheduler init: set sched_state=3 before task_start. */
     if (addr == 0x10085E50) {
@@ -3815,6 +3831,40 @@ void vflash_run_frame(VFlash *vf) {
                 static int sched_dump = 0;
                 if (!sched_dump) {
                     sched_dump = 1;
+                    /* Dump game task entry code */
+                    {
+                        uint32_t best_a2 = 0, best_sz2 = 0;
+                        for (uint32_t a = 0x100000; a < 0xC00000; a += 4) {
+                            if (*(uint32_t*)(vf->ram+a) == 0x42435124 &&
+                                *(uint32_t*)(vf->ram+a+0x1C) == 0x42435424) {
+                                uint32_t sz = *(uint32_t*)(vf->ram+a+0x34);
+                                uint32_t entry = *(uint32_t*)(vf->ram+a+0x2C);
+                                if (sz > best_sz2 && entry >= 0x10090000) {
+                                    best_sz2 = sz; best_a2 = a;
+                                }
+                            }
+                        }
+                        if (best_a2) {
+                            uint32_t entry = *(uint32_t*)(vf->ram+best_a2+0x2C);
+                            uint32_t eoff = entry - 0x10000000;
+                            printf("[GAME-ENTRY] Task entry at 0x%08X:\n", entry);
+                            for (uint32_t d = 0; d < 0x80; d += 4)
+                                printf("  %08X: %08X\n", entry+d, *(uint32_t*)(vf->ram+eoff+d));
+                            /* Dump pool area (entry + 0x140 to entry + 0x160) */
+                            printf("[GAME-ENTRY] Pool area:\n");
+                            for (uint32_t d = 0x140; d < 0x170; d += 4)
+                                printf("  %08X: %08X\n", entry+d, *(uint32_t*)(vf->ram+eoff+d));
+                            /* Read context pointer */
+                            uint32_t ctx_ptr = *(uint32_t*)(vf->ram+eoff+0x150);
+                            printf("[GAME-ENTRY] Context ptr (pool+0x150) = 0x%08X\n", ctx_ptr);
+                            if (ctx_ptr >= 0x10000000 && ctx_ptr < 0x11000000) {
+                                uint32_t co = ctx_ptr - 0x10000000;
+                                printf("[GAME-ENTRY] Context data:\n");
+                                for (uint32_t d = 0; d < 0x20; d += 4)
+                                    printf("  +%02X: %08X\n", d, *(uint32_t*)(vf->ram+co+d));
+                            }
+                        }
+                    }
                     printf("[SCHED-CODE] Scheduler idle loop at 0x10A219xx:\n");
                     for (uint32_t da = 0xA21980; da < 0xA21A20; da += 4)
                         printf("  %08X: %08X\n", 0x10000000+da, *(uint32_t*)(vf->ram+da));
