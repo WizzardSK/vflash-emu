@@ -248,6 +248,7 @@ struct VFlash {
     int      bp_hit;   /* set by vflash_step() when BP hit */
 
     int      boot_phase; /* Boot flow phase tracking */
+    uint32_t flash_last_write; /* Last value written to NOR flash (for status polling) */
 
     uint32_t  framebuf[VFLASH_SCREEN_W * VFLASH_SCREEN_H];
 };
@@ -880,17 +881,10 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
     /* Fast path: RAM (most common — ~90% of all accesses) */
     if (__builtin_expect(addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE, 1)) {
         uint32_t roff = addr - VFLASH_RAM_BASE;
-        /* Trace RAM reads from scheduler loop */
-        {
-            uint32_t caller = vf->cpu.r[15];
-            if (vf->boot_phase >= 300 && caller >= 0x10A1C540 && caller <= 0x10A1C5F0) {
-                static int ram_trace = 0;
-                if (ram_trace < 30 && roff > 0xA1D000) { /* skip code/pool reads */
-                    uint32_t val = *(uint32_t*)(vf->ram + roff);
-                    printf("[RAM-TRACE] PC=%08X read [%08X]=%08X\n", caller, addr, val);
-                    ram_trace++;
-                }
-            }
+        /* Flash completion: µMORE loop checks [0x10BBCFF4] and [0x10BBD010].
+         * Force bit 0 on both to signal operation complete. */
+        if (vf->boot_phase >= 300 && (roff == 0xBBCFF4 || roff == 0xBBD010)) {
+            return *(uint32_t*)(vf->ram + roff) | 1;
         }
         if (roff == 0x1C9C && vf->atapi.reboot_count >= 2) {
             static int rd_wp = 0;
@@ -986,14 +980,13 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
             uint32_t foff = off - 0x38000000u;
             if (foff < 0x800) {
-                /* Controller status registers */
+                /* NOR flash: µMORE writes data then polls to verify.
+                 * Return last written value (flash write completes instantly).
+                 * If nothing was written, return 0 (erased state). */
+                if (foff < 0x10) {
+                    return vf->flash_last_write; /* last written value */
+                }
                 switch (foff) {
-                    /* NOR flash status: return 0 (no data) so polling loops
-                     * see empty accumulator and take the "complete" path. */
-                    case 0x00: return 0;
-                    case 0x04: return 0;
-                    case 0x08: return 0;
-                    case 0x0C: return 0;
                     case 0x34: return 0x40;   /* Status: ready */
                     case 0x40: return 1;
                 }
@@ -1544,6 +1537,11 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
          * We buffer all writes to 0xB8000800+ and flush to RAM on remap. */
         if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
             uint32_t foff = off - 0x38000000u;
+            /* Track writes to flash data area (for status polling read-back) */
+            if (foff < 0x800) {
+                vf->flash_last_write = val;
+                return; /* absorb flash commands/data writes */
+            }
             if (foff >= 0x800 && foff < 0x800 + sizeof(vf->flash_buf)) {
                 uint32_t boff = foff - 0x800;
                 /* Buffer the write (but don't overwrite flash_buf[0] after preload) */
@@ -3269,18 +3267,16 @@ void vflash_run_frame(VFlash *vf) {
             uint32_t pc = vf->cpu.r[15];
             static int phase = 0;
 
-            /* Skip LCD vsync wait loop at 0x10A1C5xx.
-             * µMORE code polls [0x10BBCFF4] waiting for LCD frame complete.
-             * We don't generate LCD vsync interrupts, so skip after timeout. */
+            /* Flash operation completion: µMORE loop at 0x10A1C5xx polls
+             * [0x10BBCFF4] bit 0. Set it periodically to simulate flash
+             * write/erase completion. This flag is normally set by a flash
+             * controller interrupt or DMA callback. */
             if (vf->boot_phase >= 300 && pc >= 0x10A1C540 && pc <= 0x10A1C590) {
-                static int vsync_wait = 0;
-                vsync_wait++;
-                if (vsync_wait > 50) { /* force quickly */
-                    /* Set the flag the loop checks */
-                    *(uint32_t*)(vf->ram + 0xBBCFF4) = 0x80808080;
-                    *(uint32_t*)(vf->ram + 0xBBCFF8) = 0x80808080;
-                    vsync_wait = 0;
-                    printf("[VSYNC] Forced vsync complete at frame %llu\n", vf->frame_count);
+                static int flash_wait = 0;
+                flash_wait++;
+                if (flash_wait > 20) {
+                    *(uint32_t*)(vf->ram + 0xBBCFF4) |= 1;
+                    flash_wait = 0;
                 }
             }
 
