@@ -883,6 +883,22 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         uint32_t roff = addr - VFLASH_RAM_BASE;
         /* Flash completion: µMORE loop checks [0x10BBCFF4] and [0x10BBD010].
          * Force bit 0 on both to signal operation complete. */
+        /* Detect game task reaching BOOT.BIN code (0x10C00000+) */
+        if (vf->boot_phase >= 800 && roff >= 0xC00000 && roff < 0xE00000) {
+            static int bootbin_access = 0;
+            if (bootbin_access < 5) {
+                printf("[GAME-CODE] BOOT.BIN read at [%08X] from PC=%08X\n",
+                       addr, vf->cpu.r[15]);
+                bootbin_access++;
+            }
+        }
+        /* Detect framebuffer writes */
+        if (vf->boot_phase >= 800 && roff >= 0x800000 && roff < 0x900000) {
+            static int fb_read = 0;
+            if (fb_read < 3)
+                printf("[FB-ACCESS] Read [%08X] from PC=%08X\n", addr, vf->cpu.r[15]);
+            fb_read++;
+        }
         /* Flash completion flags — always return with bit0 set. */
         if (roff == 0xBBCFF4 || roff == 0xBBD010) {
             return *(uint32_t*)(vf->ram + roff) | 1;
@@ -1293,19 +1309,16 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         /* 0x90020000: UART or 2nd VIC/event controller on V.Flash.
          * Scheduler polls offset 0x14 checking bit 5 (pending event).
          * Return timer IRQ pending status as bit 5. */
-        if (off >= 0x10020000u && off < 0x10021000u) {
-            uint32_t ureg = off - 0x10020000u;
+        if (off >= 0x10020000u && off < 0x10080000u) { /* event controller banks 0-5 */
+            uint32_t ureg = (off - 0x10020000u) & 0xFFFF; /* bank-relative offset */
             switch (ureg) {
-                case 0x00: return vf->timer.irq.status & vf->timer.irq.enable; /* IRQ status */
-                case 0x14: /* event controller status: bit5 = event pending */
-                    return (vf->timer.irq.status & vf->timer.irq.enable) ? 0x20 : 0;
-                case 0x18: return 0x90;      /* UARTFR: TX empty, RX empty */
-                case 0x24: return 0;         /* UARTIBRD */
-                case 0x28: return 0;         /* UARTFBRD */
-                case 0x2C: return 0;         /* UARTLCR_H */
-                case 0x30: return 0;         /* UARTCR */
-                case 0xFE0: return 0x11;     /* PL011 PeriphID0 */
-                case 0xFE4: return 0x10;     /* PL011 PeriphID1 */
+                case 0x00: return vf->timer.irq.status & vf->timer.irq.enable;
+                case 0x14: /* event status: bit5 = pending.
+                     * Return always-pending for all banks to unblock tasks. */
+                    return 0x20;
+                case 0x18: return 0x90; /* UARTFR: TX empty */
+                case 0xFE0: return 0x11;
+                case 0xFE4: return 0x10;
                 default:    return 0;
             }
         }
@@ -2004,8 +2017,8 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
         if (off >= 0x10000000u && off < 0x10001000u) return;
 
         /* Event controller / UART write at 0x90020000 */
-        if (off >= 0x10020000u && off < 0x10021000u) {
-            uint32_t ureg = off - 0x10020000u;
+        if (off >= 0x10020000u && off < 0x10080000u) { /* event controller banks 0-5 */
+            uint32_t ureg = (off - 0x10020000u) & 0xFFFF;
             if (ureg == 0x00) {
                 char c = (char)(val & 0xFF);
                 if (c >= 0x20 || c == '\n')
@@ -3660,28 +3673,52 @@ void vflash_run_frame(VFlash *vf) {
             if (vf->boot_phase >= 600 && pc == 0x1001158C) {
                 static int game_start = 0;
                 if (game_start == 100) {
-                    /* Find task with largest stack (= game task) */
-                    uint32_t best_a = 0, best_sz = 0;
+                    /* Launch ALL tasks by calling their entries sequentially.
+                     * Start with highest priority first (task #1), then game task last. */
+                    printf("[TASK-LAUNCH] Scanning and launching tasks...\n");
+                    /* First: launch task #1 (entry=109D1D30, priority 3, stack 8KB)
+                     * This is likely the main service dispatcher task. */
+                    uint32_t task1_a = 0;
+                    uint32_t game_a = 0;
                     for (uint32_t a = 0x100000; a < 0xC00000; a += 4) {
                         if (*(uint32_t*)(vf->ram+a) == 0x42435124 &&
                             *(uint32_t*)(vf->ram+a+0x1C) == 0x42435424) {
-                            uint32_t sz = *(uint32_t*)(vf->ram+a+0x34);
                             uint32_t entry = *(uint32_t*)(vf->ram+a+0x2C);
-                            if (sz > best_sz && entry >= 0x10090000) {
-                                best_sz = sz; best_a = a;
+                            uint32_t id = *(uint32_t*)(vf->ram+a+0x28);
+                            uint32_t sz = *(uint32_t*)(vf->ram+a+0x34);
+                            if (entry >= 0x10090000) {
+                                printf("[TASK-LAUNCH] Task #%d @%08X entry=%08X stack=%X\n",
+                                       id, 0x10000000+a, entry, sz);
+                                if (id == 1) task1_a = a;
+                                if (sz >= 0x10000) game_a = a; /* 64KB+ = game */
                             }
                         }
                     }
-                    if (best_a) {
-                        uint32_t entry = *(uint32_t*)(vf->ram+best_a+0x2C);
-                        uint32_t sbase = *(uint32_t*)(vf->ram+best_a+0x30);
-                        uint32_t ssz = *(uint32_t*)(vf->ram+best_a+0x34);
-                        printf("[GAME-TASK] Launching task @0x%08X: entry=%08X stack=%08X+%X\n",
-                               0x10000000+best_a, entry, sbase, ssz);
-                        vf->cpu.cpsr = 0x00000013; /* SVC, IRQ+FIQ enabled */
+                    /* Try each task. Task #7 has 16KB stack (could be game). */
+                    uint32_t pick = 0;
+                    for (uint32_t a = 0x100000; a < 0xC00000; a += 4) {
+                        if (*(uint32_t*)(vf->ram+a) == 0x42435124 &&
+                            *(uint32_t*)(vf->ram+a+0x1C) == 0x42435424) {
+                            uint32_t id = *(uint32_t*)(vf->ram+a+0x28);
+                            if (id == 7) { pick = a; break; } /* try task #7 */
+                        }
+                    }
+                    if (!pick) pick = game_a ? game_a : task1_a;
+                    if (pick) {
+                        uint32_t entry = *(uint32_t*)(vf->ram+pick+0x2C);
+                        uint32_t sbase = *(uint32_t*)(vf->ram+pick+0x30);
+                        uint32_t ssz = *(uint32_t*)(vf->ram+pick+0x34);
+                        printf("[TASK-LAUNCH] → entry=%08X stack=%08X+%X\n",
+                               entry, sbase, ssz);
+                        vf->cpu.cpsr = 0x00000013;
                         vf->cpu.r[15] = entry;
-                        vf->cpu.r[13] = sbase + ssz - 4; /* top of stack */
-                        vf->cpu.r[14] = 0x10FFF000; /* return to idle */
+                        vf->cpu.r[13] = sbase + ssz - 4;
+                        vf->cpu.r[14] = 0x10FFF000;
+                        /* Enable timer for task */
+                        vf->timer.timer[0].load = 37500;
+                        vf->timer.timer[0].count = 37500;
+                        vf->timer.timer[0].ctrl = 0xE2;
+                        vf->timer.irq.enable |= 0x01;
                         vf->boot_phase = 800;
                     }
                 }
