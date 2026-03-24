@@ -3324,14 +3324,12 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
             printf("[SLEEP] 0x10011D88 from LR=%08X bp=%d\n",
                    cpu->r[14], ((VFlash*)ctx)->boot_phase);
         sleep_log++;
-        /* Skip sleep in early boot (< 600). After boot_phase 600,
-         * let sleep run natively — sleep-wake simulator handles it. */
-        if (((VFlash*)ctx)->boot_phase < 600) {
-            cpu->r[0] = 0;
-            cpu->r[15] = cpu->r[14] & ~3u;
-            return 1;
-        }
-        return 0; /* native execution */
+        /* Always intercept sleep — return 0 (success) immediately.
+         * Without µMORE scheduler context-switch, native sleep (B .)
+         * never wakes. Intercepting creates busy event processing loop. */
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
     }
     /* Dynamic event_wait skip DISABLED — corrupts task state.
      * Need proper event signaling instead. */
@@ -3669,8 +3667,13 @@ void vflash_run_frame(VFlash *vf) {
                 }
             }
 
-            /* After TCB scan, launch the game task directly */
-            if (vf->boot_phase >= 600 && pc == 0x1001158C) {
+            /* After TCB scan, launch the game task directly.
+             * Match: trampoline idle (0x10FFE118), init sleep (0x1001158C),
+             * or any B . in kernel area with boot_phase >= 600. */
+            if (vf->boot_phase >= 600 &&
+                ((pc == 0x10FFE118) || (pc == 0x1001158C) ||
+                 (pc >= 0x10090000 && pc < 0x10FFE000 &&
+                  *(uint32_t*)(vf->ram+(pc-0x10000000)) == 0xEAFFFFFE))) {
                 static int game_start = 0;
                 if (game_start == 100) {
                     /* Launch ALL tasks by calling their entries sequentially.
@@ -3754,7 +3757,18 @@ void vflash_run_frame(VFlash *vf) {
             /* Simulate µMORE sleep-wake: when init task hits B . (sleep),
              * skip it after timeout by returning to caller (PC = LR).
              * This simulates scheduler waking the task after sleep timer. */
-            if (vf->boot_phase >= 600 && pc >= 0x10010000 && pc < 0x10020000 &&
+            /* Simple debug: log when bp>=800 and PC anywhere */
+            if (vf->boot_phase >= 800) {
+                static int bp800 = 0;
+                if (bp800 < 3) {
+                    printf("[BP800] pc=%08X bp=%d frame=%llu\n",
+                           pc, vf->boot_phase, vf->frame_count);
+                    bp800++;
+                }
+            }
+            /* Sleep-wake: skip B . in kernel area or trampoline idle */
+            if (vf->boot_phase >= 800 &&
+                pc >= 0x10010000 && pc < 0x10FFE000 &&
                 *(uint32_t*)(vf->ram + (pc - 0x10000000)) == 0xEAFFFFFE) {
                 static int sleep_skip = 0;
                 static uint32_t last_sleep_pc = 0;
@@ -3766,19 +3780,13 @@ void vflash_run_frame(VFlash *vf) {
                     sleep_skip = 0;
                 }
                 sleep_skip++;
-                if (sleep_skip > 0 && sleep_skip % 500 == 0) {
-                    /* Ensure timer is running so IRQ can wake the sleep.
-                     * µMORE sleep waits for timer IRQ to context-switch. */
-                    if (!(vf->timer.timer[0].ctrl & 0x81)) {
-                        printf("[SLEEP-WAKE] Re-enabling timer for sleep wake\n");
-                        vf->timer.timer[0].load = 37500;
-                        vf->timer.timer[0].count = 37500;
-                        vf->timer.timer[0].ctrl = 0xE2;
-                        vf->timer.irq.enable |= 0x01;
-                    }
-                    /* Also ensure IRQ enabled in CPSR */
-                    vf->cpu.cpsr &= ~0xC0;
-                    sleep_skip = 0;
+                if (sleep_skip > 0 && sleep_skip % 200 == 0) {
+                    /* Skip B . by returning to caller (LR).
+                     * This simulates µMORE scheduler waking the task. */
+                    printf("[SLEEP-WAKE] Skipping B . at %08X → LR=%08X (iter %d)\n",
+                           pc, vf->cpu.r[14], sleep_skip);
+                    vf->cpu.r[0] = 0;
+                    vf->cpu.r[15] = vf->cpu.r[14] & ~3u;
                 }
             }
 
