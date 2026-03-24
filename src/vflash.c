@@ -2091,14 +2091,10 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                     return;
                 }
 
-                if (vf->atapi.reboot_count >= 2) {
-                    /* Reboot #2+: SDRAM vectors at 0xFF80+ populated by reboot #1.
-                     * Re-load BOOT.BIN, run init, then launch service entry.
-                     * The vectors will enable µMORE FIQ dispatch to work properly. */
-                    printf("[REBOOT] Reboot #%d: BOOT.BIN init → service entry\n",
-                           vf->atapi.reboot_count);
-
-                    /* Re-load BOOT.BIN from disc */
+                if (vf->atapi.reboot_count == 2) {
+                    /* Reboot #2: SDRAM vectors at 0xFF80+ populated by reboot #1.
+                     * Re-load BOOT.BIN, run init, then launch service entry. */
+                    printf("[REBOOT] Reboot #2: BOOT.BIN init → service entry\n");
                     if (vf->cd && vf->cd->is_open) {
                         CDEntry boot_entry;
                         if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &boot_entry)) {
@@ -2109,31 +2105,21 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                                 vf->ram + dest, 0, max_sz);
                         }
                     }
-
-                    /* Log SDRAM vectors (should be populated from reboot #1) */
-                    printf("[REBOOT] Vectors: [0xFF9C]=%08X [0xFFB8]=%08X [0xFFBC]=%08X [0xFFDC]=%08X\n",
-                           *(uint32_t*)(vf->ram+0xFF9C), *(uint32_t*)(vf->ram+0xFFB8),
-                           *(uint32_t*)(vf->ram+0xFFBC), *(uint32_t*)(vf->ram+0xFFDC));
-
-                    /* Patch callback to idle (prevent warm reboot loop) */
+                    printf("[REBOOT] Vectors: [0xFF9C]=%08X [0xFFBC]=%08X [0xFFDC]=%08X\n",
+                           *(uint32_t*)(vf->ram+0xFF9C), *(uint32_t*)(vf->ram+0xFFBC),
+                           *(uint32_t*)(vf->ram+0xFFDC));
                     *(uint32_t*)(vf->ram + 0xC00020) = 0x10FFF000;
-
-                    /* Fix page table: identity map ALL 16MB RAM */
                     {
-                        uint32_t ttb_off = 0xA8000; /* ROM page table */
+                        uint32_t ttb_off = 0xA8000;
                         for (uint32_t mb = 0x100; mb <= 0x10F; mb++) {
                             uint32_t *l1 = (uint32_t*)(vf->ram + ttb_off + mb*4);
                             if ((*l1 & 3) == 0)
                                 *l1 = (mb << 20) | 0xC0E;
                         }
                     }
-
-                    /* Disable timer during init */
                     vf->timer.timer[0].ctrl = 0x10;
                     vf->timer.timer[0].irq_pending = 0;
                     vf->timer.irq.status = 0;
-
-                    /* Run BOOT.BIN init (populates service entry at 0x109D11E0) */
                     vf->cpu.cp15.ttb = 0x100A8000;
                     vf->cpu.cp15.mmu_enabled = 1;
                     vf->cpu.cp15.control = 0x0000507D;
@@ -2143,9 +2129,15 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                     vf->cpu.r[15] = 0x10C0011C;
                     vf->cpu.r[13] = 0x10FFE000;
                     vf->cpu.r[14] = 0x10FFF000;
-                    vf->boot_phase = 100; /* phase 101 will detect idle → launch service */
+                    vf->boot_phase = 100;
                     printf("[REBOOT] → BOOT.BIN init at 0x10C0011C\n");
                     return;
+                }
+                if (vf->atapi.reboot_count >= 3) {
+                    /* Reboot #3+: µMORE is fully initialized.
+                     * Let ROM warm boot run naturally — it will jump to
+                     * SDRAM[0xFFC8] which should dispatch to game code. */
+                    printf("[REBOOT] Reboot #%d: natural warm boot\n", vf->atapi.reboot_count);
                 }
 
                 /* Reboot #1: let ROM run from 0 with warm boot flag */
@@ -3385,15 +3377,51 @@ void vflash_run_frame(VFlash *vf) {
             if (vf->boot_phase >= 300 && pc == 0x109D1E40) {
                 static int loop_1e40 = 0;
                 if (loop_1e40 == 0) {
-                    /* Force FIQ+IRQ enable so timer can interrupt B . loop */
                     vf->cpu.cpsr &= ~0xC0;
-                    /* Set FIQ handler flag so ROM FIQ vector dispatches to µMORE.
-                     * ROM reads *(0x9009008C) — if non-zero, jumps to *(0x1000FF9C).
-                     * SDRAM[0xFF9C] = LDR PC,[PC,#0x18] → SDRAM[0xFFBC] = µMORE FIQ handler. */
                     vf->rtc_regs[0x8C >> 2] = 1;
-                    printf("[SCHED] Force-enabled FIQ+IRQ + FIQ handler flag at init halt\n");
+                    printf("[SCHED] µMORE init halt — enabling IRQ\n");
                 }
                 loop_1e40++;
+                /* After 500 ticks at halt, µMORE services are stable.
+                 * Launch game code directly since scheduler has no tasks. */
+                if (loop_1e40 == 500) {
+                    printf("[SCHED] Launching game main at 0x10CFAEA0\n");
+                    /* Re-load BOOT.BIN for game code */
+                    if (vf->cd && vf->cd->is_open) {
+                        CDEntry be;
+                        if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &be)) {
+                            uint32_t dest = 0xC00000;
+                            uint32_t msz = VFLASH_RAM_SIZE - dest;
+                            if (be.size < msz) msz = be.size;
+                            cdrom_read_file(vf->cd, &be, vf->ram + dest, 0, msz);
+                        }
+                    }
+                    /* Set init flags for game code:
+                     * [0x10BBAE40] = 5: game_init_poll returns success
+                     * [0x10BE49E0] = 1: game main state != 0
+                     * [0x10B69144] = game context at +0x28A4, must be non-zero
+                     *   (read by getter at 0x10CEA01C, checked by game main) */
+                    *(uint32_t*)(vf->ram + 0xBBAE40) = 5;
+                    *(uint16_t*)(vf->ram + 0xBE49E0) = 1;
+                    *(uint32_t*)(vf->ram + 0xB69144) = 1; /* game context field */
+                    /* Launch game on separate stack.
+                     * Game main at 0x10CFAEA0 expects R0 = game context pointer.
+                     * R0 is saved as R6 and used for byte reads at [R6+offset]. */
+                    vf->cpu.cpsr = 0x00000013; /* SVC, IRQ+FIQ enabled */
+                    vf->cpu.r[15] = 0x10CFAEA0;
+                    vf->cpu.r[13] = 0x10FFD000;
+                    vf->cpu.r[14] = 0x109D1E40; /* return to halt */
+                    /* R0 = game context. Allocate a fake one in high RAM.
+                     * Set key fields: +0x00 = state byte (non-zero to run) */
+                    {
+                        uint32_t ctx = 0xF80000; /* fake game context */
+                        memset(vf->ram + ctx, 0, 0x100);
+                        *(uint8_t*)(vf->ram + ctx + 0x00) = 1; /* state */
+                        *(uint8_t*)(vf->ram + ctx + 0x24) = 1; /* checked by game main */
+                        vf->cpu.r[0] = 0x10000000 + ctx;
+                    }
+                    vf->boot_phase = 400;
+                }
             }
 
             /* Flash operation completion: µMORE loop at 0x10A1C5xx polls
