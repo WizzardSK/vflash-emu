@@ -3391,16 +3391,22 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
      * that crashes on uninitialized entity data.
      * 10AB5660 is called from render callback when entity list is non-empty.
      * 10AE9840 is the render callback that reads entity context. */
-    /* Skip render sub-functions that crash on uninitialized entity data.
-     * Each of these processes entity/sprite lists that are empty. */
-    if (((VFlash*)ctx)->boot_phase >= 900 &&
-        (addr == 0x10AB5660 ||   /* sprite batch processing */
-         addr == 0x10AB0A48 ||   /* entity batch init */
-         addr == 0x10AE9840 ||   /* render callback (entity context) */
-         addr == 0x10A881F0)) {  /* render frame init (calls callbacks) */
+    /* Skip render init (10A881F0) — crashes on uninitialized entity callbacks.
+     * Let render processing (10A89100) run — it checks render_ctx and returns
+     * early when ctx[0]==0 && ctx[1]==0 (safe). */
+    if (addr == 0x10A881F0 && ((VFlash*)ctx)->boot_phase >= 900) {
         cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
+    }
+    /* Render main (10B265E8): force render_enable=1 so it skips init and goes
+     * straight to FUN_10a89100 (which returns early with empty ctx). */
+    if (addr == 0x10B265E8 && ((VFlash*)ctx)->boot_phase >= 900) {
+        VFlash *vf2 = (VFlash*)ctx;
+        *(uint8_t*)(vf2->ram + 0xBE3EC0) = 1;   /* render_enable = already inited */
+        *(uint32_t*)(vf2->ram + 0xBE3C40) = 0;   /* render_ctx[0] = 0 (no entities) */
+        *(uint32_t*)(vf2->ram + 0xBE3C44) = 0;   /* render_ctx[1] = 0 */
+        return 0; /* let native render run (will call 10A89100 which returns early) */
     }
 
     /* Skip 109D2754 (state machine) always during init — entity data
@@ -3432,6 +3438,13 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
             printf("[PRELOOP] PC=%08X R0=%08X LR=%08X\n", addr, cpu->r[0], cpu->r[14]);
             preloop_log++;
         }
+    }
+
+    /* HLE init function table walker (109D26FC) — skip since entities empty */
+    if (addr == 0x109D26FC && ((VFlash*)ctx)->boot_phase >= 900) {
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
     }
 
     /* HLE memset/memclear (10A70324).
@@ -5293,7 +5306,14 @@ void vflash_run_frame(VFlash *vf) {
      * Jump to 0x109D1CA8 (buffer clear + display setup) instead of
      * directly to game loop. This lets the game set up its own
      * framebuffer and render state before entering the main loop. */
-    if (vf->has_rom && vf->boot_phase == 800 && vf->frame_count == 85) {
+    if (vf->has_rom && vf->boot_phase == 800 &&
+        vf->frame_count >= 80 && vf->frame_count <= 200) {
+        /* Set asset loading counters to > 7 (game waits for this) */
+        *(uint32_t*)(vf->ram + 0xB05A18) = 8;  /* counter1 */
+        *(uint32_t*)(vf->ram + 0xB05A1C) = 8;  /* counter2 */
+        /* Set game state for active gameplay */
+        *(uint32_t*)(vf->ram + 0xB009C4) = 1;  /* game_state = active */
+        *(uint32_t*)(vf->ram + 0xB902C0) = 3;  /* game_mode = gameplay */
         /* Clear the 960KB render buffer */
         memset(vf->ram + 0x48000, 0, 0xF0000);
         /* Load PTX game artwork to the render buffer at 0x10048000.
@@ -5328,8 +5348,12 @@ void vflash_run_frame(VFlash *vf) {
                 free(ptx_buf);
             }
         }
-        printf("[GAME-LOOP] Entering main loop at 0x109D1CE0\n");
-        vf->cpu.r[15] = 0x109D1CE0;
+        /* Jump to game_setup (109D5B1C) instead of game loop.
+         * With counters set, game entry would naturally reach:
+         *   game_setup → first_tick → buffer_clear → display → walker → game loop
+         * But game_setup + walker are slow, so jump to buffer clear (109D1C9C). */
+        printf("[GAME-LOOP] Jumping to buffer clear + game loop at 0x109D1C9C\n");
+        vf->cpu.r[15] = 0x109D1C9C;
         vf->cpu.cpsr = 0x000000D3;  /* SVC mode, IRQ+FIQ disabled */
         vf->timer.timer[0].ctrl = 0;
         vf->timer.irq.enable = 0;
