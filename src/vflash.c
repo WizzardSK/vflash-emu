@@ -899,6 +899,11 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                 printf("[FB-ACCESS] Read [%08X] from PC=%08X\n", addr, vf->cpu.r[15]);
             fb_read++;
         }
+        /* Ghidra: game task checks *[0x10B05A18] > 7 and *[0x10B05A1C] > 7.
+         * Return 8 on read to unblock game task wait loop. */
+        if (roff == 0xB05A18 || roff == 0xB05A1C) {
+            return 8;
+        }
         /* Flash completion flags — always return with bit0 set. */
         if (roff == 0xBBCFF4 || roff == 0xBBD010) {
             return *(uint32_t*)(vf->ram + roff) | 1;
@@ -1477,6 +1482,11 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
 
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
         uint32_t roff = addr - VFLASH_RAM_BASE;
+        /* Ghidra: game task wait counters at [0x10B05A18] and [0x10B05A1C].
+         * Must be > 7 for game to proceed. Force minimum value of 8. */
+        if ((roff == 0xB05A18 || roff == 0xB05A1C) && val < 8) {
+            val = 8;
+        }
         /* Protect game callback pointer at [0x10BBD3C0].
          * µMORE game task init writes 0 here — prevent clearing. */
         if (roff == 0xBBD3C0 && val == 0 && vf->boot_phase >= 800) {
@@ -5043,7 +5053,7 @@ void vflash_run_frame(VFlash *vf) {
     }
 
     /* Scan for BOOT.BIN callback pointers in µMORE area */
-    if (vf->has_rom && vf->frame_count == 130 && vf->boot_phase >= 100) {
+    if (vf->has_rom && vf->frame_count == 110 && vf->boot_phase >= 100) {
         printf("[CB-SCAN] Scanning for BOOT.BIN pointers in µMORE area...\n");
         /* Dump full SDRAM for Ghidra analysis */
         {
@@ -5072,6 +5082,11 @@ void vflash_run_frame(VFlash *vf) {
          * We write BOOT.BIN game entry here so event dispatch calls it. */
         *(uint32_t*)(vf->ram + 0xBBD3C0) = 0x10CFAEA0; /* game_main entry */
         printf("[CB-INJECT] Set *[0x10BBD3C0] = 0x10CFAEA0 (game callback)\n");
+        /* Ghidra: game task waits for *[0x10B05A18] > 7 AND *[0x10B05A1C] > 7.
+         * These are service registration counters. Set to 8 to unblock. */
+        *(uint32_t*)(vf->ram + 0xB05A18) = 8;
+        *(uint32_t*)(vf->ram + 0xB05A1C) = 8;
+        printf("[CB-INJECT] Set service counters to 8 (unblock game task wait)\n");
         /* Dump area around first cluster at 0x1009D160-0x1009D190 */
         printf("[CB-SCAN] Context around first cluster:\n");
         for (uint32_t d = 0x9D160; d < 0x9D1C0; d += 16)
