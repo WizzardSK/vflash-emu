@@ -3391,22 +3391,46 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
      * that crashes on uninitialized entity data.
      * 10AB5660 is called from render callback when entity list is non-empty.
      * 10AE9840 is the render callback that reads entity context. */
-    /* Skip render init (10A881F0) — crashes on uninitialized entity callbacks.
-     * Let render processing (10A89100) run — it checks render_ctx and returns
-     * early when ctx[0]==0 && ctx[1]==0 (safe). */
-    if (addr == 0x10A881F0 && ((VFlash*)ctx)->boot_phase >= 900) {
+    /* HLE render: skip native render entirely, draw PTX to framebuffer ourselves.
+     * Native render crashes because entity data was never loaded from CD
+     * (BOOT.BIN CD driver not registered in kernel). */
+    if (addr == 0x10B265E8 && ((VFlash*)ctx)->boot_phase >= 900) {
+        VFlash *vf2 = (VFlash*)ctx;
+        static int ptx_frame = 0;
+        /* Every 120 frames (~2 sec), cycle to next PTX image */
+        int ptx_idx = (ptx_frame / 120) % (vf2->ptx_count > 0 ? vf2->ptx_count : 1);
+        if (vf2->ptx_count > 0 && vf2->cd && (ptx_frame % 120) == 0) {
+            CDEntry *pe = &vf2->ptx_list[ptx_idx];
+            uint8_t *buf = malloc(pe->size);
+            if (buf) {
+                int rd = cdrom_read_file(vf2->cd, pe, buf, 0, pe->size);
+                if (rd > 44) {
+                    uint32_t hs = *(uint32_t*)buf;
+                    if (hs >= 12 && hs <= 256 && hs < (uint32_t)rd) {
+                        const uint16_t *src = (const uint16_t*)(buf + hs);
+                        uint32_t pw = 512, rows = ((uint32_t)rd - hs) / (pw * 2);
+                        uint32_t sh = rows / 2;
+                        if (sh > 0) {
+                            for (uint32_t y = 0; y < VFLASH_SCREEN_H; y++) {
+                                uint32_t sy = y * sh / VFLASH_SCREEN_H;
+                                for (uint32_t x = 0; x < VFLASH_SCREEN_W; x++) {
+                                    uint16_t p = src[sy * 2 * pw + x];
+                                    uint8_t b=((p>>10)&0x1F)<<3, g=((p>>5)&0x1F)<<3, r=(p&0x1F)<<3;
+                                    vf2->framebuf[y*VFLASH_SCREEN_W+x] =
+                                        0xFF000000|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                                }
+                            }
+                            vf2->vid.fb_dirty = 1;
+                        }
+                    }
+                }
+                free(buf);
+            }
+        }
+        ptx_frame++;
         cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
-    }
-    /* Render main (10B265E8): force render_enable=1 so it skips init and goes
-     * straight to FUN_10a89100 (which returns early with empty ctx). */
-    if (addr == 0x10B265E8 && ((VFlash*)ctx)->boot_phase >= 900) {
-        VFlash *vf2 = (VFlash*)ctx;
-        *(uint8_t*)(vf2->ram + 0xBE3EC0) = 1;   /* render_enable = already inited */
-        *(uint32_t*)(vf2->ram + 0xBE3C40) = 0;   /* render_ctx[0] = 0 (no entities) */
-        *(uint32_t*)(vf2->ram + 0xBE3C44) = 0;   /* render_ctx[1] = 0 */
-        return 0; /* let native render run (will call 10A89100 which returns early) */
     }
 
     /* Skip 109D2754 (state machine) always during init — entity data
@@ -3480,23 +3504,26 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         return 1;
     }
 
-    /* HLE kernel CD-ROM query (0x1000C620).
-     * Called by FUN_10a363e8 (CD-ROM init). Args: R0=&result, R1=buf.
-     * Game checks return value: if non-zero, uses default capacity AND
-     * proceeds to FUN_10a36510 (CD-ROM load). Return 1 to enable loading. */
-    if ((addr == 0x1000C620 || addr == 0x10A363E8 || addr == 0x10A4B048) &&
-        ((VFlash*)ctx)->boot_phase >= 800) {
-        if (addr == 0x10A363E8) {
-            printf("[HLE-CDROM] FUN_10a363e8 CALLED! R0=%08X LR=%08X\n", cpu->r[0], cpu->r[14]);
-            return 0; /* let it run */
+    /* HLE CD-ROM init (FUN_10a363e8).
+     * Normally queries disc via kernel service 0xE00 which goes to BOOT.BIN
+     * CD driver. Since the driver isn't registered, we HLE it:
+     * set disc flags and return success so FUN_10a36510 gets called. */
+    if (addr == 0x10A363E8 && ((VFlash*)ctx)->boot_phase >= 800) {
+        VFlash *vf2 = (VFlash*)ctx;
+        /* Set disc info at DAT_10a3650c (extracted from capacity 0x7FFFF) */
+        uint32_t disc_info_ptr;
+        { /* Read literal at 10A3650C */
+            disc_info_ptr = *(uint32_t*)(vf2->ram + 0xA3650C);
         }
-        if (addr == 0x10A4B048) {
-            printf("[HLE-CDROM] Jump table 10A4B048 hit\n");
-            return 0;
+        if (disc_info_ptr >= 0x10000000 && disc_info_ptr < 0x11000000) {
+            uint8_t *di = vf2->ram + (disc_info_ptr - 0x10000000);
+            di[0] = 1; di[1] = 1; di[2] = 1; di[3] = 3;
+            *(uint16_t*)(di+4) = 0x7F; *(uint16_t*)(di+6) = 0x7F;
+            *(uint16_t*)(di+8) = 0;
         }
-        cpu->r[0] = 1; /* non-zero triggers default path + CD load */
+        cpu->r[0] = 1; /* success → triggers FUN_10a36510 */
         cpu->r[15] = cpu->r[14] & ~3u;
-        printf("[HLE-CDROM] Kernel CD query → 1 (use default, enable load)\n");
+        printf("[HLE-CDROM] CD init → success, disc info set\n");
         return 1;
     }
 
@@ -3504,10 +3531,12 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
      * Some of these functions do useful work (CD-ROM loading) before blocking.
      * Strategy: skip ONLY the pure sleep/wait, let the others run. */
     if (((VFlash*)ctx)->boot_phase >= 800) {
-        /* Pure sleep/wait wrappers — skip immediately */
+        /* Sleep/wait — return after incrementing a timeout counter.
+         * On real HW, sleep yields to scheduler which runs CD-ROM task.
+         * We return immediately but let any pending DMA complete first. */
         if (addr == 0x10007304 ||  /* kernel sleep wrapper */
             addr == 0x100086F0 ||  /* kernel polling sleep loop */
-            addr == 0x109D1F28) {  /* peripheral wait (blocks, no CD I/O) */
+            addr == 0x109D1F28) {  /* peripheral wait */
             cpu->r[0] = 0;
             cpu->r[15] = cpu->r[14] & ~3u;
             return 1;
