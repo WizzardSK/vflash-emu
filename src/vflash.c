@@ -3339,9 +3339,12 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
             printf("[SLEEP] 0x10011D88 from LR=%08X bp=%d\n",
                    cpu->r[14], ((VFlash*)ctx)->boot_phase);
         sleep_log++;
-        /* Always intercept sleep — return 0 (success) immediately.
-         * Without µMORE scheduler context-switch, native sleep (B .)
-         * never wakes. Intercepting creates busy event processing loop. */
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* Skip µMORE WFI/sleep loops (Ghidra: do{}while(!ZR)) */
+    if (addr == 0x10A739EC) {
         cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
@@ -5131,7 +5134,7 @@ void vflash_run_frame(VFlash *vf) {
     /* Auto-launch game task after µMORE init stabilizes.
      * On frame 120 (after init + bootstrap), find TCB with largest stack
      * and launch it directly. Simple, no complex state tracking. */
-    if (vf->has_rom && vf->frame_count == 120 && vf->boot_phase < 800) {
+    if (vf->has_rom && vf->frame_count == 70) {
         uint32_t best_a = 0, best_sz = 0;
         for (uint32_t a = 0x100000; a < 0xC00000; a += 4) {
             if (*(uint32_t*)(vf->ram+a) == 0x42435124 &&
