@@ -5404,6 +5404,29 @@ void vflash_run_frame(VFlash *vf) {
         /* Set game state for active gameplay */
         *(uint32_t*)(vf->ram + 0xB009C4) = 1;  /* game_state = active */
         *(uint32_t*)(vf->ram + 0xB902C0) = 3;  /* game_mode = gameplay */
+        /* Load VFF scene data to target RAM addresses.
+         * sec[0]=ARM code→0x105B8000, sec[1]=gfx→0x1066B000, sec[2]=tiles→0x101B8000 */
+        if (vf->cd && vf->cd->is_open) {
+            CDEntry ve;
+            if (cdrom_find_file_any(vf->cd, "MAIN.VFF", &ve)) {
+                uint8_t vhdr[0x60];
+                cdrom_read_file(vf->cd, &ve, vhdr, 0, 0x60);
+                if (vhdr[0]=='v' && vhdr[1]=='f') {
+                    uint32_t nsec = *(uint32_t*)(vhdr + 0x2C);
+                    uint32_t foff = 0x400;
+                    for (uint32_t si = 0; si < nsec && si < 3; si++) {
+                        uint32_t ssz = *(uint32_t*)(vhdr + 0x34 + si*0x10);
+                        uint32_t dst = *(uint32_t*)(vhdr + 0x30 + si*0x10);
+                        if (dst >= 0x10000000 && dst + ssz <= 0x10000000 + VFLASH_RAM_SIZE) {
+                            int rd = cdrom_read_file(vf->cd, &ve,
+                                        vf->ram + (dst - 0x10000000), foff, ssz);
+                            printf("[VFF] sec[%d] %dKB → %08X\n", si, rd/1024, dst);
+                        }
+                        foff += ssz;
+                    }
+                }
+            }
+        }
 
         /* Load VFF scene data from CD-ROM directly into game's render buffer.
          * Find MAIN.VFF on disc and load its largest section. */
