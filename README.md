@@ -54,18 +54,20 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **Secondary VIC (0xDC000000)** | ✅ Timer IRQ clear |
 | **Nucleus TCB discovery** | ✅ 10 tasks found, entry points + stacks |
 | **Game task launch** | ✅ Task #10 (128KB stack) executing µMORE code |
+| **Game loop (Ghidra RE)** | ✅ tick→sync→render at 0x109D1CE0 |
+| **Game loop execution** | 🔧 Launches but crashes (uninit game state) |
 
 ### Remaining for gameplay
 
-Game task runs µMORE event pump but never calls BOOT.BIN game code. The event
-callback context at 0x10BE4BA8 is empty — on real hardware this is filled during
-the warm reboot chain. Need to reverse-engineer the callback table format used by
-the µMORE event dispatch function at 0x109D13B8 to inject BOOT.BIN game handlers.
+Game loop found at 0x109D1CE0 (tick→sync→render, infinite loop). Launches
+but crashes immediately because game state is uninitialized. The init phase
+before the game loop (asset loading, CD-ROM access, 960KB memcpy) must complete
+first. Currently blocked by µMORE sleep/wait functions in init path.
 
-**Nucleus RTOS** confirmed via Ndless/Nspire RE (NU_ API). TCB format:
-`$QCB` magic, `$QBT` sub-magic, entry at +0x2C, stack at +0x30/+0x34, priority at +0x3C.
-**Interrupt controller** per TI-Nspire Firebird at 0xDC000000 (ACK, EOI, priority).
-**Multi-game**: dynamic service entry, tested 6 games (Cars + Incredibles boot µMORE).
+**Ghidra headless decompiler** used to RE full game task entry (0x109D1BD0):
+init → event_system → services → wait(counters>7) → game_setup → **GAME LOOP**.
+**Nucleus RTOS** confirmed (NU_ API). TCB: `$QCB`/`$QBT`, entry +0x2C, stack +0x30/+0x34.
+**Firebird interrupt controller** at 0xDC000000. Tested 6 games.
 
 ### Asset Browser
 
