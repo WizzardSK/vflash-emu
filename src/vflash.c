@@ -5428,9 +5428,38 @@ void vflash_run_frame(VFlash *vf) {
             }
         }
 
-        /* Load VFF scene data from CD-ROM directly into game's render buffer.
-         * Find MAIN.VFF on disc and load its largest section. */
-        if (vf->cd && vf->cd->is_open) {
+        /* Execute VFF sec[0] ARM code to initialize scene descriptors.
+         * Entry at sec[0]+0x400, needs R0=1 (init), R1=0xFFFF (scene ID).
+         * This fills the scene dispatch table at 0x10500808. */
+        {
+            uint32_t entry = 0x104E2400;
+            uint32_t first_i = *(uint32_t*)(vf->ram + (entry - 0x10000000));
+            if (first_i != 0) {
+                uint32_t spc=vf->cpu.r[15], ssp=vf->cpu.r[13];
+                uint32_t slr=vf->cpu.r[14], scp=vf->cpu.cpsr;
+                vf->cpu.r[0] = 1; vf->cpu.r[1] = 0xFFFF;
+                vf->cpu.r[15] = entry;
+                vf->cpu.r[14] = 0x10FFF000;
+                vf->cpu.r[13] = 0x10B8D000;
+                vf->cpu.cpsr = 0x000000D3;
+                int si;
+                for (si = 0; si < 5000000; si++) {
+                    arm9_step(&vf->cpu);
+                    if (vf->cpu.r[15] == 0x10FFF000) break;
+                }
+                printf("[VFF-EXEC] Scene init: %d steps R0=%08X\n", si, vf->cpu.r[0]);
+                /* Check what was written to scene table */
+                printf("[VFF-EXEC] [10500808]=%08X [1050080C]=%08X [10500810]=%08X\n",
+                       *(uint32_t*)(vf->ram+0x500808),
+                       *(uint32_t*)(vf->ram+0x50080C),
+                       *(uint32_t*)(vf->ram+0x500810));
+                vf->cpu.r[15]=spc; vf->cpu.r[13]=ssp;
+                vf->cpu.r[14]=slr; vf->cpu.cpsr=scp;
+            }
+        }
+
+        /* Load VFF to backup buffer */
+        if (0 && vf->cd && vf->cd->is_open) {
             CDEntry vff_e;
             const char *vff_names[] = {"MAIN.VFF","CWMENU.VFF","CW1A.VFF","OPENING.VFF",NULL};
             for (int vi = 0; vff_names[vi]; vi++) {
