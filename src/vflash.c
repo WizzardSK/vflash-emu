@@ -903,11 +903,10 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         if (roff == 0xB05A18 || roff == 0xB05A1C) {
             return 8;
         }
-        /* Ghidra: game_tick checks *[0x10B009C4] != 0.
-         * If 0, game_tick does nothing. Force to 1. */
-        if (roff == 0xB009C4) {
-            return 1;
-        }
+        /* Ghidra: game_tick checks *[0x10B009C4] != 0. */
+        if (roff == 0xB009C4) return 1;
+        /* Ghidra: scheduler state at *[0x10BA63E0] must be 1 or 3. */
+        if (roff == 0xBA63E0) return 3;
         /* Flash completion flags — always return with bit0 set. */
         if (roff == 0xBBCFF4 || roff == 0xBBD010) {
             return *(uint32_t*)(vf->ram + roff) | 1;
@@ -3380,12 +3379,11 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     /* Skip blocking µMORE functions in game task entry.
      * Only skip the ones that BLOCK (sleep/wait loops).
      * Let non-blocking init functions run to populate game state. */
-    if ((addr == 0x109D1F28 ||  /* peripheral wait loop (sleep+while) */
-         addr == 0x10A176BC ||  /* event setup (blocks inside FUN_10a18a04) */
-         addr == 0x10A083AC ||  /* sleep function (blocks in B .) */
-         addr == 0x10A4AE64 ||  /* mutex/sem init 1 (crashes without event sys) */
-         addr == 0x10A4AE78 ||  /* mutex/sem init 2 */
-         addr == 0x10A4AE8C     /* mutex/sem init 3 */
+    /* Skip ONLY truly blocking functions (sleep/wait loops).
+     * Let mutex init and other non-blocking functions run normally. */
+    if ((addr == 0x109D1F28 ||  /* peripheral wait (sleep + while loop) */
+         addr == 0x10A176BC ||  /* event setup (blocks in event pump) */
+         addr == 0x10A083AC     /* sleep (blocks in B .) */
         ) && ((VFlash*)ctx)->boot_phase >= 800) {
         static int skip_log = 0;
         if (!skip_log) {
@@ -5149,13 +5147,12 @@ void vflash_run_frame(VFlash *vf) {
             uint32_t sbase = *(uint32_t*)(vf->ram+best_a+0x30);
             uint32_t ssz = *(uint32_t*)(vf->ram+best_a+0x34);
             printf("[AUTO-LAUNCH] Game task: entry=%08X stack=%08X+%X\n", entry, sbase, ssz);
-            /* Jump to GAME LOOP directly.
-             * Game state flag forced via read intercept [0x10B009C4]=1.
-             * Game mode already set to 3 (gameplay) at [0x10B902C0]. */
-            printf("[AUTO-LAUNCH] → GAME LOOP at 0x109D1CE0\n");
+            /* Launch game task ENTRY — let init run with blocking skipped.
+             * Only sleep/wait are skipped; mutex init runs normally. */
+            printf("[AUTO-LAUNCH] → Task entry at 0x%08X (init with skips)\n", entry);
             vf->cpu.cpsr = 0x00000013;
-            vf->cpu.r[15] = 0x109D1CE0;
-            vf->cpu.r[13] = sbase + ssz - 0x100;
+            vf->cpu.r[15] = entry;
+            vf->cpu.r[13] = sbase + ssz - 4;
             vf->cpu.r[14] = 0x10FFF000;
             vf->timer.timer[0].load = 37500;
             vf->timer.timer[0].count = 37500;
