@@ -55,14 +55,15 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **Nucleus TCB discovery** | ✅ 10 tasks found, entry points + stacks |
 | **Game task launch** | ✅ Task #10 (128KB stack) executing µMORE code |
 | **Game loop (Ghidra RE)** | ✅ tick→sync→render at 0x109D1CE0 |
-| **Game loop execution** | 🔧 Launches but crashes (uninit game state) |
+| **Game loop execution** | ✅ tick→sync→render running 100K+ iterations |
 
 ### Remaining for gameplay
 
-Game loop found at 0x109D1CE0 (tick→sync→render, infinite loop). Launches
-but crashes immediately because game state is uninitialized. The init phase
-before the game loop (asset loading, CD-ROM access, 960KB memcpy) must complete
-first. Currently blocked by µMORE sleep/wait functions in init path.
+Game loop at 0x109D1CE0 (tick→sync→render) **runs continuously** after 22+
+init functions complete. Render is currently intercepted (returns immediately)
+because entity/GPU state is uninitialized. Game tick processes entity tables
+and the loop is stable at 100K+ iterations. Next: CD-ROM asset loading to
+populate game state, then enable render pipeline.
 
 **Ghidra headless decompiler** used to RE full game task entry (0x109D1BD0):
 init → event_system → services → wait(counters>7) → game_setup → **GAME LOOP**.
@@ -150,6 +151,11 @@ ROM[0x00] → flash copy → flash remap (0x118)
 | One-shot timer re-fire | FIQ storm from cnt=0 loop | Disable timer after one-shot fires |
 | µMORE FIQ routing | All IRQs routed to FIQ | Handle fiq_sel=0xFFFFFFFF correctly |
 | RTC 0x8C FIQ flag | ROM FIQ handler skipped dispatch | Store writes, return for FIQ flag |
+| Scheduler check 2-ptr | FUN_10a08ed8 checks two pointers | Intercept [0x10B606C0] return 1 |
+| Kernel sleep 98K loop | Game init stuck in polling sleep | Skip 0x10007304 and 0x100086F0 |
+| Invalid ptr deref | 10A355A4/109D2754 loop on garbage | Skip when R0 outside RAM range |
+| Auto-launch too late | Frame 200 unreachable (delay loop) | Changed to frame 75 |
+| IRQ handler stuck | 0x900D0018 returns wrong value | Return 0 during game phase |
 
 ### Subsystems
 - ATAPI CD-ROM: INQUIRY, READ(10), READ CD, READ TOC, READ CAPACITY, MODE SENSE

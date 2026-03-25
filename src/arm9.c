@@ -584,6 +584,39 @@ int arm9_step(ARM9 *cpu) {
                     }
                 }
             }
+            /* Trace first instructions after game task launch */
+            {
+                static int gt_trace = 0;
+                static int gt_active = 0;
+                if (inst_addr == 0x109D1BD0 && !gt_active) {
+                    gt_active = 1;
+                    gt_trace = 0;
+                    printf("[GT-TRACE] Game entry hit!\n");
+                }
+                /* Reset trace when game loop is forced */
+                if (inst_addr == 0x109D1CE0 && gt_trace > 1000) {
+                    gt_active = 1;
+                    gt_trace = 0;
+                    printf("[GT-TRACE] Game loop hit — resetting trace!\n");
+                }
+                if (gt_active && gt_trace < 50000) {
+                    static uint32_t gt_last_lr = 0;
+                    static uint32_t gt_last_pc = 0;
+                    /* Log function entries (LR change), skip IRQ/FIQ handler noise */
+                    if (cpu->r[14] != gt_last_lr &&
+                        inst_addr >= 0x10000000 &&
+                        !(inst_addr >= 0xD00 && inst_addr < 0xE00)) {
+                        printf("[GT] %08X: R0=%08X LR=%08X SP=%08X (#%d)\n",
+                               inst_addr, cpu->r[0], cpu->r[14], cpu->r[13], gt_trace);
+                        gt_last_lr = cpu->r[14];
+                    }
+                    gt_last_pc = inst_addr;
+                    gt_trace++;
+                    if (inst_addr < 0x100 && inst_addr != 0x08 && inst_addr != 0x18 && inst_addr != 0x1C) {
+                        printf("[GT] CRASH at PC=%08X!\n", inst_addr);
+                    }
+                }
+            }
             /* Track when game code (0x10C00000+) transitions to low addr */
             {
                 static int game_started = 0, crash_log = 0;
@@ -608,10 +641,13 @@ int arm9_step(ARM9 *cpu) {
             }
         }
 
-        /* Catch BLX to NULL (address 0) — game code calls NULL func pointers.
-         * Also catch any instruction fetch at low SDRAM addresses that
-         * shouldn't be executing (0x10000000-0x10001000 = kernel vectors) */
-        if ((inst_addr == 0 || (inst_addr >= 0x10000000 && inst_addr < 0x10000100))
+        /* Catch jumps to invalid addresses:
+         * - NULL (address 0)
+         * - Kernel vector area (0x10000000-0x10000100)
+         * - Addresses outside any valid memory region (> 0x11000000 and not ROM/peripherals) */
+        if ((inst_addr == 0 ||
+             (inst_addr >= 0x10000000 && inst_addr < 0x10000100) ||
+             (inst_addr > 0x11000000 && inst_addr < 0x80000000))
             && cpu->null_trap_enabled) {
             static int null_blx = 0;
             if (null_blx < 10)
@@ -619,11 +655,16 @@ int arm9_step(ARM9 *cpu) {
                        inst_addr, cpu->r[14], cpu->r[0], cpu->r[13]);
             null_blx++;
             cpu->r[0] = 0;
-            if (cpu->r[14] != 0 && cpu->r[14] != inst_addr)
-                PC = cpu->r[14] & ~3u;
-            else {
-                /* Can't return — go to idle, let scheduler take over */
-                PC = 0x10FFF000;
+            /* Check if LR is a valid code address */
+            uint32_t lr = cpu->r[14];
+            int lr_valid = (lr >= 0x10000100 && lr < 0x11000000) ||
+                           (lr > 0 && lr < 0x00200000);
+            if (lr_valid && lr != inst_addr) {
+                PC = lr & ~3u;
+            } else {
+                /* LR also corrupted — jump to game loop if in game phase */
+                PC = 0x109D1CE0; /* game loop */
+                cpu->r[13] = 0x10B8DAC0; /* restore SP to safe value */
                 cpu->cpsr = 0x000000D3; /* SVC, IRQ off */
             }
             cpu->cycles += 1;

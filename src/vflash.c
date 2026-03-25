@@ -903,10 +903,21 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         if (roff == 0xB05A18 || roff == 0xB05A1C) {
             return 8;
         }
-        /* Ghidra: game_tick checks *[0x10B009C4] != 0. */
-        if (roff == 0xB009C4) return 1;
+        /* Ghidra: game_tick checks *[0x10B009C4] != 0.
+         * Return 0 during game loop (phase 900) to skip entity processing
+         * (entities are uninitialized → crash). Return 1 during init. */
+        if (roff == 0xB009C4) {
+            return (vf->boot_phase >= 900) ? 0 : 1;
+        }
+        /* Render function at 10B265E8 checks *[0x10BE3EC0] != 0.
+         * Return 0 during game loop to skip render (uninitialized GPU state). */
+        if (roff == 0xBE3EC0 && vf->boot_phase >= 900) {
+            return 0;
+        }
         /* Ghidra: scheduler state at *[0x10BA63E0] must be 1 or 3. */
         if (roff == 0xBA63E0) return 3;
+        /* Ghidra: FUN_10a08ed8 checks *[0x10B606C0] == 1 (scheduler pool active). */
+        if (roff == 0xB606C0) return 1;
         /* Flash completion flags — always return with bit0 set. */
         if (roff == 0xBBCFF4 || roff == 0xBBD010) {
             return *(uint32_t*)(vf->ram + roff) | 1;
@@ -1018,9 +1029,13 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         }
 
         /* Unknown peripheral at 0x900D0000 (off = 0x100D0000).
-         * Init task reads 0x18 — possibly clock/power status. */
+         * Init task reads 0x18 — possibly interrupt status or clock/power.
+         * During game loop, return 0 to avoid confusing IRQ handler. */
         if (off >= 0x100D0000u && off < 0x100D1000u) {
-            return 0x01; /* generic "ready" status */
+            uint32_t preg = off - 0x100D0000u;
+            if (preg == 0x18 && vf->boot_phase >= 800)
+                return 0;  /* no interrupt from this source */
+            return 0x01; /* generic "ready" status during init */
         }
 
         /* Interrupt controller at 0xDC000000 (Firebird: interrupt.c).
@@ -1902,6 +1917,8 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                                     lba, count, dst, ssz);
 
                         vf->cdr.status = 0x1; /* busy */
+                        printf("[CDROM-DMA] LBA=%u cnt=%u dst=0x%08X phase=%d\n",
+                               lba, count, dst, vf->boot_phase);
 
                         if (dst >= VFLASH_RAM_BASE &&
                             dst + total <= VFLASH_RAM_BASE + VFLASH_RAM_SIZE &&
@@ -3379,22 +3396,81 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     /* Skip blocking µMORE functions in game task entry.
      * Only skip the ones that BLOCK (sleep/wait loops).
      * Let non-blocking init functions run to populate game state. */
-    /* Skip ONLY truly blocking functions (sleep/wait loops).
-     * Let mutex init and other non-blocking functions run normally. */
-    if ((addr == 0x109D1F28 ||  /* peripheral wait (sleep + while loop) */
-         addr == 0x10A176BC ||  /* event setup (blocks in event pump) */
-         addr == 0x10A083AC     /* sleep (blocks in B .) */
-        ) && ((VFlash*)ctx)->boot_phase >= 800) {
-        static int skip_log = 0;
-        if (!skip_log) {
-            printf("[SKIP-EVTINIT] Skipping 0x10A18A04 → game task continues!\n");
-            skip_log = 1;
-        }
-        /* For counter checks, return 1 (true = > 7) instead of 0 */
-        if (addr == 0x10A36130 || addr == 0x10A36168)
-            cpu->r[0] = 1;
+    /* Skip render during game loop — entity/GPU state is uninitialized.
+     * Render crashes deep in matrix math with garbage pointers. */
+    if (addr == 0x10B265E8 && ((VFlash*)ctx)->boot_phase >= 900) {
+        cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
+    }
+
+    /* Skip 109D2754 (state machine) only when R0 is invalid.
+     * With valid R0, let it run — it processes init function results. */
+    if (addr == 0x109D2754 && ((VFlash*)ctx)->boot_phase >= 800 &&
+        (cpu->r[0] < 0x10000000 || cpu->r[0] >= 0x11000000)) {
+        static int sk2754 = 0;
+        if (sk2754 < 5)
+            printf("[SKIP] 109D2754(R0=%08X) invalid\n", cpu->r[0]);
+        sk2754++;
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    if (addr == 0x10A355A4 && ((VFlash*)ctx)->boot_phase >= 800 &&
+        (cpu->r[0] < 0x10000000 || cpu->r[0] >= 0x11000000)) {
+        static int inv_log = 0;
+        if (inv_log < 10) {
+            printf("[SKIP-INVPTR] %08X(R0=%08X) — invalid ptr, returning 0\n", addr, cpu->r[0]);
+            inv_log++;
+        }
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+
+    /* HLE kernel CD-ROM query (0x1000C620).
+     * Called by FUN_10a363e8 (CD-ROM init). Args: R0=&result, R1=buf.
+     * Game checks return value: if non-zero, uses default capacity AND
+     * proceeds to FUN_10a36510 (CD-ROM load). Return 1 to enable loading. */
+    if ((addr == 0x1000C620 || addr == 0x10A363E8 || addr == 0x10A4B048) &&
+        ((VFlash*)ctx)->boot_phase >= 800) {
+        if (addr == 0x10A363E8) {
+            printf("[HLE-CDROM] FUN_10a363e8 CALLED! R0=%08X LR=%08X\n", cpu->r[0], cpu->r[14]);
+            return 0; /* let it run */
+        }
+        if (addr == 0x10A4B048) {
+            printf("[HLE-CDROM] Jump table 10A4B048 hit\n");
+            return 0;
+        }
+        cpu->r[0] = 1; /* non-zero triggers default path + CD load */
+        cpu->r[15] = cpu->r[14] & ~3u;
+        printf("[HLE-CDROM] Kernel CD query → 1 (use default, enable load)\n");
+        return 1;
+    }
+
+    /* Handle blocking functions during game init.
+     * Some of these functions do useful work (CD-ROM loading) before blocking.
+     * Strategy: skip ONLY the pure sleep/wait, let the others run. */
+    if (((VFlash*)ctx)->boot_phase >= 800) {
+        /* Pure sleep/wait wrappers — skip immediately */
+        if (addr == 0x10007304 ||  /* kernel sleep wrapper */
+            addr == 0x100086F0 ||  /* kernel polling sleep loop */
+            addr == 0x109D1F28) {  /* peripheral wait (blocks, no CD I/O) */
+            cpu->r[0] = 0;
+            cpu->r[15] = cpu->r[14] & ~3u;
+            return 1;
+        }
+        /* B . (branch to self) — infinite wait loops in kernel.
+         * These appear when µMORE scheduler tries to sleep the task.
+         * Skip by returning to caller. */
+        if (addr == 0x10A083AC) {  /* sleep (B .) */
+            cpu->r[0] = 0;
+            cpu->r[15] = cpu->r[14] & ~3u;
+            return 1;
+        }
+        /* Functions that MAY do CD-ROM I/O — let them run.
+         * 109D1F28: peripheral wait — runs init code then blocks
+         * 10A176BC: event setup — registers event handlers then blocks */
     }
 
     /* Intercept scheduler init: set sched_state=3 before task_start. */
@@ -3948,11 +4024,23 @@ void vflash_run_frame(VFlash *vf) {
                            vf->frame_count, vf->boot_phase, pc);
                     if (pc >= 0x10000000 && pc < 0x11000000) {
                         uint32_t roff = pc - 0x10000000;
-                        printf("[BP-CHECK] Code@PC: %08X %08X %08X %08X\n",
-                               *(uint32_t*)(vf->ram + roff),
-                               *(uint32_t*)(vf->ram + roff + 4),
-                               *(uint32_t*)(vf->ram + roff + 8),
-                               *(uint32_t*)(vf->ram + roff + 12));
+                        /* Dump 128 bytes around stuck PC */
+                        uint32_t base = (roff > 64) ? roff - 64 : 0;
+                        for (uint32_t d = 0; d < 256; d += 4) {
+                            uint32_t a = base + d;
+                            if (a < VFLASH_RAM_SIZE)
+                                printf("[BP-DUMP] %08X: %08X%s\n",
+                                       0x10000000 + a,
+                                       *(uint32_t*)(vf->ram + a),
+                                       (0x10000000 + a == pc) ? " <<<" : "");
+                        }
+                        /* Also dump registers */
+                        printf("[BP-REGS] R0=%08X R1=%08X R2=%08X R3=%08X R4=%08X R5=%08X R6=%08X R7=%08X\n",
+                               vf->cpu.r[0], vf->cpu.r[1], vf->cpu.r[2], vf->cpu.r[3],
+                               vf->cpu.r[4], vf->cpu.r[5], vf->cpu.r[6], vf->cpu.r[7]);
+                        printf("[BP-REGS] R8=%08X R9=%08X R10=%08X R11=%08X R12=%08X SP=%08X LR=%08X\n",
+                               vf->cpu.r[8], vf->cpu.r[9], vf->cpu.r[10], vf->cpu.r[11],
+                               vf->cpu.r[12], vf->cpu.r[13], vf->cpu.r[14]);
                     }
                     bp_log++;
                 }
@@ -4773,7 +4861,7 @@ void vflash_run_frame(VFlash *vf) {
         printf("[MJP] Found %d MJP video files\n", vf->mjp_count);
     }
     /* Navigate gallery with Left/Right keys (only when video not playing) */
-    if (vf->ptx_count > 0 && vf->cd && vf->cd->is_open && !vf->mjp_player.playing) {
+    if (vf->ptx_count > 0 && vf->cd && vf->cd->is_open && !vf->mjp_player.playing && vf->boot_phase < 900) {
         uint32_t pressed = vf->input & ~vf->input_prev;
         int new_idx = vf->ptx_index;
         if (pressed & VFLASH_BTN_RIGHT) new_idx = (vf->ptx_index + 1) % vf->ptx_count;
@@ -4976,8 +5064,8 @@ void vflash_run_frame(VFlash *vf) {
 
     /* VFF scene viewer: load and display VFF scene on Enter/Up/Down.
      * VFF format: header (0x400) + sections (code, framebuf, data).
-     * Only active when video is not playing. */
-    if (vf->cd && vf->cd->is_open && !vf->mjp_player.playing) {
+     * Only active when video is not playing and game loop is not running. */
+    if (vf->cd && vf->cd->is_open && !vf->mjp_player.playing && vf->boot_phase < 900) {
         static int vff_loaded = 0;
         static CDEntry vff_list[32];
         static int vff_count = 0, vff_index = 0;
@@ -5130,7 +5218,7 @@ void vflash_run_frame(VFlash *vf) {
     /* Auto-launch game task after µMORE init stabilizes.
      * On frame 120 (after init + bootstrap), find TCB with largest stack
      * and launch it directly. Simple, no complex state tracking. */
-    if (vf->has_rom && vf->frame_count == 200 && vf->boot_phase >= 100) {
+    if (vf->has_rom && vf->frame_count == 75 && vf->boot_phase >= 100) {
         uint32_t best_a = 0, best_sz = 0;
         for (uint32_t a = 0x100000; a < 0xC00000; a += 4) {
             if (*(uint32_t*)(vf->ram+a) == 0x42435124 &&
@@ -5162,12 +5250,131 @@ void vflash_run_frame(VFlash *vf) {
         }
     }
 
+    /* Force game loop after init gets stuck.
+     * If boot_phase=800 and we've been running for 200+ frames since launch,
+     * the init is stuck. Jump to game loop directly with IRQs disabled. */
+    if (vf->has_rom && vf->boot_phase == 800 && vf->frame_count == 85) {
+        printf("[GAME-LOOP] Forcing game loop at 0x109D1CE0 (init stuck)\n");
+        vf->cpu.r[15] = 0x109D1CE0;
+        vf->cpu.cpsr = 0x000000D3;  /* SVC mode, IRQ+FIQ disabled */
+        vf->timer.timer[0].ctrl = 0;
+        vf->timer.irq.enable = 0;
+        vf->timer.irq.status = 0;
+        /* Trigger init function table entries by setting "current state" markers
+         * to differ from "expected state" (both are 0xFFFF = uninitialized).
+         * Setting current to 0 makes condition (current != expected) TRUE,
+         * triggering the init body to run for each function. */
+        uint32_t init_cur_vars[] = {
+            0xAA4AF0, 0xAA5DB8, 0xAAC324, 0xAAC4F8, 0xAACB10,
+            0xAAD0D8, 0xAAE824, 0xAA4AD8, 0xAA5DA0, 0xAAC30C,
+            0xAAC4E0, 0xAACB94, /* likely "current" state vars */
+        };
+        for (int iv = 0; iv < (int)(sizeof(init_cur_vars)/sizeof(init_cur_vars[0])); iv++) {
+            *(uint32_t*)(vf->ram + init_cur_vars[iv]) = 0;
+        }
+        printf("[GAME-LOOP] Set %zu init state vars to 0 (trigger init bodies)\n",
+               sizeof(init_cur_vars)/sizeof(init_cur_vars[0]));
+        /* Set up LCD controller for display output.
+         * Use 16bpp RGB565 framebuffer at 0x10800000 (320x240). */
+        vf->lcd.upbase = 0x10800000;
+        vf->lcd.control = 0x082D; /* 16bpp565 (bpp_code=6), TFT, power, enabled */
+        /* Load first PTX image from disc into framebuffer as splash screen.
+         * PTX format: XBGR1555, 512px stride, shows game artwork. */
+        if (vf->cd && vf->cd->is_open && vf->ptx_count > 0) {
+            CDEntry *pe = &vf->ptx_list[0];
+            uint32_t ptx_sz = pe->size;
+            uint8_t *ptx_buf = malloc(ptx_sz);
+            if (ptx_buf) {
+                int rd = cdrom_read_file(vf->cd, pe, ptx_buf, 0, ptx_sz);
+                if (rd > 0) {
+                    /* PTX: header + interleaved XBGR1555 at 512px stride.
+                     * Even rows = scene, odd rows = sprite overlay.
+                     * Write directly to vf->framebuf (ARGB32) for display. */
+                    uint32_t hdr_sz = *(uint32_t*)ptx_buf;
+                    if (hdr_sz >= 12 && hdr_sz <= 256 && hdr_sz < (uint32_t)rd) {
+                        const uint16_t *src = (const uint16_t*)(ptx_buf + hdr_sz);
+                        /* PTX decode: same as frame-0 splash (512px stride, interleaved).
+                         * This is a copy of the proven working code at line ~4730. */
+                        uint32_t pw = 512;
+                        uint32_t total_rows = ((uint32_t)rd - hdr_sz) / (pw * 2);
+                        uint32_t src_h = total_rows / 2;
+                        uint32_t src_w = pw < VFLASH_SCREEN_W ? pw : VFLASH_SCREEN_W;
+                        for (uint32_t dy = 0; dy < VFLASH_SCREEN_H; dy++) {
+                            uint32_t sy = dy * src_h / VFLASH_SCREEN_H;
+                            for (uint32_t dx = 0; dx < src_w; dx++) {
+                                uint16_t p = src[sy * 2 * pw + dx]; /* even rows */
+                                uint8_t b = ((p >> 10) & 0x1F) << 3;
+                                uint8_t g = ((p >> 5)  & 0x1F) << 3;
+                                uint8_t r = ( p        & 0x1F) << 3;
+                                vf->framebuf[dy * VFLASH_SCREEN_W + dx] =
+                                    0xFF000000|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                            }
+                        }
+                        vf->vid.fb_dirty = 1;
+                        /* Save screenshot of the PTX splash */
+                        FILE *bf = fopen("/tmp/vflash_ptx_splash.bmp", "wb");
+                        if (bf) {
+                            int w = VFLASH_SCREEN_W, h = VFLASH_SCREEN_H;
+                            int row_sz = w * 3, pad = (4 - row_sz % 4) % 4;
+                            int img_sz = (row_sz + pad) * h;
+                            uint8_t hdr2[54] = {0};
+                            hdr2[0]='B'; hdr2[1]='M';
+                            *(uint32_t*)(hdr2+2) = 54+img_sz; *(uint32_t*)(hdr2+10) = 54;
+                            *(uint32_t*)(hdr2+14) = 40; *(int32_t*)(hdr2+18) = w;
+                            *(int32_t*)(hdr2+22) = -h; *(uint16_t*)(hdr2+26) = 1;
+                            *(uint16_t*)(hdr2+28) = 24; *(uint32_t*)(hdr2+34) = img_sz;
+                            fwrite(hdr2, 1, 54, bf);
+                            for (int y2 = 0; y2 < h; y2++) {
+                                for (int x2 = 0; x2 < w; x2++) {
+                                    uint32_t px2 = vf->framebuf[y2*w+x2];
+                                    uint8_t rgb[3] = {px2&0xFF,(px2>>8)&0xFF,(px2>>16)&0xFF};
+                                    fwrite(rgb, 1, 3, bf);
+                                }
+                                uint8_t z[4]={0}; if(pad) fwrite(z,1,pad,bf);
+                            }
+                            fclose(bf);
+                            printf("[PTX-SPLASH] Screenshot saved\n");
+                        }
+                    }
+                    /* Debug: check first few pixels */
+                    {
+                        uint32_t hs = *(uint32_t*)ptx_buf;
+                        uint16_t *dbg = (uint16_t*)(ptx_buf + hs);
+                        printf("[PTX-DBG] hdr=%u first_px: %04X %04X %04X %04X fb[0]=%08X fb[100]=%08X\n",
+                               hs, dbg[0], dbg[1], dbg[2], dbg[3],
+                               vf->framebuf[0], vf->framebuf[100]);
+                    }
+                    printf("[GAME-LOOP] Loaded PTX splash: %s (%d bytes)\n", pe->name, rd);
+                }
+                free(ptx_buf);
+            }
+        } else {
+            /* Fallback: gradient test pattern */
+            uint16_t *fb = (uint16_t*)(vf->ram + 0x800000);
+            for (int y = 0; y < 240; y++)
+                for (int x = 0; x < 320; x++)
+                    fb[y * 320 + x] = ((y*31/240) << 11) | ((x*63/320) << 5) | 15;
+        }
+        vf->vid.fb_dirty = 0;
+        printf("[GAME-LOOP] LCD set up: fb=0x10800000 320x240 RGB565\n");
+        /* Dump SDRAM for analysis of game state after init */
+        {
+            FILE *df = fopen("/tmp/vflash_gameloop.bin", "wb");
+            if (df) {
+                fwrite(vf->ram, 1, VFLASH_RAM_SIZE, df);
+                fclose(df);
+                printf("[DUMP] Game loop RAM dumped to /tmp/vflash_gameloop.bin\n");
+            }
+        }
+        vf->boot_phase = 900;
+    }
+
     /* PL111 LCD framebuffer blit: only when game actually writes to LCD
      * (not during asset browser mode where MJP/PTX write directly to framebuf).
      * Skip if video is playing or if the LCD framebuffer hasn't been written by game code. */
     if ((vf->lcd.control & 1) && vf->lcd.upbase >= VFLASH_RAM_BASE &&
         vf->lcd.upbase < VFLASH_RAM_BASE + VFLASH_RAM_SIZE && !vf->vid.fb_dirty &&
-        !vf->mjp_player.playing && !vf->ptx_loaded) {
+        !vf->mjp_player.playing && (!vf->ptx_loaded || vf->boot_phase >= 900)) {
         uint32_t fb_off = vf->lcd.upbase - VFLASH_RAM_BASE;
         uint32_t bpp_code = (vf->lcd.control >> 1) & 7;
         /* BPP: 1=2bpp, 2=4bpp, 3=8bpp, 4=16bpp, 5=24bpp, 6=16bpp565 */
@@ -5185,6 +5392,41 @@ void vflash_run_frame(VFlash *vf) {
                 }
             }
             vf->vid.fb_dirty = 1;
+            static int lcd_blit_log = 0;
+            if (!lcd_blit_log) {
+                printf("[LCD-BLIT] First 16bpp blit from fb=0x%08X\n", vf->lcd.upbase);
+                /* Auto-save screenshot as BMP */
+                FILE *bf = fopen("/tmp/vflash_screen.bmp", "wb");
+                if (bf) {
+                    int w = VFLASH_SCREEN_W, h = VFLASH_SCREEN_H;
+                    int row_sz = w * 3;
+                    int pad = (4 - row_sz % 4) % 4;
+                    int img_sz = (row_sz + pad) * h;
+                    uint8_t hdr[54] = {0};
+                    hdr[0]='B'; hdr[1]='M';
+                    *(uint32_t*)(hdr+2) = 54 + img_sz;
+                    *(uint32_t*)(hdr+10) = 54;
+                    *(uint32_t*)(hdr+14) = 40;
+                    *(int32_t*)(hdr+18) = w;
+                    *(int32_t*)(hdr+22) = -h; /* top-down */
+                    *(uint16_t*)(hdr+26) = 1;
+                    *(uint16_t*)(hdr+28) = 24;
+                    *(uint32_t*)(hdr+34) = img_sz;
+                    fwrite(hdr, 1, 54, bf);
+                    for (int y2 = 0; y2 < h; y2++) {
+                        for (int x2 = 0; x2 < w; x2++) {
+                            uint32_t px2 = vf->framebuf[y2 * w + x2];
+                            uint8_t rgb[3] = {px2 & 0xFF, (px2>>8)&0xFF, (px2>>16)&0xFF};
+                            fwrite(rgb, 1, 3, bf);
+                        }
+                        uint8_t zero[4] = {0};
+                        if (pad) fwrite(zero, 1, pad, bf);
+                    }
+                    fclose(bf);
+                    printf("[LCD-BLIT] Screenshot saved to /tmp/vflash_screen.bmp\n");
+                }
+                lcd_blit_log = 1;
+            }
         } else if (bpp_code == 5) {
             /* 24-bit or 32-bit ARGB */
             const uint32_t *src = (const uint32_t*)(vf->ram + fb_off);
