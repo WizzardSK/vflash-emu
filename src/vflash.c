@@ -3373,21 +3373,15 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     /* Skip blocking functions in game task entry.
      * FUN_109d1f28: peripheral wait with sleep loop (blocks forever)
      * FUN_10a18a04: event system init (blocks in event pump) */
-    /* Skip ALL blocking µMORE functions in game task entry.
-     * Found via Ghidra decompilation of game task at 0x109D1BD0. */
-    if ((addr == 0x109D1F28 ||  /* peripheral wait loop */
-         addr == 0x10A18A04 ||  /* event system init (blocks in pump) */
-         addr == 0x10A083AC ||  /* sleep function */
-         addr == 0x10A090DC ||  /* unknown blocking func */
-         addr == 0x10A4AE64 ||  /* µMORE API init 1 */
-         addr == 0x10A4AE78 ||  /* µMORE API init 2 */
-         addr == 0x10A4AE8C ||  /* µMORE API init 3 */
-         addr == 0x10A4A638 ||  /* µMORE init */
-         addr == 0x10A4A858 ||  /* µMORE init */
-         addr == 0x10A363E8 ||  /* check function */
-         addr == 0x10A367C8 ||  /* sync function */
-         addr == 0x10A36130 ||  /* wait counter check 1 */
-         addr == 0x10A36168     /* wait counter check 2 */
+    /* Skip blocking µMORE functions in game task entry.
+     * Only skip the ones that BLOCK (sleep/wait loops).
+     * Let non-blocking init functions run to populate game state. */
+    if ((addr == 0x109D1F28 ||  /* peripheral wait loop (sleep+while) */
+         addr == 0x10A176BC ||  /* event setup (blocks inside FUN_10a18a04) */
+         addr == 0x10A083AC ||  /* sleep function (blocks in B .) */
+         addr == 0x10A4AE64 ||  /* mutex/sem init 1 (crashes without event sys) */
+         addr == 0x10A4AE78 ||  /* mutex/sem init 2 */
+         addr == 0x10A4AE8C     /* mutex/sem init 3 */
         ) && ((VFlash*)ctx)->boot_phase >= 800) {
         static int skip_log = 0;
         if (!skip_log) {
@@ -5134,7 +5128,7 @@ void vflash_run_frame(VFlash *vf) {
     /* Auto-launch game task after µMORE init stabilizes.
      * On frame 120 (after init + bootstrap), find TCB with largest stack
      * and launch it directly. Simple, no complex state tracking. */
-    if (vf->has_rom && vf->frame_count == 70) {
+    if (vf->has_rom && vf->frame_count == 200 && vf->boot_phase >= 100) {
         uint32_t best_a = 0, best_sz = 0;
         for (uint32_t a = 0x100000; a < 0xC00000; a += 4) {
             if (*(uint32_t*)(vf->ram+a) == 0x42435124 &&
@@ -5151,13 +5145,13 @@ void vflash_run_frame(VFlash *vf) {
             uint32_t sbase = *(uint32_t*)(vf->ram+best_a+0x30);
             uint32_t ssz = *(uint32_t*)(vf->ram+best_a+0x34);
             printf("[AUTO-LAUNCH] Game task: entry=%08X stack=%08X+%X\n", entry, sbase, ssz);
-            /* Jump directly to GAME LOOP at 0x109D1CE0 (skip all init).
-             * Game loop: { game_tick(); sync(); render(); } forever.
-             * Discovered via Ghidra decompilation of game task entry. */
-            printf("[AUTO-LAUNCH] → GAME LOOP at 0x109D1CE0!\n");
-            vf->cpu.cpsr = 0x00000013;
-            vf->cpu.r[15] = 0x109D1CE0;
-            vf->cpu.r[13] = sbase + ssz - 0x100; /* some stack used by init */
+            /* Jump to game task ENTRY (not loop) — let init run with
+             * blocking functions skipped. Init populates game state,
+             * then game loop starts naturally. */
+            printf("[AUTO-LAUNCH] → Game task entry at 0x%08X\n", entry);
+            vf->cpu.cpsr = 0x00000013; /* SVC, IRQ+FIQ enabled */
+            vf->cpu.r[15] = entry;
+            vf->cpu.r[13] = sbase + ssz - 4;
             vf->cpu.r[14] = 0x10FFF000;
             vf->timer.timer[0].load = 37500;
             vf->timer.timer[0].count = 37500;
