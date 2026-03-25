@@ -3504,28 +3504,42 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         return 1;
     }
 
-    /* HLE CD-ROM init (FUN_10a363e8).
-     * Normally queries disc via kernel service 0xE00 which goes to BOOT.BIN
-     * CD driver. Since the driver isn't registered, we HLE it:
-     * set disc flags and return success so FUN_10a36510 gets called. */
-    if (addr == 0x10A363E8 && ((VFlash*)ctx)->boot_phase >= 800) {
-        VFlash *vf2 = (VFlash*)ctx;
-        /* Set disc info at DAT_10a3650c (extracted from capacity 0x7FFFF) */
-        uint32_t disc_info_ptr;
-        { /* Read literal at 10A3650C */
-            disc_info_ptr = *(uint32_t*)(vf2->ram + 0xA3650C);
+    /* HLE kernel service dispatch.
+     * FUN_10008514 (lookup) calls *[*[1000C76C]+0x44](service_id).
+     * FUN_10008414 (request) calls *[*[1000C76C]+0x30](id, buf, size).
+     * We intercept these kernel functions directly. */
+    if (addr == 0x10008514 && ((VFlash*)ctx)->boot_phase >= 800) {
+        /* Service lookup: return 0x22 (service found) for CD-ROM services */
+        uint32_t svc_id = cpu->r[0];
+        if (svc_id == 0xE000 || svc_id == 0xF000) {
+            cpu->r[0] = 0x22; /* service registered */
+        } else {
+            cpu->r[0] = 0; /* not found */
         }
-        if (disc_info_ptr >= 0x10000000 && disc_info_ptr < 0x11000000) {
-            uint8_t *di = vf2->ram + (disc_info_ptr - 0x10000000);
-            di[0] = 1; di[1] = 1; di[2] = 1; di[3] = 3;
-            *(uint16_t*)(di+4) = 0x7F; *(uint16_t*)(di+6) = 0x7F;
-            *(uint16_t*)(di+8) = 0;
-        }
-        cpu->r[0] = 1; /* success → triggers FUN_10a36510 */
         cpu->r[15] = cpu->r[14] & ~3u;
-        printf("[HLE-CDROM] CD init → success, disc info set\n");
         return 1;
     }
+    if (addr == 0x10008414 && ((VFlash*)ctx)->boot_phase >= 800) {
+        /* Service request: handle CD-ROM queries.
+         * R0=service_id, R1=output_buffer, R2=request_size */
+        VFlash *vf2 = (VFlash*)ctx;
+        uint32_t svc_id = cpu->r[0];
+        uint32_t out_buf = cpu->r[1];
+        if ((svc_id == 0xE000 || svc_id == 0xF000) &&
+            out_buf >= 0x10000000 && out_buf < 0x11000000) {
+            uint8_t *buf = vf2->ram + (out_buf - 0x10000000);
+            /* Return disc capacity info: 0x7FFFF sectors */
+            *(uint32_t*)(buf + 0) = 0x0007FFFF;
+            memset(buf + 4, 0, 12);
+            printf("[HLE-SVC] CD request svc=%X → capacity 0x7FFFF\n", svc_id);
+        }
+        cpu->r[0] = 0; /* success */
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+
+    /* CD-ROM init (FUN_10a363e8) — let it run natively.
+     * With HLE service lookup/request above, it should work now. */
 
     /* Handle blocking functions during game init.
      * Some of these functions do useful work (CD-ROM loading) before blocking.
@@ -5343,6 +5357,26 @@ void vflash_run_frame(VFlash *vf) {
         /* Set game state for active gameplay */
         *(uint32_t*)(vf->ram + 0xB009C4) = 1;  /* game_state = active */
         *(uint32_t*)(vf->ram + 0xB902C0) = 3;  /* game_mode = gameplay */
+
+        /* Load VFF scene data from CD-ROM directly into game's render buffer.
+         * Find MAIN.VFF on disc and load its largest section. */
+        if (vf->cd && vf->cd->is_open) {
+            CDEntry vff_e;
+            const char *vff_names[] = {"MAIN.VFF","CWMENU.VFF","CW1A.VFF","OPENING.VFF",NULL};
+            for (int vi = 0; vff_names[vi]; vi++) {
+                if (cdrom_find_file_any(vf->cd, vff_names[vi], &vff_e)) {
+                    /* Load VFF to a temp buffer in game RAM (0x10200000) */
+                    uint32_t load_sz = vff_e.size;
+                    if (load_sz > 0x100000) load_sz = 0x100000; /* max 1MB */
+                    int rd = cdrom_read_file(vf->cd, &vff_e, vf->ram + 0x200000, 0, load_sz);
+                    if (rd > 0) {
+                        printf("[CD-LOAD] Loaded %s (%d bytes) to RAM+0x200000\n",
+                               vff_e.name, rd);
+                    }
+                    break;
+                }
+            }
+        }
         /* Clear the 960KB render buffer */
         memset(vf->ram + 0x48000, 0, 0xF0000);
         /* Load PTX game artwork to the render buffer at 0x10048000.
