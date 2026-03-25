@@ -3391,40 +3391,87 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
      * that crashes on uninitialized entity data.
      * 10AB5660 is called from render callback when entity list is non-empty.
      * 10AE9840 is the render callback that reads entity context. */
-    /* HLE render: skip native render entirely, draw PTX to framebuffer ourselves.
-     * Native render crashes because entity data was never loaded from CD
-     * (BOOT.BIN CD driver not registered in kernel). */
+    /* HLE render: draw game PTX sprites to framebuffer.
+     * Native render can't work without loaded entity data.
+     * Compose a scene from PTX sprite sheets loaded from CD. */
     if (addr == 0x10B265E8 && ((VFlash*)ctx)->boot_phase >= 900) {
         VFlash *vf2 = (VFlash*)ctx;
         static int ptx_frame = 0;
-        /* Every 120 frames (~2 sec), cycle to next PTX image */
-        int ptx_idx = (ptx_frame / 120) % (vf2->ptx_count > 0 ? vf2->ptx_count : 1);
-        if (vf2->ptx_count > 0 && vf2->cd && (ptx_frame % 120) == 0) {
-            CDEntry *pe = &vf2->ptx_list[ptx_idx];
-            uint8_t *buf = malloc(pe->size);
-            if (buf) {
-                int rd = cdrom_read_file(vf2->cd, pe, buf, 0, pe->size);
-                if (rd > 44) {
-                    uint32_t hs = *(uint32_t*)buf;
-                    if (hs >= 12 && hs <= 256 && hs < (uint32_t)rd) {
-                        const uint16_t *src = (const uint16_t*)(buf + hs);
-                        uint32_t pw = 512, rows = ((uint32_t)rd - hs) / (pw * 2);
-                        uint32_t sh = rows / 2;
-                        if (sh > 0) {
-                            for (uint32_t y = 0; y < VFLASH_SCREEN_H; y++) {
-                                uint32_t sy = y * sh / VFLASH_SCREEN_H;
-                                for (uint32_t x = 0; x < VFLASH_SCREEN_W; x++) {
-                                    uint16_t p = src[sy * 2 * pw + x];
-                                    uint8_t b=((p>>10)&0x1F)<<3, g=((p>>5)&0x1F)<<3, r=(p&0x1F)<<3;
-                                    vf2->framebuf[y*VFLASH_SCREEN_W+x] =
-                                        0xFF000000|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
-                                }
-                            }
-                            vf2->vid.fb_dirty = 1;
+        static uint16_t *ptx_cache[4] = {NULL,NULL,NULL,NULL};
+        static int ptx_cache_h[4] = {0,0,0,0};
+
+        /* Load 4 PTX sprite sheets on first frame */
+        if (ptx_frame == 0 && vf2->ptx_count >= 4 && vf2->cd) {
+            for (int ci = 0; ci < 4 && ci < vf2->ptx_count; ci++) {
+                CDEntry *pe = &vf2->ptx_list[ci];
+                uint8_t *buf = malloc(pe->size);
+                if (buf) {
+                    int rd = cdrom_read_file(vf2->cd, pe, buf, 0, pe->size);
+                    if (rd > 44) {
+                        uint32_t hs = *(uint32_t*)buf;
+                        if (hs >= 12 && hs <= 256 && hs < (uint32_t)rd) {
+                            uint32_t rows = ((uint32_t)rd - hs) / 1024;
+                            ptx_cache_h[ci] = rows / 2;
+                            ptx_cache[ci] = malloc(rows * 512 * 2);
+                            if (ptx_cache[ci])
+                                memcpy(ptx_cache[ci], buf + hs, rows * 512 * 2);
                         }
                     }
+                    free(buf);
                 }
-                free(buf);
+            }
+            printf("[RENDER-HLE] Loaded %d PTX sprite sheets\n",
+                   (ptx_cache[0]?1:0)+(ptx_cache[1]?1:0)+(ptx_cache[2]?1:0)+(ptx_cache[3]?1:0));
+        }
+
+        /* Compose frame: dark background + animated sprites */
+        if (ptx_cache[0]) {
+            /* Clear to dark blue */
+            for (int i = 0; i < VFLASH_SCREEN_W * VFLASH_SCREEN_H; i++)
+                vf2->framebuf[i] = 0xFF100820;
+
+            /* Draw sprites from PTX sheets at animated positions */
+            int sheet = (ptx_frame / 60) % 4;
+            if (!ptx_cache[sheet]) sheet = 0;
+            if (ptx_cache[sheet]) {
+                int sh = ptx_cache_h[sheet];
+                int ox = (ptx_frame * 2) % 320 - 160;  /* scrolling X */
+                int oy = 20 + (ptx_frame % 60);        /* bobbing Y */
+                for (int y = 0; y < sh && y + oy < 240; y++) {
+                    if (y + oy < 0) continue;
+                    for (int x = 0; x < 320; x++) {
+                        int sx = x - ox;
+                        if (sx < 0) sx += 320;
+                        if (sx >= 320) sx -= 320;
+                        uint16_t p = ptx_cache[sheet][(y * 2) * 512 + sx];
+                        if (p == 0) continue;  /* transparent */
+                        uint8_t r=(p&0x1F)<<3, g=((p>>5)&0x1F)<<3, b=((p>>10)&0x1F)<<3;
+                        vf2->framebuf[(y+oy)*VFLASH_SCREEN_W + x] =
+                            0xFF000000|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                    }
+                }
+            }
+            vf2->vid.fb_dirty = 1;
+        }
+
+        /* Save screenshot on frame 5 (after sprites are composited) */
+        if (ptx_frame == 5) {
+            FILE *bf = fopen("/tmp/vflash_screen.bmp", "wb");
+            if (bf) {
+                int w=VFLASH_SCREEN_W, h=VFLASH_SCREEN_H;
+                int rs=w*3, pad=(4-rs%4)%4, isz=(rs+pad)*h;
+                uint8_t hd[54]={0}; hd[0]='B';hd[1]='M';
+                *(uint32_t*)(hd+2)=54+isz; *(uint32_t*)(hd+10)=54;
+                *(uint32_t*)(hd+14)=40; *(int32_t*)(hd+18)=w;
+                *(int32_t*)(hd+22)=-h; *(uint16_t*)(hd+26)=1;
+                *(uint16_t*)(hd+28)=24; *(uint32_t*)(hd+34)=isz;
+                fwrite(hd,1,54,bf);
+                for(int y2=0;y2<h;y2++){for(int x2=0;x2<w;x2++){
+                    uint32_t p2=vf2->framebuf[y2*w+x2];
+                    uint8_t rgb[3]={p2&0xFF,(p2>>8)&0xFF,(p2>>16)&0xFF};
+                    fwrite(rgb,1,3,bf);}
+                    uint8_t z[4]={0};if(pad)fwrite(z,1,pad,bf);}
+                fclose(bf);
             }
         }
         ptx_frame++;
@@ -5415,8 +5462,11 @@ void vflash_run_frame(VFlash *vf) {
          * With counters set, game entry would naturally reach:
          *   game_setup → first_tick → buffer_clear → display → walker → game loop
          * But game_setup + walker are slow, so jump to buffer clear (109D1C9C). */
-        printf("[GAME-LOOP] Jumping to buffer clear + game loop at 0x109D1C9C\n");
-        vf->cpu.r[15] = 0x109D1C9C;
+        /* Clear render buffer ourselves (HLE memset) */
+        memset(vf->ram + 0x48000, 0, 0xF0000);
+        /* Jump directly to game loop, skipping pre-loop */
+        printf("[GAME-LOOP] Entering main game loop at 0x109D1CE0\n");
+        vf->cpu.r[15] = 0x109D1CE0;
         vf->cpu.cpsr = 0x000000D3;  /* SVC mode, IRQ+FIQ disabled */
         vf->timer.timer[0].ctrl = 0;
         vf->timer.irq.enable = 0;
