@@ -31,8 +31,10 @@ Background voice/SFX audio plays automatically from 561 WAV files on disc.
 
 ## Status
 
-**Game task executing** — µMORE v4.0 RTOS boots, 10 task TCBs discovered via Nucleus RTOS
-RE, game task (128KB stack) launched directly. Game code runs through µMORE kernel services.
+**Game loop running with PTX artwork display** — µMORE v4.0 RTOS boots, game task
+launched, 22+ init functions execute, game loop (tick→sync→render) runs at 284K+
+iterations. VFF scene data and PTX sprite sheets loaded from CD-ROM. Animated
+game artwork displays on screen via HLE render with PTX compositing.
 
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spider-Man.
 
@@ -55,18 +57,30 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **Nucleus TCB discovery** | ✅ 10 tasks found, entry points + stacks |
 | **Game task launch** | ✅ Task #10 (128KB stack) executing µMORE code |
 | **Game loop (Ghidra RE)** | ✅ tick→sync→render at 0x109D1CE0 |
-| **Game loop execution** | ✅ tick→sync→render running 100K+ iterations |
+| **Game loop execution** | ✅ 284K+ iterations, PTX artwork displayed |
+| **VFF scene loading** | ✅ ARM code + graphics + tilemap loaded to RAM |
+| **VFF scene init** | ✅ Scene descriptor table populated at 0x10500808 |
+| **CD-ROM service dispatch** | ✅ HLE kernel lookup + request for svc 0xE000 |
+| **Native render** | 🔧 Runs without crashes, needs event system for output |
 
 ### Remaining for gameplay
 
-Game loop at 0x109D1CE0 (tick→sync→render) **runs continuously** after 22+
-init functions complete. Render is currently intercepted (returns immediately)
-because entity/GPU state is uninitialized. Game tick processes entity tables
-and the loop is stable at 100K+ iterations. Next: CD-ROM asset loading to
-populate game state, then enable render pipeline.
+Game loop runs with **animated PTX sprite artwork from CD-ROM** displayed via
+HLE render. Native render runs stably but produces no output — all render
+subsystems (3D sprites, 2D backgrounds, effects) require context initialization
+that only happens through the µMORE event dispatch system.
 
-**Ghidra headless decompiler** used to RE full game task entry (0x109D1BD0):
-init → event_system → services → wait(counters>7) → game_setup → **GAME LOOP**.
+**Root cause**: BOOT.BIN CD-ROM driver not registered in kernel (service vtable
+at `[1000C76C]` = NULL). Asset loading requires event callbacks between game task
+and BOOT.BIN driver, coordinated by µMORE scheduler. Without this, VFF scene
+code (ARM executable in sec[0]) can initialize descriptors but not decompress
+graphics (sec[1] data is compressed with proprietary codec).
+
+**Ghidra RE completed**: full game task entry, render pipeline, VFF scene format,
+BOOT.BIN CD driver (10C21680 ATAPI read), scene loader (10CC3F84), kernel service
+dispatch (10008414/10008514). VFF sec[0] = ARM scene code, sec[1] = compressed
+graphics, sec[2] = tilemap. Scene init registers callback table at 0x10500808.
+
 **Nucleus RTOS** confirmed (NU_ API). TCB: `$QCB`/`$QBT`, entry +0x2C, stack +0x30/+0x34.
 **Firebird interrupt controller** at 0xDC000000. Tested 6 games.
 

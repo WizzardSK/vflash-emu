@@ -3391,11 +3391,13 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
      * that crashes on uninitialized entity data.
      * 10AB5660 is called from render callback when entity list is non-empty.
      * 10AE9840 is the render callback that reads entity context. */
-    /* HLE render: draw game PTX sprites to framebuffer.
-     * Native render can't work without loaded entity data.
-     * Compose a scene from PTX sprite sheets loaded from CD. */
+    /* HLE render: draw PTX game artwork, skip native render.
+     * Native render was tested with crash recovery but produces no output
+     * because all render subsystems need initialized context from event system. */
     if (addr == 0x10B265E8 && ((VFlash*)ctx)->boot_phase >= 900) {
         VFlash *vf2 = (VFlash*)ctx;
+        *(uint8_t*)(vf2->ram + 0xBE3EC0) = 1;
+        /* PTX fallback: draw game artwork when native render produces nothing */
         static int ptx_frame = 0;
         static uint16_t *ptx_cache[4] = {NULL,NULL,NULL,NULL};
         static int ptx_cache_h[4] = {0,0,0,0};
@@ -5554,37 +5556,7 @@ void vflash_run_frame(VFlash *vf) {
             vf->vid.fb_dirty = 1;
             static int lcd_blit_log = 0;
             if (!lcd_blit_log) {
-                printf("[LCD-BLIT] First 16bpp blit from fb=0x%08X\n", vf->lcd.upbase);
-                /* Auto-save screenshot as BMP */
-                FILE *bf = fopen("/tmp/vflash_screen.bmp", "wb");
-                if (bf) {
-                    int w = VFLASH_SCREEN_W, h = VFLASH_SCREEN_H;
-                    int row_sz = w * 3;
-                    int pad = (4 - row_sz % 4) % 4;
-                    int img_sz = (row_sz + pad) * h;
-                    uint8_t hdr[54] = {0};
-                    hdr[0]='B'; hdr[1]='M';
-                    *(uint32_t*)(hdr+2) = 54 + img_sz;
-                    *(uint32_t*)(hdr+10) = 54;
-                    *(uint32_t*)(hdr+14) = 40;
-                    *(int32_t*)(hdr+18) = w;
-                    *(int32_t*)(hdr+22) = -h; /* top-down */
-                    *(uint16_t*)(hdr+26) = 1;
-                    *(uint16_t*)(hdr+28) = 24;
-                    *(uint32_t*)(hdr+34) = img_sz;
-                    fwrite(hdr, 1, 54, bf);
-                    for (int y2 = 0; y2 < h; y2++) {
-                        for (int x2 = 0; x2 < w; x2++) {
-                            uint32_t px2 = vf->framebuf[y2 * w + x2];
-                            uint8_t rgb[3] = {px2 & 0xFF, (px2>>8)&0xFF, (px2>>16)&0xFF};
-                            fwrite(rgb, 1, 3, bf);
-                        }
-                        uint8_t zero[4] = {0};
-                        if (pad) fwrite(zero, 1, pad, bf);
-                    }
-                    fclose(bf);
-                    printf("[LCD-BLIT] Screenshot saved to /tmp/vflash_screen.bmp\n");
-                }
+                printf("[LCD-BLIT] 16bpp blit from fb=0x%08X\n", vf->lcd.upbase);
                 lcd_blit_log = 1;
             }
         } else if (bpp_code == 5) {
