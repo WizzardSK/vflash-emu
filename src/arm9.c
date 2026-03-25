@@ -655,16 +655,18 @@ int arm9_step(ARM9 *cpu) {
                        inst_addr, cpu->r[14], cpu->r[0], cpu->r[13]);
             null_blx++;
             cpu->r[0] = 0;
-            /* Check if LR is a valid code address */
+            /* Check if LR and SP are valid */
             uint32_t lr = cpu->r[14];
+            uint32_t sp = cpu->r[13];
             int lr_valid = (lr >= 0x10000100 && lr < 0x11000000) ||
                            (lr > 0 && lr < 0x00200000);
-            if (lr_valid && lr != inst_addr) {
+            int sp_valid = (sp >= 0x10000000 && sp < 0x11000000);
+            if (lr_valid && sp_valid && lr != inst_addr) {
                 PC = lr & ~3u;
             } else {
-                /* LR also corrupted — jump to game loop if in game phase */
+                /* LR or SP corrupted — jump to game loop with safe state */
                 PC = 0x109D1CE0; /* game loop */
-                cpu->r[13] = 0x10B8DAC0; /* restore SP to safe value */
+                cpu->r[13] = 0x10B8DAC0; /* safe SP */
                 cpu->cpsr = 0x000000D3; /* SVC, IRQ off */
             }
             cpu->cycles += 1;
