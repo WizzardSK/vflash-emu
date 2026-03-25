@@ -3387,9 +3387,17 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     /* Skip blocking µMORE functions in game task entry.
      * Only skip the ones that BLOCK (sleep/wait loops).
      * Let non-blocking init functions run to populate game state. */
-    /* Skip render during game loop — entity/GPU state is uninitialized.
-     * VFF scene data loaded directly to framebuffer instead. */
-    if (addr == 0x10B265E8 && ((VFlash*)ctx)->boot_phase >= 900) {
+    /* Render: let the main function run but intercept the sub-function
+     * that crashes on uninitialized entity data.
+     * 10AB5660 is called from render callback when entity list is non-empty.
+     * 10AE9840 is the render callback that reads entity context. */
+    /* Skip render sub-functions that crash on uninitialized entity data.
+     * Each of these processes entity/sprite lists that are empty. */
+    if (((VFlash*)ctx)->boot_phase >= 900 &&
+        (addr == 0x10AB5660 ||   /* sprite batch processing */
+         addr == 0x10AB0A48 ||   /* entity batch init */
+         addr == 0x10AE9840 ||   /* render callback (entity context) */
+         addr == 0x10A881F0)) {  /* render frame init (calls callbacks) */
         cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
