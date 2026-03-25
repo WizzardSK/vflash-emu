@@ -899,10 +899,14 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                 printf("[FB-ACCESS] Read [%08X] from PC=%08X\n", addr, vf->cpu.r[15]);
             fb_read++;
         }
-        /* Ghidra: game task checks *[0x10B05A18] > 7 and *[0x10B05A1C] > 7.
-         * Return 8 on read to unblock game task wait loop. */
+        /* Ghidra: game task checks *[0x10B05A18] > 7 and *[0x10B05A1C] > 7. */
         if (roff == 0xB05A18 || roff == 0xB05A1C) {
             return 8;
+        }
+        /* Ghidra: game_tick checks *[0x10B009C4] != 0.
+         * If 0, game_tick does nothing. Force to 1. */
+        if (roff == 0xB009C4) {
+            return 1;
         }
         /* Flash completion flags — always return with bit0 set. */
         if (roff == 0xBBCFF4 || roff == 0xBBD010) {
@@ -5145,13 +5149,13 @@ void vflash_run_frame(VFlash *vf) {
             uint32_t sbase = *(uint32_t*)(vf->ram+best_a+0x30);
             uint32_t ssz = *(uint32_t*)(vf->ram+best_a+0x34);
             printf("[AUTO-LAUNCH] Game task: entry=%08X stack=%08X+%X\n", entry, sbase, ssz);
-            /* Jump to game task ENTRY (not loop) — let init run with
-             * blocking functions skipped. Init populates game state,
-             * then game loop starts naturally. */
-            printf("[AUTO-LAUNCH] → Game task entry at 0x%08X\n", entry);
-            vf->cpu.cpsr = 0x00000013; /* SVC, IRQ+FIQ enabled */
-            vf->cpu.r[15] = entry;
-            vf->cpu.r[13] = sbase + ssz - 4;
+            /* Jump to GAME LOOP directly.
+             * Game state flag forced via read intercept [0x10B009C4]=1.
+             * Game mode already set to 3 (gameplay) at [0x10B902C0]. */
+            printf("[AUTO-LAUNCH] → GAME LOOP at 0x109D1CE0\n");
+            vf->cpu.cpsr = 0x00000013;
+            vf->cpu.r[15] = 0x109D1CE0;
+            vf->cpu.r[13] = sbase + ssz - 0x100;
             vf->cpu.r[14] = 0x10FFF000;
             vf->timer.timer[0].load = 37500;
             vf->timer.timer[0].count = 37500;
