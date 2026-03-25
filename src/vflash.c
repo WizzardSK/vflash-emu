@@ -3348,6 +3348,8 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     }
     /* (event loop intercept moved before BSS check) */
 
+    /* (event init skip moved before BSS check) */
+
     /* Intercept µMORE event dispatch loop (0x10A17100).
      * Game task calls with R0=0, R1=0 (null callback).
      * Inject BOOT.BIN game entry as callback. */
@@ -3363,6 +3365,37 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
             printf("[EV-LOOP] Injected game callback!\n");
         }
         return 0;
+    }
+
+    /* Skip blocking functions in game task entry.
+     * FUN_109d1f28: peripheral wait with sleep loop (blocks forever)
+     * FUN_10a18a04: event system init (blocks in event pump) */
+    /* Skip ALL blocking µMORE functions in game task entry.
+     * Found via Ghidra decompilation of game task at 0x109D1BD0. */
+    if ((addr == 0x109D1F28 ||  /* peripheral wait loop */
+         addr == 0x10A18A04 ||  /* event system init (blocks in pump) */
+         addr == 0x10A083AC ||  /* sleep function */
+         addr == 0x10A090DC ||  /* unknown blocking func */
+         addr == 0x10A4AE64 ||  /* µMORE API init 1 */
+         addr == 0x10A4AE78 ||  /* µMORE API init 2 */
+         addr == 0x10A4AE8C ||  /* µMORE API init 3 */
+         addr == 0x10A4A638 ||  /* µMORE init */
+         addr == 0x10A4A858 ||  /* µMORE init */
+         addr == 0x10A363E8 ||  /* check function */
+         addr == 0x10A367C8 ||  /* sync function */
+         addr == 0x10A36130 ||  /* wait counter check 1 */
+         addr == 0x10A36168     /* wait counter check 2 */
+        ) && ((VFlash*)ctx)->boot_phase >= 800) {
+        static int skip_log = 0;
+        if (!skip_log) {
+            printf("[SKIP-EVTINIT] Skipping 0x10A18A04 → game task continues!\n");
+            skip_log = 1;
+        }
+        /* For counter checks, return 1 (true = > 7) instead of 0 */
+        if (addr == 0x10A36130 || addr == 0x10A36168)
+            cpu->r[0] = 1;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
     }
 
     /* Intercept scheduler init: set sched_state=3 before task_start. */
@@ -5115,9 +5148,13 @@ void vflash_run_frame(VFlash *vf) {
             uint32_t sbase = *(uint32_t*)(vf->ram+best_a+0x30);
             uint32_t ssz = *(uint32_t*)(vf->ram+best_a+0x34);
             printf("[AUTO-LAUNCH] Game task: entry=%08X stack=%08X+%X\n", entry, sbase, ssz);
+            /* Jump directly to GAME LOOP at 0x109D1CE0 (skip all init).
+             * Game loop: { game_tick(); sync(); render(); } forever.
+             * Discovered via Ghidra decompilation of game task entry. */
+            printf("[AUTO-LAUNCH] → GAME LOOP at 0x109D1CE0!\n");
             vf->cpu.cpsr = 0x00000013;
-            vf->cpu.r[15] = entry;
-            vf->cpu.r[13] = sbase + ssz - 4;
+            vf->cpu.r[15] = 0x109D1CE0;
+            vf->cpu.r[13] = sbase + ssz - 0x100; /* some stack used by init */
             vf->cpu.r[14] = 0x10FFF000;
             vf->timer.timer[0].load = 37500;
             vf->timer.timer[0].count = 37500;
