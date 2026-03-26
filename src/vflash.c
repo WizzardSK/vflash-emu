@@ -3391,13 +3391,8 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     /* Skip blocking µMORE functions in game task entry.
      * Only skip the ones that BLOCK (sleep/wait loops).
      * Let non-blocking init functions run to populate game state. */
-    /* Render: let the main function run but intercept the sub-function
-     * that crashes on uninitialized entity data.
-     * 10AB5660 is called from render callback when entity list is non-empty.
-     * 10AE9840 is the render callback that reads entity context. */
-    /* HLE render: draw PTX game artwork, skip native render.
-     * Native render was tested with crash recovery but produces no output
-     * because all render subsystems need initialized context from event system. */
+    /* HLE render: PTX sprite artwork display.
+     * Native render can't produce output without event-driven init. */
     if (addr == 0x10B265E8 && ((VFlash*)ctx)->boot_phase >= 900) {
         VFlash *vf2 = (VFlash*)ctx;
         *(uint8_t*)(vf2->ram + 0xBE3EC0) = 1;
@@ -3517,12 +3512,9 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         }
     }
 
-    /* HLE init function table walker (109D26FC) — skip since entities empty */
-    if (addr == 0x109D26FC && ((VFlash*)ctx)->boot_phase >= 900) {
-        cpu->r[0] = 0;
-        cpu->r[15] = cpu->r[14] & ~3u;
-        return 1;
-    }
+    /* Init function table walker (109D26FC) — let it run.
+     * 109D2754 (state machine) is still skipped to prevent loops.
+     * Walker calls 21 functions that initialize render engine layers/state. */
 
     /* HLE memset/memclear (10A70324).
      * Game calls FUN_10a70324(dst, val, size) to clear 960KB render buffer.
@@ -5535,6 +5527,7 @@ void vflash_run_frame(VFlash *vf) {
         /* Clear render buffer ourselves (HLE memset) */
         memset(vf->ram + 0x48000, 0, 0xF0000);
         /* Jump directly to game loop, skipping pre-loop */
+        /* Render context stays at 0 — engine subsystems need event-driven init */
         printf("[GAME-LOOP] Entering main game loop at 0x109D1CE0\n");
         vf->cpu.r[15] = 0x109D1CE0;
         vf->cpu.cpsr = 0x000000D3;  /* SVC mode, IRQ+FIQ disabled */
