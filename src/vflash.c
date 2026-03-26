@@ -286,8 +286,8 @@ static void atapi_init(ATAPIState *a) {
     memset(a, 0, sizeof(*a));
     a->status = ATA_SR_DRDY;
     a->sect_count = ATAPI_IR_COD | ATAPI_IR_IO; /* ready for command */
-    a->sense_key = 0x06; /* UNIT ATTENTION (power on) */
-    a->asc = 0x29;       /* power on reset */
+    a->sense_key = 0x00; /* NO SENSE — disc ready, no errors */
+    a->asc = 0x00;       /* no additional sense */
 }
 
 static void atapi_set_sense(ATAPIState *a, uint8_t key, uint8_t asc, uint8_t ascq) {
@@ -909,6 +909,8 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         }
         /* Ghidra: game_tick checks *[0x10B009C4] != 0. */
         if (roff == 0xB009C4) return 1;
+        /* Force game_mode to 3 (gameplay), prevent error mode 4. */
+        if (roff == 0xB902C0) return 3;
         /* Ghidra: scheduler state at *[0x10BA63E0] must be 1 or 3. */
         if (roff == 0xBA63E0) return 3;
         /* Ghidra: FUN_10a08ed8 checks *[0x10B606C0] == 1 (scheduler pool active). */
@@ -1499,6 +1501,11 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
          * Must be > 7 for game to proceed. Force minimum value of 8. */
         if ((roff == 0xB05A18 || roff == 0xB05A1C) && val < 8) {
             val = 8;
+        }
+        /* Block game_mode write to 4 (error mode). Game enters mode 4
+         * when CD query returns "door open". Force mode to stay at 3. */
+        if (roff == 0xB902C0 && val == 4) {
+            val = 3; /* force gameplay mode */
         }
         /* Protect game callback pointer at [0x10BBD3C0].
          * µMORE game task init writes 0 here — prevent clearing. */
@@ -2374,7 +2381,10 @@ static void mem_write8(void *ctx, uint32_t addr, uint8_t val) {
         return;
     }
     if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
-        vf->ram[addr - VFLASH_RAM_BASE] = val;
+        uint32_t roff8 = addr - VFLASH_RAM_BASE;
+        /* Block game_mode byte write to 4 (error mode) */
+        if (roff8 == 0xB902C0 && val == 4) val = 3;
+        vf->ram[roff8] = val;
         return;
     }
     if (addr >= VFLASH_SRAM_BASE && addr < VFLASH_SRAM_BASE + VFLASH_SRAM_SIZE) {
@@ -3391,9 +3401,12 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     /* Skip blocking µMORE functions in game task entry.
      * Only skip the ones that BLOCK (sleep/wait loops).
      * Let non-blocking init functions run to populate game state. */
-    /* HLE render: PTX sprite artwork display.
-     * Native render can't produce output without event-driven init. */
+    /* Dump game state on first render call */
     if (addr == 0x10B265E8 && ((VFlash*)ctx)->boot_phase >= 900) {
+        static int dump_once = 0;
+        if (!dump_once) {
+            VFlash *vd = (VFlash*)ctx;
+        }
         VFlash *vf2 = (VFlash*)ctx;
         *(uint8_t*)(vf2->ram + 0xBE3EC0) = 1;
         /* PTX fallback: draw game artwork when native render produces nothing */
@@ -3480,6 +3493,7 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
+
 
     /* 109D2754 (state machine): force object state to "done" (0x84).
      * The function checks [param_1 + 0x104] for state. States:
