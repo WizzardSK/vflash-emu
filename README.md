@@ -31,10 +31,11 @@ Background voice/SFX audio plays automatically from 561 WAV files on disc.
 
 ## Status
 
-**Game loop running with PTX artwork display** — µMORE v4.0 RTOS boots, game task
-launched, 22+ init functions execute, game loop (tick→sync→render) runs at 284K+
-iterations. VFF scene data and PTX sprite sheets loaded from CD-ROM. Animated
-game artwork displays on screen via HLE render with PTX compositing.
+**Game engine running natively** — µMORE v4.0 RTOS boots, game task launched,
+native kernel service dispatch through vtable, CD-ROM init succeeds, VFF scene
+data loaded and scene builder completes with HLE alloc. Game loop runs with
+all engine subsystems (tick, sync, entity processing) executing natively.
+PTX sprite artwork from CD-ROM displays on screen.
 
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spider-Man.
 
@@ -54,32 +55,35 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **BOOT.BIN bootstrap → warm reboot #3** | ✅ Callback 0x1880 |
 | **ROM warm boot → scheduler idle** | ✅ 0x10A219xx loop |
 | **Secondary VIC (0xDC000000)** | ✅ Timer IRQ clear |
-| **Nucleus TCB discovery** | ✅ 10 tasks found, entry points + stacks |
-| **Game task launch** | ✅ Task #10 (128KB stack) executing µMORE code |
-| **Game loop (Ghidra RE)** | ✅ tick→sync→render at 0x109D1CE0 |
-| **Game loop execution** | ✅ 284K+ iterations, PTX artwork displayed |
+| **Nucleus TCB discovery** | ✅ Relaxed $QCB scan (no $QBT required) |
+| **Game task launch** | ✅ Correct entry via TCB (not service entry) |
+| **Kernel service vtable** | ✅ Initialized from ROM, native dispatch works |
+| **CD-ROM init** | ✅ Native through kernel vtable, disc query succeeds |
 | **VFF scene loading** | ✅ ARM code + graphics + tilemap loaded to RAM |
 | **VFF scene init** | ✅ Scene descriptor table populated at 0x10500808 |
-| **CD-ROM service dispatch** | ✅ HLE kernel lookup + request for svc 0xE000 |
-| **Native render** | 🔧 Runs without crashes, needs event system for output |
+| **VFF scene builder** | ✅ Entity alloc + engine setup completes |
+| **Game loop** | ✅ tick→sync→render, all subsystems active |
+| **NULL entity protection** | ✅ Dummy vtable + read trap for safe execution |
+| **Native render** | 🔧 Entity data allocated but render needs more init |
 
 ### Remaining for gameplay
 
-Game loop runs with **animated PTX sprite artwork from CD-ROM** displayed via
-HLE render. Native render runs stably but produces no output — all render
-subsystems (3D sprites, 2D backgrounds, effects) require context initialization
-that only happens through the µMORE event dispatch system.
+Game engine runs natively with all subsystems active. VFF scene builder
+allocates entities via HLE alloc with dummy vtable stubs. Render subsystem
+needs initialized GPU/layer state to produce framebuffer output.
 
-**Root cause**: BOOT.BIN CD-ROM driver not registered in kernel (service vtable
-at `[1000C76C]` = NULL). Asset loading requires event callbacks between game task
-and BOOT.BIN driver, coordinated by µMORE scheduler. Without this, VFF scene
-code (ARM executable in sec[0]) can initialize descriptors but not decompress
-graphics (sec[1] data is compressed with proprietary codec).
+**Key HLE components**:
+- Game alloc (10A775E0, 10A77648): bump allocator with dummy vtable
+- NULL entity read trap: returns 1 for [0x00-0x1F] reads (breaks polling loops)
+- Dummy vtable at 0x10310800: 64 return-0 stubs for virtual method calls
+- Engine wait skip (10A20B30): breaks BEQ loop waiting for entity state
+- Render state pre-fill: 10BE3C40/10BE49E0 areas set to ready state
+- Game mode fix: intercept [10B902C0] reads, return 3 (not 4=error)
+- Kernel vtable: 7 function pointers from ROM at [1000C76C+0x2C..+0x44]
 
-**Ghidra RE completed**: full game task entry, render pipeline, VFF scene format,
-BOOT.BIN CD driver (10C21680 ATAPI read), scene loader (10CC3F84), kernel service
-dispatch (10008414/10008514). VFF sec[0] = ARM scene code, sec[1] = compressed
-graphics, sec[2] = tilemap. Scene init registers callback table at 0x10500808.
+**Ghidra RE completed**: full game task entry, render pipeline, VFF scene format
+(sec[0]=ARM scene script, sec[1]=tile graphics, sec[2]=tilemap), BOOT.BIN
+CD driver (10C21680), kernel service dispatch, game engine object system.
 
 **Nucleus RTOS** confirmed (NU_ API). TCB: `$QCB`/`$QBT`, entry +0x2C, stack +0x30/+0x34.
 **Firebird interrupt controller** at 0xDC000000. Tested 6 games.
