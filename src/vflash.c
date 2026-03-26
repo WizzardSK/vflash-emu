@@ -881,6 +881,12 @@ static uint32_t mmu_translate(VFlash *vf, uint32_t va) {
 static uint32_t mem_read32(void *ctx, uint32_t addr) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
+    /* NULL pointer dereference trap: when game reads [0x00-0x1F]
+     * during gameplay, it's accessing a NULL entity pointer.
+     * Return "ready" values to break polling loops. */
+    if (addr < 0x20 && vf->boot_phase >= 900) {
+        return 1; /* generic "ready/done" value */
+    }
 
     /* Fast path: RAM (most common — ~90% of all accesses) */
     if (__builtin_expect(addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE, 1)) {
@@ -1431,6 +1437,8 @@ static uint16_t mem_read16(void *ctx, uint32_t addr) {
 static uint8_t mem_read8(void *ctx, uint32_t addr) {
     VFlash *vf = ctx;
     addr = mmu_translate(vf, addr);
+    /* NULL entity byte read trap */
+    if (addr < 0x20 && vf->boot_phase >= 900) return 1;
     if (addr < 0x00200000u) {
         if (vf->has_rom && !vf->rom_remapped && addr < vf->rom_size)
             return vf->rom[addr];
@@ -5550,10 +5558,31 @@ void vflash_run_frame(VFlash *vf) {
          * But game_setup + walker are slow, so jump to buffer clear (109D1C9C). */
         /* Clear render buffer ourselves (HLE memset) */
         memset(vf->ram + 0x48000, 0, 0xF0000);
-        /* Jump to pre-loop (tick + render_setup + sync) then main game loop.
-         * render_setup (10B263FC) runs natively to populate render_ctx. */
-        printf("[GAME-LOOP] Entering pre-loop at 0x109D1CB8\n");
-        vf->cpu.r[15] = 0x109D1CB8;
+        /* Create dummy entities so render subsystem doesn't loop on NULL.
+         * Entity struct: [+0]=vtable_ptr, [+4]=id, [+8]=status_byte(1=ready).
+         * Place at 0x10300000 (unused RAM area). */
+        {
+            uint32_t ent_base = 0x300000; /* RAM offset */
+            /* Create 8 dummy entities at 0x200 bytes apart */
+            for (int ei = 0; ei < 8; ei++) {
+                uint32_t eo = ent_base + ei * 0x200;
+                memset(vf->ram + eo, 0, 0x200);
+                /* Status byte at +8 = 1 (ready/done) */
+                vf->ram[eo + 8] = 1;
+                /* Also set bytes at common offsets to non-zero */
+                vf->ram[eo + 5] = 1;
+                *(uint32_t*)(vf->ram + eo + 0x104) = 0x84; /* state=done */
+            }
+            /* Set render_ctx to have entity pointer */
+            uint32_t ent_addr = 0x10000000 + ent_base;
+            *(uint32_t*)(vf->ram + 0xBE3C40) = 0;       /* ctx[0] still 0 */
+            *(uint32_t*)(vf->ram + 0xBE3C44) = 1;       /* ctx[1] = frame */
+            *(uint32_t*)(vf->ram + 0xBE3C4C) = 0;       /* ctx[3] = no flags yet */
+            printf("[ENTITY] Created 8 dummy entities at %08X\n", ent_addr);
+        }
+        /* Enter main game loop directly */
+        printf("[GAME-LOOP] Entering main game loop at 0x109D1CE0\n");
+        vf->cpu.r[15] = 0x109D1CE0;
         vf->cpu.cpsr = 0x000000D3;  /* SVC mode, IRQ+FIQ disabled */
         vf->timer.timer[0].ctrl = 0;
         vf->timer.irq.enable = 0;
