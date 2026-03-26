@@ -249,6 +249,10 @@ struct VFlash {
 
     int      boot_phase; /* Boot flow phase tracking */
     uint32_t flash_last_write; /* Last value written to NOR flash (for status polling) */
+    /* Saved game task info from BOOT TCB scan (before service entry may overwrite) */
+    uint32_t saved_game_entry;
+    uint32_t saved_game_stack;
+    uint32_t saved_game_stack_sz;
 
     uint32_t  framebuf[VFLASH_SCREEN_W * VFLASH_SCREEN_H];
 };
@@ -4433,6 +4437,25 @@ void vflash_run_frame(VFlash *vf) {
                         }
                     }
                     printf("[BOOT] Found %d $QCB task structs\n", qcb_count);
+                    /* Save best game task TCB (largest stack with valid entry) */
+                    {
+                        uint32_t b_a=0, b_sz=0;
+                        for (uint32_t a2 = 0x100000; a2 < 0xC00000; a2 += 4) {
+                            if (*(uint32_t*)(vf->ram+a2) == 0x42435124 &&
+                                *(uint32_t*)(vf->ram+a2+0x1C) == 0x42435424) {
+                                uint32_t e2 = *(uint32_t*)(vf->ram+a2+0x2C);
+                                uint32_t s2 = *(uint32_t*)(vf->ram+a2+0x34);
+                                if (s2 > b_sz && e2 >= 0x10090000) { b_sz=s2; b_a=a2; }
+                            }
+                        }
+                        if (b_a) {
+                            vf->saved_game_entry = *(uint32_t*)(vf->ram+b_a+0x2C);
+                            vf->saved_game_stack = *(uint32_t*)(vf->ram+b_a+0x30);
+                            vf->saved_game_stack_sz = b_sz;
+                            printf("[BOOT] Saved game TCB: entry=%08X stack=%08X+%X\n",
+                                   vf->saved_game_entry, vf->saved_game_stack, b_sz);
+                        }
+                    }
                     /* Set task dispatch flag at 0x10BC2BC0.
                      * IRQ handler checks *(0x10BC2BC0) != 0 before calling
                      * task_dispatch at 0x10A15D78. */
@@ -5363,21 +5386,23 @@ void vflash_run_frame(VFlash *vf) {
      * On frame 120 (after init + bootstrap), find TCB with largest stack
      * and launch it directly. Simple, no complex state tracking. */
     if (vf->has_rom && vf->frame_count == 75 && vf->boot_phase >= 100) {
-        uint32_t best_a = 0, best_sz = 0;
-        for (uint32_t a = 0x100000; a < 0xC00000; a += 4) {
-            if (*(uint32_t*)(vf->ram+a) == 0x42435124 &&
-                *(uint32_t*)(vf->ram+a+0x1C) == 0x42435424) {
-                uint32_t sz = *(uint32_t*)(vf->ram+a+0x34);
-                uint32_t entry = *(uint32_t*)(vf->ram+a+0x2C);
-                if (sz > best_sz && entry >= 0x10090000) {
-                    best_sz = sz; best_a = a;
-                }
-            }
+        /* Use saved TCB info, or fall back to service entry as game task */
+        uint32_t entry, sbase, ssz;
+        if (vf->saved_game_entry) {
+            entry = vf->saved_game_entry;
+            sbase = vf->saved_game_stack;
+            ssz = vf->saved_game_stack_sz;
+        } else {
+            /* No valid TCB found — use service entry address from SDRAM.
+             * Service entry is set during BOOT.BIN init at [FFCC/FFD0]. */
+            entry = *(uint32_t*)(vf->ram + 0xFFD0);
+            if (entry < 0x10090000 || entry >= 0x10E00000)
+                entry = *(uint32_t*)(vf->ram + 0xFFCC);
+            sbase = 0x10B6DB28;  /* default stack base */
+            ssz = 0x20000;       /* 128KB stack */
+            printf("[AUTO-LAUNCH] No TCB, using service entry %08X\n", entry);
         }
-        if (best_a) {
-            uint32_t entry = *(uint32_t*)(vf->ram+best_a+0x2C);
-            uint32_t sbase = *(uint32_t*)(vf->ram+best_a+0x30);
-            uint32_t ssz = *(uint32_t*)(vf->ram+best_a+0x34);
+        {
             printf("[AUTO-LAUNCH] Game task: entry=%08X stack=%08X+%X\n", entry, sbase, ssz);
             /* Launch game task ENTRY — let init run with blocking skipped.
              * Only sleep/wait are skipped; mutex init runs normally. */
