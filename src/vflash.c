@@ -883,9 +883,26 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
     addr = mmu_translate(vf, addr);
     /* NULL pointer dereference trap: when game reads [0x00-0x1F]
      * during gameplay, it's accessing a NULL entity pointer.
-     * Return "ready" values to break polling loops. */
+     * Return dummy vtable ptr for [0x00] so virtual calls go to stubs.
+     * Return 1 ("ready") for other offsets to break polling loops. */
     if (addr < 0x20 && vf->boot_phase >= 900) {
-        return 1; /* generic "ready/done" value */
+        /* Initialize dummy vtable once at 0x10310000 */
+        static int vtbl_init = 0;
+        if (!vtbl_init) {
+            /* Fill with ARM "MOV R0, #0; BX LR" stubs (return 0) */
+            /* E3A00000 = MOV R0, #0; E12FFF1E = BX LR */
+            for (int vi = 0; vi < 256; vi++) {
+                *(uint32_t*)(vf->ram + 0x310000 + vi*8) = 0xE3A00000;
+                *(uint32_t*)(vf->ram + 0x310004 + vi*8) = 0xE12FFF1E;
+            }
+            /* Vtable: array of pointers to stubs */
+            for (int vi = 0; vi < 64; vi++) {
+                *(uint32_t*)(vf->ram + 0x310800 + vi*4) = 0x10310000 + vi*8;
+            }
+            vtbl_init = 1;
+        }
+        if (addr < 4) return 0x10310800; /* vtable pointer */
+        return 1; /* status/flag byte */
     }
 
     /* Fast path: RAM (most common — ~90% of all accesses) */
@@ -3497,9 +3514,7 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
             }
         }
         ptx_frame++;
-        cpu->r[0] = 0;
-        cpu->r[15] = cpu->r[14] & ~3u;
-        return 1;
+        cpu->r[0] = 0; cpu->r[15] = cpu->r[14] & ~3u; return 1;
     }
 
 
@@ -3558,15 +3573,8 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         return 1;
     }
 
-    /* Skip render callbacks (10AE98xx) that access NULL entities.
-     * NULL trap handles reads but callbacks also call virtual methods
-     * through NULL vtable which corrupts stack. */
-    if (((VFlash*)ctx)->boot_phase >= 900 &&
-        addr >= 0x10AE9800 && addr < 0x10AE9A00) {
-        cpu->r[0] = 0;
-        cpu->r[15] = cpu->r[14] & ~3u;
-        return 1;
-    }
+    /* Render callbacks run natively — dummy vtable handles NULL entity
+     * virtual method calls safely (stubs return 0 immediately). */
 
     /* Render setup (10B263FC) — let it run natively.
      * This function may populate render_ctx with frame data.
@@ -5601,6 +5609,21 @@ void vflash_run_frame(VFlash *vf) {
         vf->lcd.upbase = 0x10048000; /* game's own render buffer */
         vf->lcd.control = 0x082D; /* 16bpp565, TFT, power, enabled */
         vf->boot_phase = 900;
+    }
+
+    /* Check if game wrote to framebuffer (every 100 frames) */
+    if (vf->boot_phase >= 900 && (vf->frame_count % 100) == 0) {
+        uint32_t nz = 0;
+        for (uint32_t c = 0x48000; c < 0x138000; c += 4)
+            if (*(uint32_t*)(vf->ram + c)) nz++;
+        if (nz > 0) {
+            static int fb_log = 0;
+            if (fb_log < 3) {
+                printf("[FB-CHECK] Frame %llu: %u non-zero dwords in framebuffer!\n",
+                       vf->frame_count, nz);
+                fb_log++;
+            }
+        }
     }
 
     /* PL111 LCD framebuffer blit: only when game actually writes to LCD
