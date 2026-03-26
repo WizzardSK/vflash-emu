@@ -3573,8 +3573,37 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         return 1;
     }
 
-    /* Render callbacks run natively — dummy vtable handles NULL entity
-     * virtual method calls safely (stubs return 0 immediately). */
+    /* HLE game alloc (10A775E0, 10A77648) and free (10A776A8).
+     * Bump allocator with dummy vtable at [+0] for safe virtual calls. */
+    if ((addr == 0x10A775E0 || addr == 0x10A77648) &&
+        ((VFlash*)ctx)->boot_phase >= 800) {
+        static uint32_t bump = 0x320000;
+        uint32_t size = cpu->r[0];
+        if (size > 0 && size < 0x10000 && bump + size < 0x380000) {
+            uint32_t ptr = 0x10000000 + bump;
+            VFlash *va = (VFlash*)ctx;
+            memset(va->ram + bump, 0, size);
+            *(uint32_t*)(va->ram + bump) = 0x10310800; /* dummy vtable */
+            va->ram[bump + 8] = 1;
+            *(uint32_t*)(va->ram + bump + 0x104) = 0x84;
+            bump = (bump + size + 15) & ~15u;
+            cpu->r[0] = ptr;
+        } else {
+            cpu->r[0] = 0;
+        }
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    if (addr == 0x10A776A8 && ((VFlash*)ctx)->boot_phase >= 800) {
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* Skip engine wait loop at 10A20B30 (BEQ polling for entity state) */
+    if (addr == 0x10A20B30 && ((VFlash*)ctx)->boot_phase >= 800) {
+        cpu->r[0] = 1;
+        cpu->r[15] += 4;
+        return 1;
+    }
 
     /* Render setup (10B263FC) — let it run natively.
      * This function may populate render_ctx with frame data.
