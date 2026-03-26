@@ -3550,6 +3550,17 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         return 1;
     }
 
+    /* Skip ALL render callback functions that crash on NULL entity data.
+     * 10AE98xx callbacks read entity context and call virtual methods.
+     * 10AB5660 and 10A6FC60 crash on NULL function pointers in entities. */
+    if (((VFlash*)ctx)->boot_phase >= 900 &&
+        addr >= 0x10AE9800 && addr < 0x10AE9A00) {
+        /* Skip entire callback — return to caller */
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+
     /* Render setup (10B263FC) — let it run natively.
      * This function may populate render_ctx with frame data.
      * Pre-loop calls it until non-zero; we no longer skip it. */
