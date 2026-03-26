@@ -5382,9 +5382,21 @@ void vflash_run_frame(VFlash *vf) {
                    *(uint32_t*)(vf->ram+d+8), *(uint32_t*)(vf->ram+d+12));
     }
 
-    /* Auto-launch game task after µMORE init stabilizes.
-     * On frame 120 (after init + bootstrap), find TCB with largest stack
-     * and launch it directly. Simple, no complex state tracking. */
+    /* Initialize kernel service dispatch vtable at [1000C76C].
+     * ROM function at ROM+A1C8 fills this but gets skipped in our boot flow.
+     * Contains function pointers for service lookup (+0x44) and request (+0x30). */
+    if (vf->has_rom && vf->boot_phase >= 100 && *(uint32_t*)(vf->ram+0xC7B0) == 0) {
+        *(uint32_t*)(vf->ram + 0xC798) = 0x10007A14;
+        *(uint32_t*)(vf->ram + 0xC79C) = 0x10007878; /* service request */
+        *(uint32_t*)(vf->ram + 0xC7A0) = 0x10007AB8;
+        *(uint32_t*)(vf->ram + 0xC7A4) = 0x10007558;
+        *(uint32_t*)(vf->ram + 0xC7A8) = 0x10007614;
+        *(uint32_t*)(vf->ram + 0xC7AC) = 0x100077AC;
+        *(uint32_t*)(vf->ram + 0xC7B0) = 0x10007E68; /* service lookup */
+        printf("[VTABLE] Kernel service dispatch table initialized\n");
+    }
+
+    /* Auto-launch game task after µMORE init stabilizes. */
     if (vf->has_rom && vf->frame_count == 75 && vf->boot_phase >= 100) {
         /* Use saved TCB info, or fall back to service entry as game task */
         uint32_t entry, sbase, ssz;
