@@ -3558,12 +3558,11 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         return 1;
     }
 
-    /* Skip ALL render callback functions that crash on NULL entity data.
-     * 10AE98xx callbacks read entity context and call virtual methods.
-     * 10AB5660 and 10A6FC60 crash on NULL function pointers in entities. */
+    /* Skip render callbacks (10AE98xx) that access NULL entities.
+     * NULL trap handles reads but callbacks also call virtual methods
+     * through NULL vtable which corrupts stack. */
     if (((VFlash*)ctx)->boot_phase >= 900 &&
         addr >= 0x10AE9800 && addr < 0x10AE9A00) {
-        /* Skip entire callback — return to caller */
         cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
@@ -5578,6 +5577,17 @@ void vflash_run_frame(VFlash *vf) {
             *(uint32_t*)(vf->ram + 0xBE3C40) = 0;       /* ctx[0] still 0 */
             *(uint32_t*)(vf->ram + 0xBE3C44) = 1;       /* ctx[1] = frame */
             *(uint32_t*)(vf->ram + 0xBE3C4C) = 0;       /* ctx[3] = no flags yet */
+            /* Set render state bytes that render loops poll.
+             * 10BE3CA0 (render_ctx+0x60): polled by 10A73924.
+             * 10BE49E0: another render struct polled in loops.
+             * Set all bytes in render_ctx to non-zero "ready" state. */
+            memset(vf->ram + 0xBE3C40, 1, 0x100);
+            /* Also set the second render struct area */
+            memset(vf->ram + 0xBE49E0, 1, 0x100);
+            /* Restore specific ctx values */
+            *(uint32_t*)(vf->ram + 0xBE3C40) = 0;  /* ctx[0] = no crash */
+            *(uint32_t*)(vf->ram + 0xBE3C44) = 1;  /* ctx[1] = frame */
+            *(uint32_t*)(vf->ram + 0xBE3C4C) = 0;  /* ctx[3] = no flags */
             printf("[ENTITY] Created 8 dummy entities at %08X\n", ent_addr);
         }
         /* Enter main game loop directly */
