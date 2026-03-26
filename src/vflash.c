@@ -3550,14 +3550,9 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         return 1;
     }
 
-    /* HLE render setup function (10B263FC).
-     * Pre-loop calls this until it returns non-zero (render ready).
-     * Return 1 to skip pre-loop and proceed to main game loop. */
-    if (addr == 0x10B263FC && ((VFlash*)ctx)->boot_phase >= 900) {
-        cpu->r[0] = 1; /* render ready */
-        cpu->r[15] = cpu->r[14] & ~3u;
-        return 1;
-    }
+    /* Render setup (10B263FC) — let it run natively.
+     * This function may populate render_ctx with frame data.
+     * Pre-loop calls it until non-zero; we no longer skip it. */
 
     /* HLE display setup (10A36A94).
      * Calls kernel sleep and screen config. Skip — we set LCD ourselves. */
@@ -5544,10 +5539,10 @@ void vflash_run_frame(VFlash *vf) {
          * But game_setup + walker are slow, so jump to buffer clear (109D1C9C). */
         /* Clear render buffer ourselves (HLE memset) */
         memset(vf->ram + 0x48000, 0, 0xF0000);
-        /* Jump directly to game loop, skipping pre-loop */
-        /* Render context stays at 0 — engine subsystems need event-driven init */
-        printf("[GAME-LOOP] Entering main game loop at 0x109D1CE0\n");
-        vf->cpu.r[15] = 0x109D1CE0;
+        /* Jump to pre-loop (tick + render_setup + sync) then main game loop.
+         * render_setup (10B263FC) runs natively to populate render_ctx. */
+        printf("[GAME-LOOP] Entering pre-loop at 0x109D1CB8\n");
+        vf->cpu.r[15] = 0x109D1CB8;
         vf->cpu.cpsr = 0x000000D3;  /* SVC mode, IRQ+FIQ disabled */
         vf->timer.timer[0].ctrl = 0;
         vf->timer.irq.enable = 0;
