@@ -3557,9 +3557,6 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         return 1;
     }
 
-    /* Kernel service dispatch runs natively through vtable at [1000C76C].
-     * Vtable initialized in per-frame code with function pointers from ROM.
-     * Functions at 10007E68 (lookup) and 10007878 (request) are valid in RAM. */
 
     /* CD-ROM init (FUN_10a363e8) — let it run natively.
      * With HLE service lookup/request above, it should work now. */
