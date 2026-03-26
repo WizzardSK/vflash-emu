@@ -3557,39 +3557,9 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         return 1;
     }
 
-    /* HLE kernel service dispatch.
-     * FUN_10008514 (lookup) calls *[*[1000C76C]+0x44](service_id).
-     * FUN_10008414 (request) calls *[*[1000C76C]+0x30](id, buf, size).
-     * We intercept these kernel functions directly. */
-    if (addr == 0x10008514 && ((VFlash*)ctx)->boot_phase >= 800) {
-        /* Service lookup: return 0x22 (service found) for CD-ROM services */
-        uint32_t svc_id = cpu->r[0];
-        if (svc_id == 0xE000 || svc_id == 0xF000) {
-            cpu->r[0] = 0x22; /* service registered */
-        } else {
-            cpu->r[0] = 0; /* not found */
-        }
-        cpu->r[15] = cpu->r[14] & ~3u;
-        return 1;
-    }
-    if (addr == 0x10008414 && ((VFlash*)ctx)->boot_phase >= 800) {
-        /* Service request: handle CD-ROM queries.
-         * R0=service_id, R1=output_buffer, R2=request_size */
-        VFlash *vf2 = (VFlash*)ctx;
-        uint32_t svc_id = cpu->r[0];
-        uint32_t out_buf = cpu->r[1];
-        if ((svc_id == 0xE000 || svc_id == 0xF000) &&
-            out_buf >= 0x10000000 && out_buf < 0x11000000) {
-            uint8_t *buf = vf2->ram + (out_buf - 0x10000000);
-            /* Return disc capacity info: 0x7FFFF sectors */
-            *(uint32_t*)(buf + 0) = 0x0007FFFF;
-            memset(buf + 4, 0, 12);
-            printf("[HLE-SVC] CD request svc=%X → capacity 0x7FFFF\n", svc_id);
-        }
-        cpu->r[0] = 0; /* success */
-        cpu->r[15] = cpu->r[14] & ~3u;
-        return 1;
-    }
+    /* Kernel service dispatch runs natively through vtable at [1000C76C].
+     * Vtable initialized in per-frame code with function pointers from ROM.
+     * Functions at 10007E68 (lookup) and 10007878 (request) are valid in RAM. */
 
     /* CD-ROM init (FUN_10a363e8) — let it run natively.
      * With HLE service lookup/request above, it should work now. */
@@ -5398,20 +5368,32 @@ void vflash_run_frame(VFlash *vf) {
 
     /* Auto-launch game task after µMORE init stabilizes. */
     if (vf->has_rom && vf->frame_count == 75 && vf->boot_phase >= 100) {
-        /* Use saved TCB info, or fall back to service entry as game task */
-        uint32_t entry, sbase, ssz;
-        if (vf->saved_game_entry) {
-            entry = vf->saved_game_entry;
-            sbase = vf->saved_game_stack;
-            ssz = vf->saved_game_stack_sz;
-        } else {
-            /* No valid TCB found — use service entry address from SDRAM.
-             * Service entry is set during BOOT.BIN init at [FFCC/FFD0]. */
+        /* Find game task: scan for $QCB with largest stack.
+         * Relaxed check — don't require $QBT sub-magic (some games don't have it). */
+        uint32_t entry = 0, sbase = 0, ssz = 0;
+        {
+            uint32_t best_a = 0, best_sz = 0;
+            for (uint32_t a = 0x100000; a < 0xC00000; a += 4) {
+                if (*(uint32_t*)(vf->ram+a) == 0x42435124) { /* $QCB */
+                    uint32_t e = *(uint32_t*)(vf->ram+a+0x2C);
+                    uint32_t s = *(uint32_t*)(vf->ram+a+0x34);
+                    if (e >= 0x10090000 && e < 0x10E00000 && s > best_sz) {
+                        best_sz = s; best_a = a;
+                    }
+                }
+            }
+            if (best_a) {
+                entry = *(uint32_t*)(vf->ram+best_a+0x2C);
+                sbase = *(uint32_t*)(vf->ram+best_a+0x30);
+                ssz = best_sz;
+            }
+        }
+        if (!entry) {
             entry = *(uint32_t*)(vf->ram + 0xFFD0);
             if (entry < 0x10090000 || entry >= 0x10E00000)
                 entry = *(uint32_t*)(vf->ram + 0xFFCC);
-            sbase = 0x10B6DB28;  /* default stack base */
-            ssz = 0x20000;       /* 128KB stack */
+            sbase = 0x10B6DB28;
+            ssz = 0x20000;
             printf("[AUTO-LAUNCH] No TCB, using service entry %08X\n", entry);
         }
         {
