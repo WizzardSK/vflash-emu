@@ -3481,12 +3481,16 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         return 1;
     }
 
-    /* Skip 109D2754 (state machine) always during init — entity data
-     * is uninitialized, causes infinite loops regardless of R0. */
+    /* 109D2754 (state machine): force object state to "done" (0x84).
+     * The function checks [param_1 + 0x104] for state. States:
+     * 0=idle, 1=loading, 2=ready→process, 0x84+=done→return.
+     * By setting state=0x84, function returns immediately (already processed). */
     if (addr == 0x109D2754 && ((VFlash*)ctx)->boot_phase >= 800) {
-        cpu->r[0] = 0;
-        cpu->r[15] = cpu->r[14] & ~3u;
-        return 1;
+        uint32_t obj = cpu->r[0];
+        if (obj >= 0x10000000 && obj + 0x108 < 0x10000000 + VFLASH_RAM_SIZE) {
+            *(uint32_t*)(((VFlash*)ctx)->ram + (obj - 0x10000000) + 0x104) = 0x84;
+        }
+        return 0; /* let it run — will return immediately with state=0x84 */
     }
     if (addr == 0x10A355A4 && ((VFlash*)ctx)->boot_phase >= 800 &&
         (cpu->r[0] < 0x10000000 || cpu->r[0] >= 0x11000000)) {
