@@ -31,11 +31,13 @@ Background voice/SFX audio plays automatically from 561 WAV files on disc.
 
 ## Status
 
-**Game engine running natively with entity system** — µMORE v4.0 RTOS boots,
+**Game engine running natively with render pipeline** — µMORE v4.0 RTOS boots,
 game task launched, native kernel service dispatch through vtable, CD-ROM init
 succeeds natively. VFF scene data loaded, scene builder allocates 320KB of entity
 data via HLE alloc. Game loop runs with all engine subsystems executing natively.
-VFF tile graphics and PTX sprite artwork display on screen.
+Native render function recovered from BOOT.BIN, render_init HLE'd (3-step state
+machine), render processing runs with instruction budget. PTX sprite artwork
+from disc displayed on screen.
 
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spider-Man.
 
@@ -66,17 +68,21 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **Game loop** | ✅ tick→sync→render, all subsystems active |
 | **NULL entity protection** | ✅ Dummy vtable + read trap for safe execution |
 | **Native render function** | ✅ Copied from BOOT.BIN (10D615FC→10B265E8) |
-| **Render processing** | 🔧 Calls 10A89100 but loops on dummy entities |
+| **HLE render_init** | ✅ 3-step state machine bypassed, all flags set |
+| **Render processing** | 🔧 Runs with 50K instruction budget (entity stubs) |
 | **PTX display** | ✅ Game artwork (XBGR1555 sprites) on screen |
 
 ### Remaining for gameplay
 
 Game engine runs natively with 320KB of allocated entity data. Native render
-function copied from BOOT.BIN location — the BOOT.BIN bootstrap never relocated
-it to the target address. Render processing (10A89100) enters the software
-render pipeline but loops forever on dummy entity vtable stubs. VFF tile
-graphics are in proprietary compressed format requiring the game's ARM decoder.
-PTX sprite artwork displayed as fallback while entity system is developed.
+function recovered from BOOT.BIN — bootstrap never relocated it to target
+address (10B265E8 had data, not code). Render_init is a 3-step state machine
+(subsystem_ready → queue_ready → objects_ready) that gets stuck in RTOS task
+queue tree traversal — HLE'd to set all flags instantly. Render processing
+(10A89100) enters the software render pipeline with 50K instruction budget per
+frame, but entity vtable draw methods are dummy stubs (return 0). VFF tile
+graphics are in proprietary compressed format requiring the game's ARM decoder
+(VFF sec[0]). PTX sprite artwork displayed as game scene fallback.
 
 **Key HLE components**:
 - Game alloc (10A775E0, 10A77648): bump allocator with dummy vtable
@@ -84,7 +90,9 @@ PTX sprite artwork displayed as fallback while entity system is developed.
 - Dummy vtable at 0x10310800: 64 ARM stubs (MOV R0,#0; BX LR)
 - Engine wait skip (10A20B30): breaks BEQ loop waiting for entity state
 - Render function copy: 192 bytes from BOOT.BIN (10D615FC→10B265E8)
-- Render state pre-fill: 10BE3C40/10BE49E0 areas set to ready state
+- HLE render_init (10A881F0): sets subsystem/queue/objects ready flags
+- Render budget: 50K instructions per frame, force return if stuck
+- Render state pre-fill: 10BE3C40 area (0x300 bytes) set to ready state
 - State machine fix: force [param_1+0x104] = 0x84 (done) at 109D2754
 - Game mode fix: intercept [10B902C0] reads, return 3 (not 4=error)
 - ATAPI sense fix: no error (0x00) instead of unit attention (0x06)
@@ -183,6 +191,9 @@ ROM[0x00] → flash copy → flash remap (0x118)
 | Invalid ptr deref | 10A355A4/109D2754 loop on garbage | Skip when R0 outside RAM range |
 | Auto-launch too late | Frame 200 unreachable (delay loop) | Changed to frame 75 |
 | IRQ handler stuck | 0x900D0018 returns wrong value | Return 0 during game phase |
+| Render fn not relocated | BL 10B265E8 hit data, not code | Copy 192B from BOOT.BIN 10D615FC |
+| Render_init stuck | RTOS task queue tree loop | HLE: set 3 ready flags, return |
+| Render_proc infinite | Entity draw stubs never finish | 50K instruction budget per frame |
 
 ### Subsystems
 - ATAPI CD-ROM: INQUIRY, READ(10), READ CD, READ TOC, READ CAPACITY, MODE SENSE
