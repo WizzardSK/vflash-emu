@@ -248,6 +248,7 @@ struct VFlash {
     int      bp_hit;   /* set by vflash_step() when BP hit */
 
     int      boot_phase; /* Boot flow phase tracking */
+    int      render_budget; /* Instructions remaining in render pipeline (0=unlimited) */
     uint32_t flash_last_write; /* Last value written to NOR flash (for status polling) */
     /* Saved game task info from BOOT TCB scan (before service entry may overwrite) */
     uint32_t saved_game_entry;
@@ -3445,24 +3446,67 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     /* Dump game state on first render call */
     /* Force render_ctx[0]=1 when render processing is called.
      * This makes FUN_10a89100 enter processing path instead of returning. */
-    /* Render_init (10A881F0) — let it run.
-     * GPU completion flag at [10BE3CA0] forced to 1 via write intercept.
-     * This should prevent render_init from looping on GPU polling. */
-    if (addr == 0x10A89100 && ((VFlash*)ctx)->boot_phase >= 900) {
-        static int r_log = 0;
-        if (r_log < 3) { printf("[10A89100] render_processing skipped (R0=%08X)\n", cpu->r[0]); r_log++; }
-        /* Skip render_processing — it loops forever on dummy entities.
-         * Return 0 immediately (R0=0 = no error). */
-        cpu->r[0] = 0;
+    /* HLE render_init (10A881F0): 3-step state machine that sets up render
+     * subsystems. Gets stuck in RTOS task queue tree traversal (10A6AC60).
+     * Set all ready flags and return — lets caller set render_enable=1. */
+    if (addr == 0x10A881F0 && ((VFlash*)ctx)->boot_phase >= 900) {
+        VFlash *vf2 = (VFlash*)ctx;
+        /* Set render subsystem ready flags (outside memset range) */
+        vf2->ram[0xBE3EA0] = 1;  /* +0x260: render_subsystem_ready */
+        vf2->ram[0xBE3C80] = 1;  /* +0x40: render_queue_ready */
+        vf2->ram[0xBE3E20] = 1;  /* +0x1E0: render_objects_ready */
+        /* Pre-fill render context area with ready state */
+        memset(vf2->ram + 0xBE3C40, 1, 0x300); /* cover all flags */
+        /* Set render_enable — caller will also set it but be safe */
+        vf2->ram[0xBE3EC0] = 1;
+        static int ri_log = 0;
+        if (ri_log < 3) {
+            printf("[HLE-RENDER-INIT] Set all ready flags, returning\n");
+            ri_log++;
+        }
+        cpu->r[0] = cpu->r[0]; /* preserve R0 (render_ctx) */
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
+    /* Render processing (10A89100): software render pipeline.
+     * Runs natively but with instruction budget to prevent infinite loops
+     * on dummy entity vtable stubs. Budget allows partial rendering. */
+    if (addr == 0x10A89100 && ((VFlash*)ctx)->boot_phase >= 900) {
+        static int r_log = 0;
+        VFlash *vf2 = (VFlash*)ctx;
+        if (r_log < 3) {
+            printf("[RENDER-PROC] render_processing called (R0=%08X)\n", cpu->r[0]);
+            r_log++;
+        }
+        /* Set instruction budget: after 50000 instructions in render_processing,
+         * check if we're still inside it and force return if stuck. */
+        vf2->render_budget = 50000;
+        return 0; /* let it run natively */
+    }
+    /* Check render budget (counted in main CPU loop) */
+    if (((VFlash*)ctx)->render_budget > 0) {
+        VFlash *vf2 = (VFlash*)ctx;
+        vf2->render_budget--;
+        if (vf2->render_budget == 0) {
+            /* Budget expired — check if still in render pipeline (10A8xxxx-10ABxxxx) */
+            if (addr >= 0x10A80000 && addr < 0x10AC0000) {
+                static int budget_log = 0;
+                if (budget_log < 5)
+                    printf("[RENDER-BUDGET] Expired at PC=%08X, forcing return\n", addr);
+                budget_log++;
+                /* Force return to render_frame caller */
+                cpu->r[0] = 0;
+                cpu->r[15] = 0x109D1CEC; /* game loop after BL render */
+                cpu->r[13] = 0x10B8DA90; /* safe SP */
+                return 1;
+            }
+        }
+    }
     if (addr == 0x10B265E8 && ((VFlash*)ctx)->boot_phase >= 900) {
         /* Render function — real code copied from BOOT.BIN location.
-         * Force render_enable=1 to skip render_init (gets stuck in task queue).
-         * This makes the function call render_processing directly. */
-        *(uint8_t*)(((VFlash*)ctx)->ram + 0xBE3EC0) = 1;
-        return 0; /* let native render function execute */
+         * Let it run natively — render_init is HLE'd, render_enable
+         * will be set by render_init HLE + native caller code. */
+        return 0;
     }
 
 
@@ -5719,27 +5763,10 @@ void vflash_run_frame(VFlash *vf) {
                 }
             }
             vf->vid.fb_dirty = 1;
-            static int tl = 0;
-            if (!tl) {
+            static int ptx_log = 0;
+            if (!ptx_log) {
                 printf("[GAME-DISPLAY] PTX #%d rendered to framebuffer\n", ptx_idx);
-                /* Save screenshot from ARGB32 framebuffer */
-                FILE *sf = fopen("/tmp/vflash_screen.bmp", "wb");
-                if (sf) {
-                    int w=320,h=240,rs=w*3,pad=(4-rs%4)%4,isz=(rs+pad)*h;
-                    uint8_t hd[54]={0}; hd[0]='B';hd[1]='M';
-                    *(uint32_t*)(hd+2)=54+isz; *(uint32_t*)(hd+10)=54;
-                    *(uint32_t*)(hd+14)=40; *(int32_t*)(hd+18)=w;
-                    *(int32_t*)(hd+22)=-h; *(uint16_t*)(hd+26)=1;
-                    *(uint16_t*)(hd+28)=24; *(uint32_t*)(hd+34)=isz;
-                    fwrite(hd,1,54,sf);
-                    for(int y2=0;y2<h;y2++){for(int x2=0;x2<w;x2++){
-                        uint32_t px=vf->framebuf[y2*w+x2];
-                        uint8_t rgb[3]={px&0xFF,(px>>8)&0xFF,(px>>16)&0xFF};
-                        fwrite(rgb,1,3,sf);}
-                        uint8_t z[4]={0};if(pad)fwrite(z,1,pad,sf);}
-                    fclose(sf);
-                }
-                tl=1;
+                ptx_log = 1;
             }
         }
     }
