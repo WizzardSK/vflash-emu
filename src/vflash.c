@@ -3555,6 +3555,21 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         }
     }
 
+    /* Log vtable stub calls to find which virtual methods render uses */
+    if (addr >= 0x10310000 && addr < 0x10310800 &&
+        ((VFlash*)ctx)->boot_phase >= 900) {
+        int slot = (addr - 0x10310000) / 8;
+        static uint32_t stub_count[64] = {0};
+        static int total_stubs = 0;
+        stub_count[slot]++;
+        total_stubs++;
+        if (stub_count[slot] <= 2) {
+            printf("[VSTUB] slot[%d] R0=%08X R1=%08X LR=%08X (total=%d)\n",
+                   slot, cpu->r[0], cpu->r[1], cpu->r[14], total_stubs);
+        }
+        return 0; /* let stub execute */
+    }
+
     /* Init function table walker (109D26FC) — let it run.
      * 109D2754 (state machine) is still skipped to prevent loops.
      * Walker calls 21 functions that initialize render engine layers/state. */
@@ -5559,6 +5574,16 @@ void vflash_run_frame(VFlash *vf) {
                     if (pc == 0x10FFF000 || (pc > 0x11000000 && pc < 0x80000000)) break;
                 }
                 printf("[VFF-SCENE] Entity callback: %d steps\n", si);
+                /* Re-set dummy vtable on ALL allocated entities.
+                 * Scene callback overwrites [entity+0] with data (0xBDBDBDBD).
+                 * Restore vtable pointer so virtual method calls go to stubs. */
+                for (uint32_t ea = 0x320000; ea < 0x380000; ea += 0x10) {
+                    uint32_t v = *(uint32_t*)(vf->ram + ea);
+                    if (v != 0 && v != 0x10310800) {
+                        *(uint32_t*)(vf->ram + ea) = 0x10310800;
+                    }
+                }
+                printf("[VFF-SCENE] Restored dummy vtable on alloc'd entities\n");
                 vf->cpu.r[15]=spc; vf->cpu.r[13]=ssp;
                 vf->cpu.r[14]=slr; vf->cpu.cpsr=scp;
             }
