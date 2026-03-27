@@ -3492,7 +3492,7 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         if (0) {
         }
         ptx_frame++;
-        cpu->r[0] = 0; cpu->r[15] = cpu->r[14] & ~3u; return 1;
+        return 0; /* let native render run — init + processing */
     }
 
 
