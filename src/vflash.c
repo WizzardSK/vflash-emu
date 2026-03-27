@@ -3428,12 +3428,7 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
      * Let non-blocking init functions run to populate game state. */
     /* Dump game state on first render call */
     if (addr == 0x10B265E8 && ((VFlash*)ctx)->boot_phase >= 900) {
-        static int dump_once = 0;
-        if (!dump_once) {
-            VFlash *vd = (VFlash*)ctx;
-        }
         VFlash *vf2 = (VFlash*)ctx;
-        *(uint8_t*)(vf2->ram + 0xBE3EC0) = 1;
         /* PTX fallback: draw game artwork when native render produces nothing */
         static int ptx_frame = 0;
         static uint16_t *ptx_cache[4] = {NULL,NULL,NULL,NULL};
@@ -3591,8 +3586,12 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
-    /* Skip engine wait loop at 10A20B30 (BEQ polling for entity state) */
-    if (addr == 0x10A20B30 && ((VFlash*)ctx)->boot_phase >= 800) {
+    /* Skip engine wait loops (BEQ/polling loops for entity/GPU state) */
+    /* Skip GPU/render polling loops. These functions poll render state
+     * variables that never get set without a running GPU/vsync system. */
+    if (((VFlash*)ctx)->boot_phase >= 800 &&
+        (addr == 0x10A20B30 ||
+         (addr >= 0x10A73900 && addr <= 0x10A739C0))) {
         cpu->r[0] = 1;
         cpu->r[15] += 4;
         return 1;
@@ -4090,7 +4089,7 @@ void vflash_run_frame(VFlash *vf) {
             }
 
             /* POST-INIT disabled — bootstrap launched from init halt instead. */
-            if (0 && vf->boot_phase == 400 && pc == 0x1001158C) {
+            if (vf->boot_phase == 400 && pc == 0x1001158C) {
                 static int post_init = 0;
                 post_init++;
                 if (post_init == 100) { /* let a few ticks pass */
@@ -4252,7 +4251,7 @@ void vflash_run_frame(VFlash *vf) {
             }
 
             /* Dump scheduler loop once at frame 85 (disabled) */
-            if (0 && vf->boot_phase >= 300 && vf->boot_phase < 400 && vf->frame_count == 85) {
+            if (vf->boot_phase >= 300 && vf->boot_phase < 400 && vf->frame_count == 85) {
                 vf->boot_phase = 400;
                 printf("[SCHED] Loop dump at frame 85, PC=0x%08X:\n", pc);
                 /* Dump around current PC */
@@ -5524,6 +5523,18 @@ void vflash_run_frame(VFlash *vf) {
                        *(uint32_t*)(vf->ram+0x500808),
                        *(uint32_t*)(vf->ram+0x50080C),
                        *(uint32_t*)(vf->ram+0x500810));
+                /* Call scene render callback to populate entities */
+                vf->cpu.r[0] = 0x10300000;
+                vf->cpu.r[15] = 0x104E5C00;
+                vf->cpu.r[14] = 0x10FFF000;
+                vf->cpu.r[13] = 0x10B8D000;
+                vf->cpu.cpsr = 0x000000D3;
+                for (si = 0; si < 500000; si++) {
+                    arm9_step(&vf->cpu);
+                    uint32_t pc = vf->cpu.r[15];
+                    if (pc == 0x10FFF000 || (pc > 0x11000000 && pc < 0x80000000)) break;
+                }
+                printf("[VFF-SCENE] Entity callback: %d steps\n", si);
                 vf->cpu.r[15]=spc; vf->cpu.r[13]=ssp;
                 vf->cpu.r[14]=slr; vf->cpu.cpsr=scp;
             }
@@ -5636,7 +5647,7 @@ void vflash_run_frame(VFlash *vf) {
     /* Simple tile renderer: read VFF sec[1] graphics and blit to framebuffer.
      * VFF sec[1] is at 0x10501800 (loaded during init).
      * Tiles are proprietary format but raw bytes can be displayed as grayscale. */
-    if (vf->boot_phase >= 900 && (vf->frame_count % 2) == 0) {
+    if (vf->boot_phase >= 900 && (vf->frame_count % 2) == 0) { /* disabled */
         uint32_t gfx_base = 0x501800; /* VFF sec[1] in RAM */
         {
             /* Blit VFF graphics data to LCD framebuffer as raw pixel data.
@@ -5713,9 +5724,27 @@ void vflash_run_frame(VFlash *vf) {
             }
             vf->vid.fb_dirty = 1;
             static int lcd_blit_log = 0;
-            if (!lcd_blit_log) {
-                printf("[LCD-BLIT] 16bpp blit from fb=0x%08X\n", vf->lcd.upbase);
-                lcd_blit_log = 1;
+            if (lcd_blit_log < 3) {
+                /* Save screenshot every 100 blits */
+                if (lcd_blit_log == 2) {
+                    FILE *sf = fopen("/tmp/vflash_screen.bmp","wb");
+                    if (sf) {
+                        int w=320,h=240,rs=w*3,pad=(4-rs%4)%4,isz=(rs+pad)*h;
+                        uint8_t hd[54]={0}; hd[0]='B';hd[1]='M';
+                        *(uint32_t*)(hd+2)=54+isz; *(uint32_t*)(hd+10)=54;
+                        *(uint32_t*)(hd+14)=40; *(int32_t*)(hd+18)=w;
+                        *(int32_t*)(hd+22)=-h; *(uint16_t*)(hd+26)=1;
+                        *(uint16_t*)(hd+28)=24; *(uint32_t*)(hd+34)=isz;
+                        fwrite(hd,1,54,sf);
+                        for(int y2=0;y2<h;y2++){for(int x2=0;x2<w;x2++){
+                            uint32_t px=vf->framebuf[y2*w+x2];
+                            uint8_t rgb[3]={px&0xFF,(px>>8)&0xFF,(px>>16)&0xFF};
+                            fwrite(rgb,1,3,sf);}
+                            uint8_t z[4]={0};if(pad)fwrite(z,1,pad,sf);}
+                        fclose(sf);
+                    }
+                }
+                lcd_blit_log++;
             }
         } else if (bpp_code == 5) {
             /* 24-bit or 32-bit ARGB */
