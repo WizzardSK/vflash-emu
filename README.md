@@ -65,21 +65,25 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **VFF tile display** | ✅ sec[1] graphics rendered to LCD framebuffer |
 | **Game loop** | ✅ tick→sync→render, all subsystems active |
 | **NULL entity protection** | ✅ Dummy vtable + read trap for safe execution |
-| **Native render init** | 🔧 Runs but stuck on GPU frame completion polling |
+| **Native render function** | ✅ Copied from BOOT.BIN (10D615FC→10B265E8) |
+| **Render processing** | 🔧 Calls 10A89100 but loops on dummy entities |
+| **PTX display** | ✅ Game artwork (XBGR1555 sprites) on screen |
 
 ### Remaining for gameplay
 
-Game engine runs natively with 320KB of allocated entity data. VFF scene
-callback populates entities with scene data. Render init runs but gets stuck
-polling for GPU frame completion at `10A73918` (render state loop). VFF
-graphics are in proprietary compressed format — raw display shows tile
-structure but needs the game's ARM decoder (VFF sec[0]) for proper rendering.
+Game engine runs natively with 320KB of allocated entity data. Native render
+function copied from BOOT.BIN location — the BOOT.BIN bootstrap never relocated
+it to the target address. Render processing (10A89100) enters the software
+render pipeline but loops forever on dummy entity vtable stubs. VFF tile
+graphics are in proprietary compressed format requiring the game's ARM decoder.
+PTX sprite artwork displayed as fallback while entity system is developed.
 
 **Key HLE components**:
 - Game alloc (10A775E0, 10A77648): bump allocator with dummy vtable
 - NULL entity read trap: returns ready(1) for [0x00-0x1F] (breaks ALL polling loops)
 - Dummy vtable at 0x10310800: 64 ARM stubs (MOV R0,#0; BX LR)
 - Engine wait skip (10A20B30): breaks BEQ loop waiting for entity state
+- Render function copy: 192 bytes from BOOT.BIN (10D615FC→10B265E8)
 - Render state pre-fill: 10BE3C40/10BE49E0 areas set to ready state
 - State machine fix: force [param_1+0x104] = 0x84 (done) at 109D2754
 - Game mode fix: intercept [10B902C0] reads, return 3 (not 4=error)
