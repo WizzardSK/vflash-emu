@@ -3493,25 +3493,8 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
             vf2->vid.fb_dirty = 1;
         }
 
-        /* Save screenshot on frame 5 (after sprites are composited) */
-        if (ptx_frame == 5) {
-            FILE *bf = fopen("/tmp/vflash_screen.bmp", "wb");
-            if (bf) {
-                int w=VFLASH_SCREEN_W, h=VFLASH_SCREEN_H;
-                int rs=w*3, pad=(4-rs%4)%4, isz=(rs+pad)*h;
-                uint8_t hd[54]={0}; hd[0]='B';hd[1]='M';
-                *(uint32_t*)(hd+2)=54+isz; *(uint32_t*)(hd+10)=54;
-                *(uint32_t*)(hd+14)=40; *(int32_t*)(hd+18)=w;
-                *(int32_t*)(hd+22)=-h; *(uint16_t*)(hd+26)=1;
-                *(uint16_t*)(hd+28)=24; *(uint32_t*)(hd+34)=isz;
-                fwrite(hd,1,54,bf);
-                for(int y2=0;y2<h;y2++){for(int x2=0;x2<w;x2++){
-                    uint32_t p2=vf2->framebuf[y2*w+x2];
-                    uint8_t rgb[3]={p2&0xFF,(p2>>8)&0xFF,(p2>>16)&0xFF};
-                    fwrite(rgb,1,3,bf);}
-                    uint8_t z[4]={0};if(pad)fwrite(z,1,pad,bf);}
-                fclose(bf);
-            }
+        /* PTX screenshot removed — tile renderer saves screenshot instead */
+        if (0) {
         }
         ptx_frame++;
         cpu->r[0] = 0; cpu->r[15] = cpu->r[14] & ~3u; return 1;
@@ -3575,7 +3558,17 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
 
     /* HLE game alloc (10A775E0, 10A77648) and free (10A776A8).
      * Bump allocator with dummy vtable at [+0] for safe virtual calls. */
-    if ((addr == 0x10A775E0 || addr == 0x10A77648) &&
+    /* Let 10A775E0 (main alloc) run natively — it may create objects with
+     * real vtables. Only HLE 10A77648 (variant that crashes on 40000010). */
+    if (addr == 0x10A775E0 && ((VFlash*)ctx)->boot_phase >= 800) {
+        static int na_log = 0;
+        if (na_log < 5) {
+            printf("[NATIVE-ALLOC] 10A775E0(size=%u) LR=%08X\n", cpu->r[0], cpu->r[14]);
+            na_log++;
+        }
+        return 0; /* let it run natively */
+    }
+    if (addr == 0x10A77648 &&
         ((VFlash*)ctx)->boot_phase >= 800) {
         static uint32_t bump = 0x320000;
         uint32_t size = cpu->r[0];
@@ -5640,25 +5633,59 @@ void vflash_run_frame(VFlash *vf) {
         vf->boot_phase = 900;
     }
 
-    /* Scan ALL RAM for framebuffer writes (every 200 frames) */
-    if (vf->boot_phase >= 900 && (vf->frame_count % 200) == 0 && vf->frame_count > 100) {
-        static int scan_log = 0;
-        if (scan_log < 2) {
-            /* Check multiple possible framebuffer locations */
-            struct { uint32_t start; uint32_t end; const char *name; } areas[] = {
-                {0x48000, 0x138000, "render_buf"},
-                {0x800000, 0x900000, "lcd_area"},
-                {0x200000, 0x300000, "vff_load"},
-                {0x320000, 0x380000, "alloc_pool"},
-            };
-            for (int ai = 0; ai < 4; ai++) {
-                uint32_t nz = 0;
-                for (uint32_t c = areas[ai].start; c < areas[ai].end; c += 4)
-                    if (*(uint32_t*)(vf->ram + c)) nz++;
-                if (nz > 0)
-                    printf("[RAM-SCAN] %s: %u non-zero dwords\n", areas[ai].name, nz);
+    /* Simple tile renderer: read VFF sec[1] graphics and blit to framebuffer.
+     * VFF sec[1] is at 0x10501800 (loaded during init).
+     * Tiles are proprietary format but raw bytes can be displayed as grayscale. */
+    if (vf->boot_phase >= 900 && (vf->frame_count % 2) == 0) {
+        uint32_t gfx_base = 0x501800; /* VFF sec[1] in RAM */
+        {
+            /* Blit VFF graphics data to LCD framebuffer as raw pixel data.
+             * Try interpreting as 8bpp tiles at 320px width. */
+            uint16_t *fb = (uint16_t*)(vf->ram + 0x48000);
+            uint8_t *gfx = vf->ram + gfx_base;
+            /* Skip zero header, find first non-zero data */
+            uint32_t data_start = 0;
+            for (uint32_t i = 0; i < 0x10000; i++) {
+                if (gfx[i] != 0) { data_start = i; break; }
             }
-            scan_log++;
+            /* Render as 8bpp grayscale at 320 pixels wide */
+            for (int y = 0; y < 240; y++) {
+                for (int x = 0; x < 320; x++) {
+                    uint32_t idx = data_start + y * 320 + x;
+                    if (idx < 0x100000) {
+                        uint8_t val = gfx[idx];
+                        /* 8bpp → RGB565 grayscale */
+                        uint16_t r = (val >> 3) & 0x1F;
+                        uint16_t g = (val >> 2) & 0x3F;
+                        uint16_t b = (val >> 3) & 0x1F;
+                        fb[y * 320 + x] = (r << 11) | (g << 5) | b;
+                    }
+                }
+            }
+            vf->vid.fb_dirty = 0;
+            static int tl = 0;
+            if (!tl) {
+                printf("[TILE-RENDER] VFF sec[1] as 8bpp from +%X to fb\n", data_start);
+                /* Save screenshot from RAM framebuffer */
+                FILE *sf = fopen("/tmp/vflash_screen.bmp", "wb");
+                if (sf) {
+                    int w=320,h=240,rs=w*3,pad=(4-rs%4)%4,isz=(rs+pad)*h;
+                    uint8_t hd[54]={0}; hd[0]='B';hd[1]='M';
+                    *(uint32_t*)(hd+2)=54+isz; *(uint32_t*)(hd+10)=54;
+                    *(uint32_t*)(hd+14)=40; *(int32_t*)(hd+18)=w;
+                    *(int32_t*)(hd+22)=-h; *(uint16_t*)(hd+26)=1;
+                    *(uint16_t*)(hd+28)=24; *(uint32_t*)(hd+34)=isz;
+                    fwrite(hd,1,54,sf);
+                    for(int y2=0;y2<h;y2++){for(int x2=0;x2<w;x2++){
+                        uint16_t px=fb[y2*w+x2];
+                        uint8_t r2=((px>>11)&0x1F)<<3, g2=((px>>5)&0x3F)<<2, b2=(px&0x1F)<<3;
+                        uint8_t rgb[3]={b2,g2,r2};
+                        fwrite(rgb,1,3,sf);}
+                        uint8_t z[4]={0};if(pad)fwrite(z,1,pad,sf);}
+                    fclose(sf);
+                }
+                tl=1;
+            }
         }
     }
 
