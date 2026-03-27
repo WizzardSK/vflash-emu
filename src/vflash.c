@@ -3604,7 +3604,7 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
      * variables that never get set without a running GPU/vsync system. */
     if (((VFlash*)ctx)->boot_phase >= 800 &&
         (addr == 0x10A20B30 ||
-         (addr >= 0x10A73900 && addr <= 0x10A739C0))) {
+         (addr >= 0x10A73900 && addr <= 0x10A73A00))) {
         cpu->r[0] = 1;
         cpu->r[15] += 4;
         return 1;
