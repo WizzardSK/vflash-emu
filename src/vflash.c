@@ -5640,18 +5640,25 @@ void vflash_run_frame(VFlash *vf) {
         vf->boot_phase = 900;
     }
 
-    /* Check if game wrote to framebuffer (every 100 frames) */
-    if (vf->boot_phase >= 900 && (vf->frame_count % 100) == 0) {
-        uint32_t nz = 0;
-        for (uint32_t c = 0x48000; c < 0x138000; c += 4)
-            if (*(uint32_t*)(vf->ram + c)) nz++;
-        if (nz > 0) {
-            static int fb_log = 0;
-            if (fb_log < 3) {
-                printf("[FB-CHECK] Frame %llu: %u non-zero dwords in framebuffer!\n",
-                       vf->frame_count, nz);
-                fb_log++;
+    /* Scan ALL RAM for framebuffer writes (every 200 frames) */
+    if (vf->boot_phase >= 900 && (vf->frame_count % 200) == 0 && vf->frame_count > 100) {
+        static int scan_log = 0;
+        if (scan_log < 2) {
+            /* Check multiple possible framebuffer locations */
+            struct { uint32_t start; uint32_t end; const char *name; } areas[] = {
+                {0x48000, 0x138000, "render_buf"},
+                {0x800000, 0x900000, "lcd_area"},
+                {0x200000, 0x300000, "vff_load"},
+                {0x320000, 0x380000, "alloc_pool"},
+            };
+            for (int ai = 0; ai < 4; ai++) {
+                uint32_t nz = 0;
+                for (uint32_t c = areas[ai].start; c < areas[ai].end; c += 4)
+                    if (*(uint32_t*)(vf->ram + c)) nz++;
+                if (nz > 0)
+                    printf("[RAM-SCAN] %s: %u non-zero dwords\n", areas[ai].name, nz);
             }
+            scan_log++;
         }
     }
 
