@@ -3429,7 +3429,16 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     /* Dump game state on first render call */
     /* Force render_ctx[0]=1 when render processing is called.
      * This makes FUN_10a89100 enter processing path instead of returning. */
+    /* Skip render_init (10A881F0) — callbacks loop forever.
+     * Force render_enable=1 so render goes straight to processing. */
+    if (addr == 0x10A881F0 && ((VFlash*)ctx)->boot_phase >= 900) {
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
     if (addr == 0x10A89100 && ((VFlash*)ctx)->boot_phase >= 900) {
+        static int r_log = 0;
+        if (r_log < 3) { printf("[10A89100] CALLED! R0=%08X\n", cpu->r[0]); r_log++; }
         /* R0 = render_ctx pointer. Set ctx[0]=1 to trigger drawing. */
         uint32_t ctx_addr = cpu->r[0];
         if (ctx_addr >= 0x10000000 && ctx_addr < 0x11000000) {
@@ -3442,6 +3451,8 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     }
     if (addr == 0x10B265E8 && ((VFlash*)ctx)->boot_phase >= 900) {
         VFlash *vf2 = (VFlash*)ctx;
+        /* Force render_enable=1 so render skips init and calls processing */
+        *(uint8_t*)(vf2->ram + 0xBE3EC0) = 1;
         /* PTX fallback: draw game artwork when native render produces nothing */
         static int ptx_frame = 0;
         static uint16_t *ptx_cache[4] = {NULL,NULL,NULL,NULL};
