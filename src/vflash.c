@@ -3427,6 +3427,19 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
      * Only skip the ones that BLOCK (sleep/wait loops).
      * Let non-blocking init functions run to populate game state. */
     /* Dump game state on first render call */
+    /* Force render_ctx[0]=1 when render processing is called.
+     * This makes FUN_10a89100 enter processing path instead of returning. */
+    if (addr == 0x10A89100 && ((VFlash*)ctx)->boot_phase >= 900) {
+        /* R0 = render_ctx pointer. Set ctx[0]=1 to trigger drawing. */
+        uint32_t ctx_addr = cpu->r[0];
+        if (ctx_addr >= 0x10000000 && ctx_addr < 0x11000000) {
+            VFlash *vf2 = (VFlash*)ctx;
+            uint32_t off = ctx_addr - 0x10000000;
+            *(uint32_t*)(vf2->ram + off) = 1;      /* ctx[0] = dirty */
+            *(uint32_t*)(vf2->ram + off + 12) = 3;  /* ctx[3] = flags (bit0+bit1) */
+        }
+        return 0; /* let it run */
+    }
     if (addr == 0x10B265E8 && ((VFlash*)ctx)->boot_phase >= 900) {
         VFlash *vf2 = (VFlash*)ctx;
         /* PTX fallback: draw game artwork when native render produces nothing */
