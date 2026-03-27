@@ -1527,10 +1527,16 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
         if ((roff == 0xB05A18 || roff == 0xB05A1C) && val < 8) {
             val = 8;
         }
-        /* Block game_mode write to 4 (error mode). Game enters mode 4
-         * when CD query returns "door open". Force mode to stay at 3. */
+        /* Block game_mode write to 4 (error mode). */
         if (roff == 0xB902C0 && val == 4) {
-            val = 3; /* force gameplay mode */
+            val = 3;
+        }
+        /* GPU completion flag at [10BE3CA0] (render_ctx+0x60).
+         * Render_init polls this until non-zero (GPU frame done).
+         * On real HW, GPU sets it after processing. Force to 1. */
+        if (roff >= 0xBE3C40 && roff < 0xBE3D40 && val == 0 &&
+            vf->boot_phase >= 900) {
+            val = 1; /* keep render state at "ready/done" */
         }
         /* Protect game callback pointer at [0x10BBD3C0].
          * µMORE game task init writes 0 here — prevent clearing. */
@@ -1547,6 +1553,16 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                 printf("[WP-HEAP] ram[0x%06X] = 0x%08X PC=0x%08X\n",
                        roff, val, vf->cpu.r[15]);
             wp_count++;
+        }
+        /* Watchpoint: catch overwrites of render function at 10B265E8 */
+        if (roff == 0xB265E8) {
+            static int rw_count = 0;
+            if (rw_count < 5) {
+                printf("[WP-RENDER] ram[0xB265E8] = 0x%08X PC=0x%08X (was 0x%08X)\n",
+                       val, vf->cpu.r[15],
+                       *(uint32_t*)(vf->ram + 0xB265E8));
+                rw_count++;
+            }
         }
         *(uint32_t*)(vf->ram + roff) = val;
         return;
@@ -3429,94 +3445,24 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     /* Dump game state on first render call */
     /* Force render_ctx[0]=1 when render processing is called.
      * This makes FUN_10a89100 enter processing path instead of returning. */
-    /* Skip render_init (10A881F0) — callbacks loop forever.
-     * Force render_enable=1 so render goes straight to processing. */
-    if (addr == 0x10A881F0 && ((VFlash*)ctx)->boot_phase >= 900) {
+    /* Render_init (10A881F0) — let it run.
+     * GPU completion flag at [10BE3CA0] forced to 1 via write intercept.
+     * This should prevent render_init from looping on GPU polling. */
+    if (addr == 0x10A89100 && ((VFlash*)ctx)->boot_phase >= 900) {
+        static int r_log = 0;
+        if (r_log < 3) { printf("[10A89100] render_processing skipped (R0=%08X)\n", cpu->r[0]); r_log++; }
+        /* Skip render_processing — it loops forever on dummy entities.
+         * Return 0 immediately (R0=0 = no error). */
         cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
-    if (addr == 0x10A89100 && ((VFlash*)ctx)->boot_phase >= 900) {
-        static int r_log = 0;
-        if (r_log < 3) { printf("[10A89100] CALLED! R0=%08X\n", cpu->r[0]); r_log++; }
-        /* R0 = render_ctx pointer. Set ctx[0]=1 to trigger drawing. */
-        uint32_t ctx_addr = cpu->r[0];
-        if (ctx_addr >= 0x10000000 && ctx_addr < 0x11000000) {
-            VFlash *vf2 = (VFlash*)ctx;
-            uint32_t off = ctx_addr - 0x10000000;
-            *(uint32_t*)(vf2->ram + off) = 1;      /* ctx[0] = dirty */
-            *(uint32_t*)(vf2->ram + off + 12) = 3;  /* ctx[3] = flags (bit0+bit1) */
-        }
-        return 0; /* let it run */
-    }
     if (addr == 0x10B265E8 && ((VFlash*)ctx)->boot_phase >= 900) {
-        VFlash *vf2 = (VFlash*)ctx;
-        /* Force render_enable=1 so render skips init and calls processing */
-        *(uint8_t*)(vf2->ram + 0xBE3EC0) = 1;
-        /* PTX fallback: draw game artwork when native render produces nothing */
-        static int ptx_frame = 0;
-        static uint16_t *ptx_cache[4] = {NULL,NULL,NULL,NULL};
-        static int ptx_cache_h[4] = {0,0,0,0};
-
-        /* Load 4 PTX sprite sheets on first frame */
-        if (ptx_frame == 0 && vf2->ptx_count >= 4 && vf2->cd) {
-            for (int ci = 0; ci < 4 && ci < vf2->ptx_count; ci++) {
-                CDEntry *pe = &vf2->ptx_list[ci];
-                uint8_t *buf = malloc(pe->size);
-                if (buf) {
-                    int rd = cdrom_read_file(vf2->cd, pe, buf, 0, pe->size);
-                    if (rd > 44) {
-                        uint32_t hs = *(uint32_t*)buf;
-                        if (hs >= 12 && hs <= 256 && hs < (uint32_t)rd) {
-                            uint32_t rows = ((uint32_t)rd - hs) / 1024;
-                            ptx_cache_h[ci] = rows / 2;
-                            ptx_cache[ci] = malloc(rows * 512 * 2);
-                            if (ptx_cache[ci])
-                                memcpy(ptx_cache[ci], buf + hs, rows * 512 * 2);
-                        }
-                    }
-                    free(buf);
-                }
-            }
-            printf("[RENDER-HLE] Loaded %d PTX sprite sheets\n",
-                   (ptx_cache[0]?1:0)+(ptx_cache[1]?1:0)+(ptx_cache[2]?1:0)+(ptx_cache[3]?1:0));
-        }
-
-        /* Compose frame: dark background + animated sprites */
-        if (ptx_cache[0]) {
-            /* Clear to dark blue */
-            for (int i = 0; i < VFLASH_SCREEN_W * VFLASH_SCREEN_H; i++)
-                vf2->framebuf[i] = 0xFF100820;
-
-            /* Draw sprites from PTX sheets at animated positions */
-            int sheet = (ptx_frame / 60) % 4;
-            if (!ptx_cache[sheet]) sheet = 0;
-            if (ptx_cache[sheet]) {
-                int sh = ptx_cache_h[sheet];
-                int ox = (ptx_frame * 2) % 320 - 160;  /* scrolling X */
-                int oy = 20 + (ptx_frame % 60);        /* bobbing Y */
-                for (int y = 0; y < sh && y + oy < 240; y++) {
-                    if (y + oy < 0) continue;
-                    for (int x = 0; x < 320; x++) {
-                        int sx = x - ox;
-                        if (sx < 0) sx += 320;
-                        if (sx >= 320) sx -= 320;
-                        uint16_t p = ptx_cache[sheet][(y * 2) * 512 + sx];
-                        if (p == 0) continue;  /* transparent */
-                        uint8_t r=(p&0x1F)<<3, g=((p>>5)&0x1F)<<3, b=((p>>10)&0x1F)<<3;
-                        vf2->framebuf[(y+oy)*VFLASH_SCREEN_W + x] =
-                            0xFF000000|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
-                    }
-                }
-            }
-            vf2->vid.fb_dirty = 1;
-        }
-
-        /* PTX screenshot removed — tile renderer saves screenshot instead */
-        if (0) {
-        }
-        ptx_frame++;
-        return 0; /* let native render run — init + processing */
+        /* Render function — real code copied from BOOT.BIN location.
+         * Force render_enable=1 to skip render_init (gets stuck in task queue).
+         * This makes the function call render_processing directly. */
+        *(uint8_t*)(((VFlash*)ctx)->ram + 0xBE3EC0) = 1;
+        return 0; /* let native render function execute */
     }
 
 
@@ -5687,46 +5633,96 @@ void vflash_run_frame(VFlash *vf) {
         vf->timer.timer[0].ctrl = 0;
         vf->timer.irq.enable = 0;
         vf->timer.irq.status = 0;
+        /* Copy render function from BOOT.BIN location to relocation target.
+         * BOOT.BIN code at 10D615FC (render_frame) was never copied to 10B265E8.
+         * The game loop at 109D1CC0 does BL 10B265E8 (PC-relative), expecting
+         * code there. Copy 192 bytes (code + literal pool) from BOOT.BIN area. */
+        {
+            uint32_t src = 0xD615FC;  /* 10D615FC in RAM (BOOT.BIN area) */
+            uint32_t dst = 0xB265E8;  /* 10B265E8 in RAM (relocation target) */
+            uint32_t sz  = 192;       /* function + literal pool */
+            if (src + sz <= VFLASH_RAM_SIZE && dst + sz <= VFLASH_RAM_SIZE) {
+                uint32_t first_src = *(uint32_t*)(vf->ram + src);
+                if (first_src == 0xE92D40F0) {  /* verify PUSH {R4-R7,LR} */
+                    memcpy(vf->ram + dst, vf->ram + src, sz);
+                    printf("[RENDER-FIX] Copied render function: %08X→%08X (%d bytes)\n",
+                           0x10000000+src, 0x10000000+dst, sz);
+                } else {
+                    printf("[RENDER-FIX] Source at %08X has %08X (expected E92D40F0)\n",
+                           0x10000000+src, first_src);
+                }
+            }
+        }
         /* Set up LCD controller */
         vf->lcd.upbase = 0x10048000; /* game's own render buffer */
         vf->lcd.control = 0x082D; /* 16bpp565, TFT, power, enabled */
         vf->boot_phase = 900;
     }
 
-    /* Simple tile renderer: read VFF sec[1] graphics and blit to framebuffer.
-     * VFF sec[1] is at 0x10501800 (loaded during init).
-     * Tiles are proprietary format but raw bytes can be displayed as grayscale. */
-    if (vf->boot_phase >= 900 && (vf->frame_count % 2) == 0) { /* disabled */
-        uint32_t gfx_base = 0x501800; /* VFF sec[1] in RAM */
-        {
-            /* Blit VFF graphics data to LCD framebuffer as raw pixel data.
-             * Try interpreting as 8bpp tiles at 320px width. */
-            uint16_t *fb = (uint16_t*)(vf->ram + 0x48000);
-            uint8_t *gfx = vf->ram + gfx_base;
-            /* Skip zero header, find first non-zero data */
-            uint32_t data_start = 0;
-            for (uint32_t i = 0; i < 0x10000; i++) {
-                if (gfx[i] != 0) { data_start = i; break; }
-            }
-            /* Render as 8bpp grayscale at 320 pixels wide */
-            for (int y = 0; y < 240; y++) {
-                for (int x = 0; x < 320; x++) {
-                    uint32_t idx = data_start + y * 320 + x;
-                    if (idx < 0x100000) {
-                        uint8_t val = gfx[idx];
-                        /* 8bpp → RGB565 grayscale */
-                        uint16_t r = (val >> 3) & 0x1F;
-                        uint16_t g = (val >> 2) & 0x3F;
-                        uint16_t b = (val >> 3) & 0x1F;
-                        fb[y * 320 + x] = (r << 11) | (g << 5) | b;
+    /* Game display: show PTX artwork from disc while game loop runs.
+     * The native render pipeline needs entity system (TODO).
+     * For now, display PTX sprite sheets as game scene visuals. */
+    if (vf->boot_phase >= 900 && (vf->frame_count % 2) == 0) {
+        static uint16_t *ptx_data = NULL;
+        static int ptx_w = 0, ptx_h = 0;
+        static int ptx_idx = 0;
+        if (!ptx_data && vf->ptx_count > 0 && vf->cd) {
+            /* Load first large PTX image (scene artwork) */
+            for (int pi = 0; pi < vf->ptx_count; pi++) {
+                CDEntry *pe = &vf->ptx_list[pi];
+                if (pe->size < 50000) continue; /* skip small UI elements */
+                uint8_t *buf = malloc(pe->size);
+                if (!buf) continue;
+                int rd = cdrom_read_file(vf->cd, pe, buf, 0, pe->size);
+                if (rd > 44) {
+                    uint32_t hs = *(uint32_t*)buf;
+                    if (hs >= 12 && hs <= 256 && hs < (uint32_t)rd) {
+                        uint32_t data_bytes = (uint32_t)rd - hs;
+                        uint32_t rows = data_bytes / 1024;
+                        ptx_w = 512;
+                        ptx_h = rows;
+                        ptx_data = malloc(data_bytes);
+                        if (ptx_data) {
+                            memcpy(ptx_data, buf + hs, data_bytes);
+                            ptx_idx = pi;
+                            printf("[GAME-DISPLAY] Loaded PTX #%d (%dx%d)\n",
+                                   pi, ptx_w, ptx_h);
+                        }
                     }
                 }
+                free(buf);
+                if (ptx_data) break;
             }
-            vf->vid.fb_dirty = 0;
+        }
+        if (ptx_data) {
+            /* Clear to desert brown (Cars themed) */
+            for (int i = 0; i < VFLASH_SCREEN_W * VFLASH_SCREEN_H; i++)
+                vf->framebuf[i] = 0xFF8B6914;
+            /* Display PTX scaled to fit 320x240 screen.
+             * PTX uses interlaced rows (even rows = image data).
+             * Stride is 512 pixels per row. */
+            int src_h = ptx_h / 2; /* actual image height (even rows only) */
+            for (int y = 0; y < 240; y++) {
+                int sy = y * src_h / 240;
+                if (sy >= src_h) sy = src_h - 1;
+                for (int x = 0; x < 320; x++) {
+                    int sx = x;
+                    if (sx >= ptx_w) sx = ptx_w - 1;
+                    uint16_t p = ptx_data[sy * 2 * 512 + sx]; /* even rows */
+                    if (p == 0) continue; /* transparent */
+                    /* XBGR1555: R=bits0-4, G=bits5-9, B=bits10-14 */
+                    uint8_t r = (p & 0x1F) << 3;
+                    uint8_t g = ((p >> 5) & 0x1F) << 3;
+                    uint8_t b = ((p >> 10) & 0x1F) << 3;
+                    vf->framebuf[y * VFLASH_SCREEN_W + x] =
+                        0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+                }
+            }
+            vf->vid.fb_dirty = 1;
             static int tl = 0;
             if (!tl) {
-                printf("[TILE-RENDER] VFF sec[1] as 8bpp from +%X to fb\n", data_start);
-                /* Save screenshot from RAM framebuffer */
+                printf("[GAME-DISPLAY] PTX #%d rendered to framebuffer\n", ptx_idx);
+                /* Save screenshot from ARGB32 framebuffer */
                 FILE *sf = fopen("/tmp/vflash_screen.bmp", "wb");
                 if (sf) {
                     int w=320,h=240,rs=w*3,pad=(4-rs%4)%4,isz=(rs+pad)*h;
@@ -5737,9 +5733,8 @@ void vflash_run_frame(VFlash *vf) {
                     *(uint16_t*)(hd+28)=24; *(uint32_t*)(hd+34)=isz;
                     fwrite(hd,1,54,sf);
                     for(int y2=0;y2<h;y2++){for(int x2=0;x2<w;x2++){
-                        uint16_t px=fb[y2*w+x2];
-                        uint8_t r2=((px>>11)&0x1F)<<3, g2=((px>>5)&0x3F)<<2, b2=(px&0x1F)<<3;
-                        uint8_t rgb[3]={b2,g2,r2};
+                        uint32_t px=vf->framebuf[y2*w+x2];
+                        uint8_t rgb[3]={px&0xFF,(px>>8)&0xFF,(px>>16)&0xFF};
                         fwrite(rgb,1,3,sf);}
                         uint8_t z[4]={0};if(pad)fwrite(z,1,pad,sf);}
                     fclose(sf);

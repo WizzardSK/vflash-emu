@@ -647,7 +647,8 @@ int arm9_step(ARM9 *cpu) {
          * - Addresses outside any valid memory region (> 0x11000000 and not ROM/peripherals) */
         if ((inst_addr == 0 ||
              (inst_addr >= 0x10000000 && inst_addr < 0x10000100) ||
-             (inst_addr > 0x11000000 && inst_addr < 0x80000000))
+             (inst_addr > 0x11000000 && inst_addr < 0x80000000) ||
+             (inst_addr >= 0x00200000 && inst_addr < 0x0FFE0000))
             && cpu->null_trap_enabled) {
             static int null_blx = 0;
             if (null_blx < 10)
