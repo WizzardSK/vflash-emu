@@ -31,11 +31,11 @@ Background voice/SFX audio plays automatically from 561 WAV files on disc.
 
 ## Status
 
-**Game engine running natively** — µMORE v4.0 RTOS boots, game task launched,
-native kernel service dispatch through vtable, CD-ROM init succeeds, VFF scene
-data loaded and scene builder completes with HLE alloc. Game loop runs with
-all engine subsystems (tick, sync, entity processing) executing natively.
-PTX sprite artwork from CD-ROM displays on screen.
+**Game engine running natively with entity system** — µMORE v4.0 RTOS boots,
+game task launched, native kernel service dispatch through vtable, CD-ROM init
+succeeds natively. VFF scene data loaded, scene builder allocates 320KB of entity
+data via HLE alloc. Game loop runs with all engine subsystems executing natively.
+VFF tile graphics and PTX sprite artwork display on screen.
 
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spider-Man.
 
@@ -61,24 +61,29 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **CD-ROM init** | ✅ Native through kernel vtable, disc query succeeds |
 | **VFF scene loading** | ✅ ARM code + graphics + tilemap loaded to RAM |
 | **VFF scene init** | ✅ Scene descriptor table populated at 0x10500808 |
-| **VFF scene builder** | ✅ Entity alloc + engine setup completes |
+| **VFF scene builder** | ✅ Entity alloc (320KB) + callback populates entities |
+| **VFF tile display** | ✅ sec[1] graphics rendered to LCD framebuffer |
 | **Game loop** | ✅ tick→sync→render, all subsystems active |
 | **NULL entity protection** | ✅ Dummy vtable + read trap for safe execution |
-| **Native render** | 🔧 Entity data allocated but render needs more init |
+| **Native render init** | 🔧 Runs but stuck on GPU frame completion polling |
 
 ### Remaining for gameplay
 
-Game engine runs natively with all subsystems active. VFF scene builder
-allocates entities via HLE alloc with dummy vtable stubs. Render subsystem
-needs initialized GPU/layer state to produce framebuffer output.
+Game engine runs natively with 320KB of allocated entity data. VFF scene
+callback populates entities with scene data. Render init runs but gets stuck
+polling for GPU frame completion at `10A73918` (render state loop). VFF
+graphics are in proprietary compressed format — raw display shows tile
+structure but needs the game's ARM decoder (VFF sec[0]) for proper rendering.
 
 **Key HLE components**:
 - Game alloc (10A775E0, 10A77648): bump allocator with dummy vtable
-- NULL entity read trap: returns 1 for [0x00-0x1F] reads (breaks polling loops)
-- Dummy vtable at 0x10310800: 64 return-0 stubs for virtual method calls
+- NULL entity read trap: returns ready(1) for [0x00-0x1F] (breaks ALL polling loops)
+- Dummy vtable at 0x10310800: 64 ARM stubs (MOV R0,#0; BX LR)
 - Engine wait skip (10A20B30): breaks BEQ loop waiting for entity state
 - Render state pre-fill: 10BE3C40/10BE49E0 areas set to ready state
+- State machine fix: force [param_1+0x104] = 0x84 (done) at 109D2754
 - Game mode fix: intercept [10B902C0] reads, return 3 (not 4=error)
+- ATAPI sense fix: no error (0x00) instead of unit attention (0x06)
 - Kernel vtable: 7 function pointers from ROM at [1000C76C+0x2C..+0x44]
 
 **Ghidra RE completed**: full game task entry, render pipeline, VFF scene format
