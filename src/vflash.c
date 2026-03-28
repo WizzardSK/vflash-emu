@@ -6086,30 +6086,58 @@ void vflash_run_frame(VFlash *vf) {
                         if (layer_y[order[i]] > layer_y[order[j]]) {
                             int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
                         }
-                /* Use sec[1] tiles and sec[2] data as layer sources */
-                uint32_t data_ptrs[16] = {
-                    0x5980F4,0x59D6C0,0x5A0274,0x5A22BC,
-                    0x5A3E5C,0x5A5798,0x5AA98C,0x5AE794,
-                    0x5B4A20,0x5BB818,0x5C4F60,0x5CCB6C,
-                    0x5D3F80,0x5DB130,0x5E3118,0x5E8350,
+                /* Use DECOMPRESSED tile data at 0x10240000 as layer sources.
+                 * 29 tiles total (512x256, 256x128, etc.) — assign groups of
+                 * tiles to each render layer based on Y position. */
+                static const struct { int tile_idx; int tw; int th; } layer_tiles[16] = {
+                    { 0, 512,256}, /* 0: Y=192 ground — tile 0 (512x256) */
+                    { 5, 512,128}, /* 1: Y=64  terrain — tile 5 (512x128) */
+                    { 9, 512,128}, /* 2: Y=128 horizon — tile 9 (512x128) */
+                    { 7, 256,256}, /* 3: Y=192 vegetation — tile 7 (256x256) */
+                    { 8, 512, 64}, /* 4: Y=192 road — tile 8 (512x64) */
+                    {22, 256,256}, /* 5: Y=0   sky — tile 22 (256x256) */
+                    { 1, 256,128}, /* 6: Y=64  sand — tile 1 (256x128) */
+                    { 3, 256,128}, /* 7: Y=192 dark ground — tile 3 (256x128) */
+                    {24, 512,128}, /* 8: Y=192 light sky — tile 24 (512x128) */
+                    { 6, 128, 64}, /* 9: Y=192 red accent — tile 6 (128x64) */
+                    { 2, 512, 32}, /*10: Y=64  road gray — tile 2 (512x32) */
+                    { 4, 512, 32}, /*11: Y=192 light sand — tile 4 (512x32) */
+                    {21, 256, 64}, /*12: Y=192 dark green — tile 21 (256x64) */
+                    {26, 256, 64}, /*13: Y=192 tan — tile 26 (256x64) */
+                    {27, 128,128}, /*14: Y=64  blue detail — tile 27 (128x128) */
+                    {10, 256, 32}, /*15: Y=336 yellow — tile 10 (256x32) */
+                };
+                /* Tile offset table (cumulative sizes) */
+                static const uint32_t tile_offsets[] = {
+                    0x000000,0x020000,0x028000,0x02C000,0x034000,
+                    0x038000,0x048000,0x04A000,0x05A000,0x062000,
+                    0x072000,0x074000,0x0F4000,0x0F6000,0x0FA000,
+                    0x0FE000,0x0FE800,0x0FF800,0x100800,0x102800,
+                    0x104800,0x105800,0x109800,0x119800,0x11B800,
+                    0x12B800,0x12D800,0x131800,0x135800,
                 };
                 for (int li = 0; li < 16; li++) {
                     int idx = order[li];
                     int ly = layer_y[idx];
-                    if (ly >= 240) continue; /* off-screen */
-                    uint32_t dp = data_ptrs[idx];
-                    if (dp + 320*60 > VFLASH_RAM_SIZE) continue;
+                    if (ly >= 240) continue;
+                    int ti = layer_tiles[idx].tile_idx;
+                    int tw = layer_tiles[idx].tw;
+                    int th = layer_tiles[idx].th;
+                    uint32_t dp = tile_off + tile_offsets[ti];
+                    if (dp + (uint32_t)(tw*th) > VFLASH_RAM_SIZE) continue;
                     uint8_t cr = layer_colors[idx].r;
                     uint8_t cg = layer_colors[idx].g;
                     uint8_t cb = layer_colors[idx].b;
-                    /* Render layer at its Y position, height ~60px */
                     int lh = (ly == 0) ? 80 : 60;
                     int y_start = ly * 240 / 320;
                     if (y_start + lh > 240) lh = 240 - y_start;
                     for (int y = y_start; y < y_start + lh && y < 240; y++) {
                         for (int x = 0; x < 320; x++) {
-                            int dy = (y - y_start) * 2;
-                            uint8_t v = vf->ram[dp + dy * 320 + x];
+                            int sy = (y - y_start) * th / lh;
+                            int sx = x * tw / 320;
+                            if (sy >= th) sy = th - 1;
+                            if (sx >= tw) sx = tw - 1;
+                            uint8_t v = vf->ram[dp + sy * tw + sx];
                             if (v == 0) continue;
                             /* Alpha-blend: pixel = old*(1-a) + color*a */
                             uint32_t old = vf->framebuf[y*320+x];
