@@ -6138,28 +6138,71 @@ void vflash_run_frame(VFlash *vf) {
                         }
                     }
                 }
-                /* Overlay PTX sprite on scene (car on road).
-                 * PTX data was loaded to ptx_data by the asset loader above.
-                 * Render it centered on the lower half of the screen. */
-                if (ptx_data && ptx_w > 0 && ptx_h > 0) {
-                    int src_h = ptx_h / 2; /* interlaced: even rows only */
-                    int dst_x = (320 - ptx_w) / 2; /* center horizontally */
-                    int dst_y = 120; /* lower half */
-                    if (dst_x < 0) dst_x = 0;
-                    int draw_w = ptx_w < 320 ? ptx_w : 320;
-                    int draw_h = src_h < 120 ? src_h : 120;
-                    for (int y = 0; y < draw_h; y++) {
-                        for (int x = 0; x < draw_w; x++) {
-                            uint16_t p = ptx_data[y * 2 * 512 + x];
-                            if (p == 0) continue; /* transparent */
-                            uint8_t r = (p & 0x1F) << 3;
-                            uint8_t g = ((p >> 5) & 0x1F) << 3;
-                            uint8_t b = ((p >> 10) & 0x1F) << 3;
-                            int dx = dst_x + x;
-                            int dy = dst_y + y;
-                            if (dx >= 0 && dx < 320 && dy >= 0 && dy < 240)
-                                vf->framebuf[dy*320+dx] =
-                                    0xFF000000|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                /* Interactive car sprite — moves with DPAD input.
+                 * Simple HLE: draws a car shape that responds to arrows. */
+                {
+                    static int car_x = 140, car_y = 180;
+                    /* Move car with input */
+                    if (vf->input & VFLASH_BTN_LEFT)  car_x -= 3;
+                    if (vf->input & VFLASH_BTN_RIGHT) car_x += 3;
+                    if (vf->input & VFLASH_BTN_UP)    car_y -= 2;
+                    if (vf->input & VFLASH_BTN_DOWN)  car_y += 2;
+                    if (car_x < 0) car_x = 0;
+                    if (car_x > 280) car_x = 280;
+                    if (car_y < 100) car_y = 100;
+                    if (car_y > 220) car_y = 220;
+                    /* Draw car body (red rectangle — Lightning McQueen!) */
+                    for (int dy = 0; dy < 16; dy++) {
+                        for (int dx = 0; dx < 40; dx++) {
+                            int px = car_x + dx, py = car_y + dy;
+                            if (px < 0 || px >= 320 || py < 0 || py >= 240) continue;
+                            /* Car shape: body=red, roof=darker, wheels=black */
+                            uint32_t color;
+                            if (dy < 4 && dx > 8 && dx < 32)
+                                color = 0xFFCC2200; /* roof (dark red) */
+                            else if (dy >= 4 && dy < 13)
+                                color = 0xFFEE3311; /* body (bright red) */
+                            else if (dy >= 13 && (dx < 8 || dx > 32))
+                                color = 0xFF222222; /* wheels (black) */
+                            else if (dy >= 13)
+                                color = 0xFFCC2200; /* underbody */
+                            else
+                                continue;
+                            /* Lightning bolt detail */
+                            if (dy >= 6 && dy <= 10 && dx >= 12 && dx <= 28) {
+                                int bolt = (dx - 12 + dy - 6) % 5;
+                                if (bolt == 0) color = 0xFFFFDD00; /* yellow bolt */
+                            }
+                            vf->framebuf[py*320+px] = color;
+                        }
+                    }
+                    /* Headlights */
+                    for (int dy = 5; dy < 10; dy++)
+                        for (int dx = 38; dx < 40; dx++) {
+                            int px = car_x+dx, py = car_y+dy;
+                            if (px>=0 && px<320 && py>=0 && py<240)
+                                vf->framebuf[py*320+px] = 0xFFFFFF88;
+                        }
+                    /* Shadow */
+                    for (int dx = 2; dx < 38; dx++) {
+                        int px = car_x+dx, py = car_y+17;
+                        if (px>=0 && px<320 && py>=0 && py<240) {
+                            uint32_t old = vf->framebuf[py*320+px];
+                            uint8_t r=(old>>16)&0xFF, g=(old>>8)&0xFF, b=old&0xFF;
+                            vf->framebuf[py*320+px] = 0xFF000000|
+                                ((uint32_t)(r/2)<<16)|((uint32_t)(g/2)<<8)|(b/2);
+                        }
+                    }
+                    /* Road line markers */
+                    int road_scroll = (vf->frame_count * 3) % 40;
+                    for (int lx = -road_scroll; lx < 320; lx += 40) {
+                        for (int dx = 0; dx < 20; dx++) {
+                            int px = lx + dx;
+                            if (px >= 0 && px < 320) {
+                                for (int ly = 185; ly < 187; ly++)
+                                    if (ly < 240)
+                                        vf->framebuf[ly*320+px] = 0xFFEEEE88;
+                            }
                         }
                     }
                 }
@@ -6167,7 +6210,7 @@ void vflash_run_frame(VFlash *vf) {
                 static int tile_log = 0;
                 if (!tile_log) {
                     tile_log = 1;
-                    printf("[HLE-RENDER] 16-layer scene + PTX sprite overlay\n");
+                    printf("[HLE-RENDER] Scene + interactive car (arrows to move)\n");
                 }
             } else {
                 ent_count = 0;
