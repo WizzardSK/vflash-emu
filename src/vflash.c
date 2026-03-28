@@ -6333,6 +6333,52 @@ void vflash_run_frame(VFlash *vf) {
         }
     }
 
+    /* HLE input: write button state to game input buffers.
+     * The RTOS input driver normally reads GPIO at 0x80004000 and dispatches
+     * button events to callbacks that write to 0x10BBE8xx buffers.
+     * Since RTOS dispatch is stubbed, we write directly.
+     * Each buffer is 12 bytes: [+0]=button_state, [+4]=pressed, [+8]=timestamp.
+     * 5 buttons: DPAD(0), Red(1), Yellow(2), Green(3), Blue(4) */
+    if (vf->has_rom && vf->boot_phase >= 900) {
+        static const uint32_t btn_bufs[] = {
+            0xBBE8BC, 0xBBE8E8, 0xBBE914, 0xBBE940, 0xBBE96C
+        };
+        /* Map emulator buttons to game button buffers.
+         * Button 0 (DPAD): encode direction in R0, pressed in R1 */
+        uint32_t pressed = vf->input & ~vf->input_prev;
+        uint32_t released = vf->input_prev & ~vf->input;
+        /* DPAD → buffer 0: R0=direction (1=up,2=down,3=left,4=right), R1=state */
+        {
+            uint32_t dir = 0;
+            if (vf->input & VFLASH_BTN_UP) dir = 1;
+            else if (vf->input & VFLASH_BTN_DOWN) dir = 2;
+            else if (vf->input & VFLASH_BTN_LEFT) dir = 3;
+            else if (vf->input & VFLASH_BTN_RIGHT) dir = 4;
+            *(uint32_t*)(vf->ram + btn_bufs[0]) = dir;
+            *(uint32_t*)(vf->ram + btn_bufs[0] + 4) = (dir != 0) ? 1 : 0;
+            *(uint32_t*)(vf->ram + btn_bufs[0] + 8) = vf->frame_count;
+        }
+        /* Color buttons → buffers 1-4: R0=1(pressed)/0(released), R1=event */
+        for (int bi = 0; bi < 4; bi++) {
+            uint32_t btn_mask = VFLASH_BTN_RED << bi;
+            uint32_t is_held = (vf->input & btn_mask) ? 1 : 0;
+            uint32_t is_pressed = (pressed & btn_mask) ? 1 : 0;
+            *(uint32_t*)(vf->ram + btn_bufs[1+bi]) = is_held;
+            *(uint32_t*)(vf->ram + btn_bufs[1+bi] + 4) = is_pressed;
+            *(uint32_t*)(vf->ram + btn_bufs[1+bi] + 8) = vf->frame_count;
+        }
+        /* Also write to input register that game code may poll directly */
+        *(uint32_t*)(vf->ram + 0xBBE880) = vf->input;
+        if (pressed) {
+            static int inp_log = 0;
+            if (inp_log < 20) {
+                printf("[HLE-INPUT] buttons=0x%03X pressed=0x%03X\n",
+                       vf->input, pressed);
+                inp_log++;
+            }
+        }
+    }
+
     vf->input_prev = vf->input;
     vf->frame_count++;
 }
