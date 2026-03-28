@@ -254,6 +254,7 @@ struct VFlash {
     int      render_budget; /* Instructions remaining in render pipeline (0=unlimited) */
     int      restore_vtable_pending; /* Restore vtable after render_init */
     JitContext *jit;                 /* JIT compiler context */
+    uint8_t *rtos_backup;           /* Backup of RTOS code area for restore */
     uint32_t native_alloc_lr; /* Track native alloc return address for logging */
     uint32_t flash_last_write; /* Last value written to NOR flash (for status polling) */
     /* Saved game task info from BOOT TCB scan (before service entry may overwrite) */
@@ -1512,10 +1513,15 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
             val = 0x00001880;
         }
         if (roff == 0x3585E0 && val != 3) {
-            /* Force sched_state to stay at 3.
-             * Kernel code at 0x100843AC resets it to 0, preventing dispatch.
-             * On real HW, scheduler manages this internally. */
             val = 3;
+        }
+        /* Protect RTOS code (0x10A00000-0x10B10000) from zeroing.
+         * Both mem_write32 AND JIT inline writes can reach here.
+         * JIT inline writes go directly to ram[], bypassing this function.
+         * So also add a periodic check in the frame loop. */
+        if (val == 0 && roff >= 0xA00000 && roff < 0xB10000 &&
+            vf->boot_phase >= 800) {
+            return; /* silently block */
         }
         *(uint32_t*)(vf->ram + roff) = val;
         return;
@@ -3607,18 +3613,33 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         uint32_t len = cpu->r[2];
         if (dst < VFLASH_RAM_SIZE && src < VFLASH_RAM_SIZE &&
             dst + len <= VFLASH_RAM_SIZE && src + len <= VFLASH_RAM_SIZE && len < 0x100000) {
+            /* Protect RTOS code from overwrite */
+            if (dst >= 0xA00000 && dst < 0xB10000) {
+                cpu->r[15] = cpu->r[14] & ~3u;
+                return 1;
+            }
             memmove(vf2->ram + dst, vf2->ram + src, len);
             cpu->r[15] = cpu->r[14] & ~3u;
             return 1;
         }
     }
-    /* HLE memset at 10A4D500: R0=dst, R1=val, R2=len → R0=dst */
+    /* HLE memset at 10A4D500: R0=dst, R1=val, R2=len → R0=dst.
+     * PROTECT RTOS code area (0x10A00000-0x10B00000) from being zeroed. */
     if (addr == 0x10A4D500) {
         VFlash *vf2 = (VFlash*)ctx;
         uint32_t dst = cpu->r[0] - 0x10000000;
         uint32_t val = cpu->r[1] & 0xFF;
         uint32_t len = cpu->r[2];
         if (dst < VFLASH_RAM_SIZE && dst + len <= VFLASH_RAM_SIZE && len < 0x100000) {
+            /* Skip if trying to zero RTOS code area */
+            if (val == 0 && dst >= 0xA00000 && dst < 0xB10000) {
+                static int prot_log = 0;
+                if (prot_log++ < 3)
+                    printf("[MEMSET-PROTECT] Blocked zero of RTOS area %08X+%X\n",
+                           0x10000000+dst, len);
+                cpu->r[15] = cpu->r[14] & ~3u;
+                return 1;
+            }
             memset(vf2->ram + dst, (int)val, len);
             cpu->r[15] = cpu->r[14] & ~3u;
             return 1;
@@ -5721,6 +5742,27 @@ void vflash_run_frame(VFlash *vf) {
             vf->timer.timer[0].ctrl = 0xE2;
             vf->timer.irq.enable |= 0x01;
             vf->boot_phase = 800;
+            /* Backup RTOS code area — game BSS clear will zero it */
+            if (!vf->rtos_backup) {
+                vf->rtos_backup = malloc(0x110000);
+                if (vf->rtos_backup) {
+                    memcpy(vf->rtos_backup, vf->ram + 0xA00000, 0x110000);
+                    printf("[RTOS-BACKUP] Saved 0x10A00000-0x10B10000 (1.1MB)\n");
+                }
+            }
+        }
+    }
+
+    /* Restore RTOS code if game zeroed it */
+    if (vf->rtos_backup && vf->boot_phase >= 800) {
+        /* Check if 10A8CDE4 is still intact */
+        if (*(uint32_t*)(vf->ram + 0xA8CDE4) == 0) {
+            memcpy(vf->ram + 0xA00000, vf->rtos_backup, 0x110000);
+            static int restore_log = 0;
+            if (restore_log++ < 5)
+                printf("[RTOS-RESTORE] Code area restored from backup\n");
+            /* Flush JIT cache since code changed */
+            if (vf->jit) jit_flush(vf->jit);
         }
     }
 
