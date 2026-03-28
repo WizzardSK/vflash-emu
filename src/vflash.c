@@ -5566,7 +5566,9 @@ void vflash_run_frame(VFlash *vf) {
         *(uint32_t*)(vf->ram + 0xB009C4) = 1;  /* game_state = active */
         *(uint32_t*)(vf->ram + 0xB902C0) = 3;  /* game_mode = gameplay */
         /* Load VFF scene data to target RAM addresses.
-         * sec[0]=ARM code→0x105B8000, sec[1]=gfx→0x1066B000, sec[2]=tiles→0x101B8000 */
+         * VFF header: +10=entry, +14=param, +18/1C=callbacks, +20=init_cb
+         * sec[0]=ARM code, sec[1]=tile descriptors+gfx, sec[2]=compressed tilemap */
+        uint32_t vff_entry = 0, vff_init_cb = 0;
         if (vf->cd && vf->cd->is_open) {
             CDEntry ve;
             if (cdrom_find_file_any(vf->cd, "MAIN.VFF", &ve)) {
@@ -5574,14 +5576,18 @@ void vflash_run_frame(VFlash *vf) {
                 cdrom_read_file(vf->cd, &ve, vhdr, 0, 0x60);
                 if (vhdr[0]=='v' && vhdr[1]=='f') {
                     uint32_t nsec = *(uint32_t*)(vhdr + 0x2C);
-                    uint32_t foff = 0x400;
+                    vff_entry = *(uint32_t*)(vhdr + 0x10);
+                    vff_init_cb = *(uint32_t*)(vhdr + 0x20);
+                    printf("[VFF] entry=0x%08X init_cb=0x%08X nsec=%d\n",
+                           vff_entry, vff_init_cb, nsec);
+                    uint32_t foff = 0x400; /* header padded to 0x400 */
                     for (uint32_t si = 0; si < nsec && si < 3; si++) {
                         uint32_t ssz = *(uint32_t*)(vhdr + 0x34 + si*0x10);
                         uint32_t dst = *(uint32_t*)(vhdr + 0x30 + si*0x10);
                         if (dst >= 0x10000000 && dst + ssz <= 0x10000000 + VFLASH_RAM_SIZE) {
                             int rd = cdrom_read_file(vf->cd, &ve,
                                         vf->ram + (dst - 0x10000000), foff, ssz);
-                            printf("[VFF] sec[%d] %dKB → %08X\n", si, rd/1024, dst);
+                            printf("[VFF] sec[%d] %dKB → %08X (load_addr)\n", si, rd/1024, dst);
                         }
                         foff += ssz;
                     }
@@ -5590,10 +5596,46 @@ void vflash_run_frame(VFlash *vf) {
         }
 
         /* Execute VFF sec[0] ARM code to initialize scene descriptors.
-         * Entry at sec[0]+0x400, needs R0=1 (init), R1=0xFFFF (scene ID).
-         * This fills the scene dispatch table at 0x10500808. */
+         * Find entry by scanning for first ARM function prologue (PUSH/STMDB).
+         * Called with R0=1 (init), R1=0xFFFF (all scenes). */
         {
-            uint32_t entry = 0x104E2400;
+            /* Scan sec[0] for first STMDB SP!, {regs} (E92Dxxxx) prologue */
+            uint32_t s0_addr = 0x104E2000; /* default sec[0] load address */
+            uint32_t s0_size = 0x20000;    /* default scan range */
+            if (vff_entry) {
+                /* entry_table from VFF header → sec[0] end */
+                s0_addr = vff_entry - (vff_entry - 0x104E2000);
+                /* Rough: use first 16KB for prologue scan */
+            }
+            /* Scan for scene entry: LDR Rx, =0xFFFF followed by PUSH.
+             * The scene init function starts with LDR R12, =0xFFFF; PUSH {regs}
+             * and is called with R0=1 (init), R1=scene_id. */
+            uint32_t entry = 0;
+            for (uint32_t scan = 0; scan < 0x8000; scan += 4) {
+                uint32_t off = s0_addr - 0x10000000 + scan;
+                if (off + 8 > VFLASH_RAM_SIZE) break;
+                uint32_t i0 = *(uint32_t*)(vf->ram + off);
+                uint32_t i1 = *(uint32_t*)(vf->ram + off + 4);
+                /* LDR Rx, [PC, #imm] where literal = 0x0000FFFF */
+                if ((i0 & 0x0F7F0000) == 0x059F0000 &&
+                    (i1 & 0xFFFF0000) == 0xE92D0000) {
+                    /* Verify literal value is 0xFFFF */
+                    int Rd = (i0 >> 12) & 0xF;
+                    int imm = i0 & 0xFFF;
+                    int U = (i0 >> 23) & 1;
+                    uint32_t lit_addr = off + 8 + (U ? imm : -imm);
+                    if (lit_addr + 4 <= VFLASH_RAM_SIZE) {
+                        uint32_t lit = *(uint32_t*)(vf->ram + lit_addr);
+                        if (lit == 0x0000FFFF || lit == 0xFFFFFFFF) {
+                            entry = s0_addr + scan;
+                            printf("[VFF-EXEC] Entry: LDR R%d,=0x%X + PUSH at 0x%08X\n",
+                                   Rd, lit, entry);
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!entry) entry = s0_addr + 0x400; /* fallback */
             uint32_t first_i = *(uint32_t*)(vf->ram + (entry - 0x10000000));
             if (first_i != 0) {
                 uint32_t spc=vf->cpu.r[15], ssp=vf->cpu.r[13];
@@ -5614,17 +5656,75 @@ void vflash_run_frame(VFlash *vf) {
                        *(uint32_t*)(vf->ram+0x500808),
                        *(uint32_t*)(vf->ram+0x50080C),
                        *(uint32_t*)(vf->ram+0x500810));
-                /* Call scene render callback to populate entities */
-                vf->cpu.r[0] = 0x10300000;
-                vf->cpu.r[15] = 0x104E5C00;
-                vf->cpu.r[14] = 0x10FFF000;
-                vf->cpu.r[13] = 0x10B8D000;
-                vf->cpu.cpsr = 0x000000D3;
-                for (si = 0; si < 500000; si++) {
-                    arm9_step(&vf->cpu);
-                    uint32_t pc = vf->cpu.r[15];
-                    if (pc == 0x10FFF000 || (pc > 0x11000000 && pc < 0x80000000)) break;
+                /* Dump RAM for analysis */
+                {
+                    FILE *df = fopen("/tmp/vflash_ram2.bin", "wb");
+                    if (df) {
+                        fwrite(vf->ram, 1, VFLASH_RAM_SIZE, df);
+                        fclose(df);
+                        printf("[DUMP] RAM dumped to /tmp/vflash_ram2.bin\n");
+                    }
                 }
+                /* Dump dispatch table entries */
+                {
+                    uint32_t db = (vff_entry ? vff_entry : 0x10500800) - 0x10000000;
+                    for (uint32_t di = 0; di < 0x400; di += 0x10) {
+                        uint32_t a = *(uint32_t*)(vf->ram + db + di);
+                        uint32_t b = *(uint32_t*)(vf->ram + db + di + 4);
+                        uint32_t c = *(uint32_t*)(vf->ram + db + di + 8);
+                        uint32_t d = *(uint32_t*)(vf->ram + db + di + 12);
+                        if (a == 0 && b == 0 && c == 0 && d == 0) continue;
+                        printf("[VFF-DT] +%03X: %08X %08X %08X %08X\n",
+                               di, a, b, c, d);
+                    }
+                }
+                /* Call ALL scene callbacks from dispatch table.
+                 * Each entry is 0x30 bytes: +0x00=id, +0x04=param, ..., +0x14=callback.
+                 * The dispatch table was populated by the scene init call above. */
+                uint32_t dt_base = vff_entry ? vff_entry : 0x10500800;
+                uint32_t dt_off = dt_base - 0x10000000;
+                uint32_t bl_targets[256];
+                int bl_count = 0;
+                int total_cb_steps = 0;
+                int cb_called = 0;
+                /* Scan dispatch table for callback pointers and call each one */
+                if (dt_off + 0x1000 < VFLASH_RAM_SIZE) {
+                    for (uint32_t di = 0; di < 0xDA0; di += 4) {
+                        uint32_t v = *(uint32_t*)(vf->ram + dt_off + di);
+                        if (v >= s0_addr && v < s0_addr + 0x20000) {
+                            /* This is a callback pointer — call it */
+                            vf->cpu.r[0] = 0x10300000;
+                            vf->cpu.r[1] = di;
+                            vf->cpu.r[15] = v;
+                            vf->cpu.r[14] = 0x10FFF000;
+                            vf->cpu.r[13] = 0x10B8D000;
+                            vf->cpu.cpsr = 0x000000D3;
+                            for (si = 0; si < 500000; si++) {
+                                uint32_t pc_before = vf->cpu.r[15];
+                                arm9_step(&vf->cpu);
+                                uint32_t pc_after = vf->cpu.r[15];
+                                if (pc_before >= 0x10100000 && pc_before < 0x10700000 &&
+                                    pc_after >= 0x10A00000 && pc_after < 0x10D00000) {
+                                    int found = 0;
+                                    for (int bi = 0; bi < bl_count; bi++)
+                                        if (bl_targets[bi] == pc_after) { found = 1; break; }
+                                    if (!found && bl_count < 256) {
+                                        bl_targets[bl_count++] = pc_after;
+                                        printf("[VFF-BL] → %08X R0=%08X R1=%08X R2=%08X\n",
+                                               pc_after, vf->cpu.r[0], vf->cpu.r[1], vf->cpu.r[2]);
+                                    }
+                                }
+                                if (pc_after == 0x10FFF000 || pc_after == 0 ||
+                                    (pc_after > 0x11000000 && pc_after < 0x80000000)) break;
+                            }
+                            total_cb_steps += si;
+                            cb_called++;
+                        }
+                    }
+                }
+                printf("[VFF-EXEC] Called %d scene callbacks (%d steps, %d BL targets)\n",
+                       cb_called, total_cb_steps, bl_count);
+                printf("[VFF-BL] Total unique BOOT.BIN calls: %d\n", bl_count);
                 printf("[VFF-SCENE] Entity callback: %d steps\n", si);
                 /* Log entity vtable values after scene callback */
                 printf("[VFF-SCENE] Entity data after callback:\n");
@@ -5847,18 +5947,48 @@ void vflash_run_frame(VFlash *vf) {
                         0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
                 }
             }
-            /* Render VFF sec[1] tile graphics directly from loaded area.
-             * VFF sec[1] was loaded from disc to RAM during init.
-             * Find it via VFF scene descriptor at [10500808]. */
+            /* Render decompressed tile graphics from 0x10240000.
+             * Tile data was decompressed by scene callbacks into HLE alloc area.
+             * Render first tile (512x256 @ 8bpp) scaled to screen with grayscale. */
             int ent_count = 0;
-            /* VFF sec[1] loaded at 10501800 (1772KB) from disc */
-            uint32_t vff_gfx = 0x501800;
-            uint32_t vff_gfx_sz = 1772 * 1024;
-            /* Render VFF sec[1] as 8bpp grayscale at 256px stride */
-            if (vff_gfx && vff_gfx_sz > 0) {
+            uint32_t tile_off = 0x240000;  /* decompressed tile data */
+            uint32_t tile_sz = 512 * 256;  /* first tile: 512x256 */
+            int tile_w = 512, tile_h = 256;
+            /* Check if tile data looks valid (has non-zero pixels) */
+            int nz = 0;
+            for (uint32_t ti = 0; ti < tile_sz && ti + tile_off < VFLASH_RAM_SIZE; ti++)
+                if (vf->ram[tile_off + ti]) nz++;
+            if (nz > 1000) {
+                /* Clear framebuffer */
+                memset(vf->framebuf, 0, 320*240*4);
+                uint8_t *gfx = vf->ram + tile_off;
+                /* Scale tile to fit screen */
+                for (int y = 0; y < 240; y++) {
+                    int sy = y * tile_h / 240;
+                    if (sy >= tile_h) sy = tile_h - 1;
+                    for (int x = 0; x < 320; x++) {
+                        int sx = x * tile_w / 320;
+                        if (sx >= tile_w) sx = tile_w - 1;
+                        uint8_t v = gfx[sy * tile_w + sx];
+                        if (v == 0) continue; /* transparent */
+                        /* Render as grayscale for now (palette TODO) */
+                        vf->framebuf[y*320+x] = 0xFF000000|(v<<16)|(v<<8)|v;
+                    }
+                }
+                ent_count = nz;
+                static int tile_log = 0;
+                if (!tile_log) {
+                    tile_log = 1;
+                    printf("[TILE] Rendered decompressed tile %dx%d (%d non-zero pixels)\n",
+                           tile_w, tile_h, nz);
+                }
+            } else {
+                /* Fallback: render sec[1] raw data */
+                uint32_t vff_gfx = 0x501800;
+                uint32_t vff_gfx_sz = 1772 * 1024;
                 memset(vf->framebuf, 0, 320*240*4);
                 uint8_t *gfx = vf->ram + vff_gfx;
-                int stride = 256; /* try 256px stride */
+                int stride = 256;
                 for (int y = 0; y < 240; y++) {
                     for (int x = 0; x < 320 && (y*stride+x) < (int)vff_gfx_sz; x++) {
                         uint8_t v = gfx[y * stride + x];
@@ -5866,8 +5996,6 @@ void vflash_run_frame(VFlash *vf) {
                     }
                 }
                 ent_count = vff_gfx_sz / 64;
-            } else {
-                ent_count = 0;
             }
             vf->vid.fb_dirty = 1;
             static int ptx_log = 0;
