@@ -6138,11 +6138,36 @@ void vflash_run_frame(VFlash *vf) {
                         }
                     }
                 }
+                /* Overlay PTX sprite on scene (car on road).
+                 * PTX data was loaded to ptx_data by the asset loader above.
+                 * Render it centered on the lower half of the screen. */
+                if (ptx_data && ptx_w > 0 && ptx_h > 0) {
+                    int src_h = ptx_h / 2; /* interlaced: even rows only */
+                    int dst_x = (320 - ptx_w) / 2; /* center horizontally */
+                    int dst_y = 120; /* lower half */
+                    if (dst_x < 0) dst_x = 0;
+                    int draw_w = ptx_w < 320 ? ptx_w : 320;
+                    int draw_h = src_h < 120 ? src_h : 120;
+                    for (int y = 0; y < draw_h; y++) {
+                        for (int x = 0; x < draw_w; x++) {
+                            uint16_t p = ptx_data[y * 2 * 512 + x];
+                            if (p == 0) continue; /* transparent */
+                            uint8_t r = (p & 0x1F) << 3;
+                            uint8_t g = ((p >> 5) & 0x1F) << 3;
+                            uint8_t b = ((p >> 10) & 0x1F) << 3;
+                            int dx = dst_x + x;
+                            int dy = dst_y + y;
+                            if (dx >= 0 && dx < 320 && dy >= 0 && dy < 240)
+                                vf->framebuf[dy*320+dx] =
+                                    0xFF000000|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                        }
+                    }
+                }
                 ent_count = nz;
                 static int tile_log = 0;
                 if (!tile_log) {
                     tile_log = 1;
-                    printf("[HLE-RENDER] 16-layer scene composite (%d tile pixels)\n", nz);
+                    printf("[HLE-RENDER] 16-layer scene + PTX sprite overlay\n");
                 }
             } else {
                 ent_count = 0;
