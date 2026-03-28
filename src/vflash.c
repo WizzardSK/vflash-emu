@@ -3351,6 +3351,22 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     VFlash *vf = ctx;
     ARM9 *cpu = &vf->cpu;
 
+    /* Render budget: decrement FIRST before any other intercepts. */
+    if (vf->render_budget > 0) {
+        vf->render_budget--;
+        if (vf->render_budget == 0 &&
+            addr >= 0x10A00000 && addr < 0x10C00000) {
+            static int budget_log = 0;
+            if (budget_log < 5)
+                printf("[RENDER-BUDGET] Expired at PC=%08X, forcing return\n", addr);
+            budget_log++;
+            cpu->r[0] = 0;
+            cpu->r[15] = 0x109D1CEC;
+            cpu->r[13] = 0x10B8DA90;
+            return 1;
+        }
+    }
+
     /* Intercept ANY zero-instruction call in µMORE service BSS range
      * (0x109A0000-0x109B0000) and nearby areas. Also catch the specific
      * dispatch table addresses and second-level dispatch addresses. */
@@ -3446,19 +3462,29 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     /* Dump game state on first render call */
     /* Force render_ctx[0]=1 when render processing is called.
      * This makes FUN_10a89100 enter processing path instead of returning. */
+    /* (budget check moved to top of function) */
+    /* Skip RTOS task_notify (10A6FC60) during game phase.
+     * Called after render_init and other subsystem inits. Gets stuck in
+     * priority tree traversal because RTOS task scheduler not fully active. */
+    if (addr == 0x10A6FC60 && ((VFlash*)ctx)->boot_phase >= 900) {
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
     /* HLE render_init (10A881F0): 3-step state machine that sets up render
      * subsystems. Gets stuck in RTOS task queue tree traversal (10A6AC60).
      * Set all ready flags and return — lets caller set render_enable=1. */
     if (addr == 0x10A881F0 && ((VFlash*)ctx)->boot_phase >= 900) {
         VFlash *vf2 = (VFlash*)ctx;
-        /* Set render subsystem ready flags (outside memset range) */
+        /* Set ONLY the 3 render ready flags + render_enable.
+         * Do NOT memset the render context — 0x01010101 in data fields
+         * causes render_processing to loop on garbage item lists. */
         vf2->ram[0xBE3EA0] = 1;  /* +0x260: render_subsystem_ready */
         vf2->ram[0xBE3C80] = 1;  /* +0x40: render_queue_ready */
         vf2->ram[0xBE3E20] = 1;  /* +0x1E0: render_objects_ready */
-        /* Pre-fill render context area with ready state */
-        memset(vf2->ram + 0xBE3C40, 1, 0x300); /* cover all flags */
-        /* Set render_enable — caller will also set it but be safe */
-        vf2->ram[0xBE3EC0] = 1;
+        vf2->ram[0xBE3EC0] = 1;  /* +0x280: render_enable */
+        /* GPU completion flag */
+        vf2->ram[0xBE3CA0] = 1;  /* +0x60: gpu_completion */
         static int ri_log = 0;
         if (ri_log < 3) {
             printf("[HLE-RENDER-INIT] Set all ready flags, returning\n");
@@ -3483,25 +3509,7 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         vf2->render_budget = 50000;
         return 0; /* let it run natively */
     }
-    /* Check render budget (counted in main CPU loop) */
-    if (((VFlash*)ctx)->render_budget > 0) {
-        VFlash *vf2 = (VFlash*)ctx;
-        vf2->render_budget--;
-        if (vf2->render_budget == 0) {
-            /* Budget expired — check if still in render pipeline (10A8xxxx-10ABxxxx) */
-            if (addr >= 0x10A80000 && addr < 0x10AC0000) {
-                static int budget_log = 0;
-                if (budget_log < 5)
-                    printf("[RENDER-BUDGET] Expired at PC=%08X, forcing return\n", addr);
-                budget_log++;
-                /* Force return to render_frame caller */
-                cpu->r[0] = 0;
-                cpu->r[15] = 0x109D1CEC; /* game loop after BL render */
-                cpu->r[13] = 0x10B8DA90; /* safe SP */
-                return 1;
-            }
-        }
-    }
+    /* (budget check moved to top of function) */
     if (addr == 0x10B265E8 && ((VFlash*)ctx)->boot_phase >= 900) {
         /* Render function — real code copied from BOOT.BIN location.
          * Let it run natively — render_init is HLE'd, render_enable
