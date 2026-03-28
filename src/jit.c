@@ -706,6 +706,25 @@ int jit_run(JitContext *jit, int cycles) {
     while (executed < cycles) {
         uint32_t pc = cpu->r[15];
 
+        /* Trace game_main execution */
+        if (pc >= 0x10CF0000 && pc < 0x10D00000) {
+            static int gm_trace = 0;
+            if (gm_trace < 20) {
+                printf("[GM-TRACE] PC=%08X R0=%08X R1=%08X LR=%08X SP=%08X\n",
+                       pc, cpu->r[0], cpu->r[1], cpu->r[14], cpu->r[13]);
+                gm_trace++;
+            }
+        }
+        /* Detect jump to ROM */
+        if (pc < 0x10000000 && pc > 0x400) {
+            static int rom_trace = 0;
+            if (rom_trace < 5) {
+                printf("[ROM-JUMP] PC=%08X LR=%08X R0=%08X SP=%08X\n",
+                       pc, cpu->r[14], cpu->r[0], cpu->r[13]);
+                rom_trace++;
+            }
+        }
+
         /* Check specific HLE intercept addresses — only these need interpreter */
         if (pc == 0x10A881F0 || pc == 0x10A8CDE4 || pc == 0x10A6FC60 ||
             pc == 0x10AB085C || pc == 0x10AB889C || pc == 0x10AB7A00 ||

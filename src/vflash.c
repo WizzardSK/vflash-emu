@@ -5763,6 +5763,11 @@ void vflash_run_frame(VFlash *vf) {
             *(uint32_t*)(vf->ram + (pc - 0x10000000)) == 0) {
             /* Restore FULL RAM from backup (all code+data structures) */
             memcpy(vf->ram, vf->rtos_backup, VFLASH_RAM_SIZE);
+            /* Set critical flags AFTER restore (backup was before these were set) */
+            *(uint16_t*)(vf->ram + 0xBE49E0) = 1;  /* game_main start flag */
+            *(uint32_t*)(vf->ram + 0xB009C4) = 1;  /* game_state = active */
+            *(uint32_t*)(vf->ram + 0xB902C0) = 3;  /* game_mode = gameplay */
+            *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;  /* render_enable */
             /* Jump to game_main (in BOOT.BIN area, always intact) */
             vf->cpu.r[15] = 0x10CFAEA0;
             vf->cpu.r[13] = 0x10B8D000;
@@ -5776,6 +5781,10 @@ void vflash_run_frame(VFlash *vf) {
         /* If landed in idle, restart game_main with full RAM state */
         if (pc == 0x10FFF00C && vf->boot_phase >= 800) {
             memcpy(vf->ram, vf->rtos_backup, VFLASH_RAM_SIZE);
+            *(uint16_t*)(vf->ram + 0xBE49E0) = 1;
+            *(uint32_t*)(vf->ram + 0xB009C4) = 1;
+            *(uint32_t*)(vf->ram + 0xB902C0) = 3;
+            *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;
             vf->cpu.r[15] = 0x10CFAEA0;
             vf->cpu.r[13] = 0x10B8D000;
             vf->cpu.r[14] = 0x10FFF000;
