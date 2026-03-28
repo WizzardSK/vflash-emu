@@ -5994,62 +5994,76 @@ void vflash_run_frame(VFlash *vf) {
                         0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
                 }
             }
-            /* Render decompressed tile graphics from 0x10240000.
-             * Tile data was decompressed by scene callbacks into HLE alloc area.
-             * Render first tile (512x256 @ 8bpp) scaled to screen with grayscale. */
+            /* Render multi-layer VFF scene from decompressed tile data.
+             * sec[1] tiles at 0x10240000 (sky/ground layers)
+             * sec[2] tiles at 0x101B8000 (horizon/detail layers)
+             * Each layer uses intensity modulation with a base color. */
             int ent_count = 0;
-            uint32_t tile_off = 0x240000;  /* decompressed tile data */
-            uint32_t tile_sz = 512 * 256;  /* first tile: 512x256 */
-            int tile_w = 512, tile_h = 256;
-            /* Check if tile data looks valid (has non-zero pixels) */
+            uint32_t tile_off = 0x240000;
+            uint32_t sec2_off = 0x1B8000;
             int nz = 0;
-            for (uint32_t ti = 0; ti < tile_sz && ti + tile_off < VFLASH_RAM_SIZE; ti++)
+            for (uint32_t ti = 0; ti < 512*256 && ti + tile_off < VFLASH_RAM_SIZE; ti++)
                 if (vf->ram[tile_off + ti]) nz++;
             if (nz > 1000) {
-                /* Clear framebuffer */
-                memset(vf->framebuf, 0, 320*240*4);
-                uint8_t *gfx = vf->ram + tile_off;
-                /* Scale tile to fit screen */
-                for (int y = 0; y < 240; y++) {
-                    int sy = y * tile_h / 240;
-                    if (sy >= tile_h) sy = tile_h - 1;
+                /* Clear to sky blue */
+                for (int i = 0; i < 320*240; i++)
+                    vf->framebuf[i] = 0xFF507898;
+                /* Layer 1: sec[1] tile 0 (512x256) as sky (top 120px) */
+                for (int y = 0; y < 120; y++) {
+                    int sy = y * 256 / 120;
                     for (int x = 0; x < 320; x++) {
-                        int sx = x * tile_w / 320;
-                        if (sx >= tile_w) sx = tile_w - 1;
-                        uint8_t v = gfx[sy * tile_w + sx];
-                        if (v == 0) continue; /* transparent */
-                        /* V.Flash uses single-color gradient: each layer has
-                         * a base color, tile values are intensity (0=transparent,
-                         * 255=full color). Desert brown for Cars background. */
-                        uint32_t base_r = 200, base_g = 150, base_b = 90;
-                        uint8_t r = (uint8_t)(base_r * v / 255);
-                        uint8_t g = (uint8_t)(base_g * v / 255);
-                        uint8_t b = (uint8_t)(base_b * v / 255);
+                        int sx = x * 512 / 320;
+                        uint8_t v = vf->ram[tile_off + sy * 512 + sx];
+                        if (v == 0) continue;
+                        uint8_t r = (uint8_t)(100 * v / 255);
+                        uint8_t g = (uint8_t)(160 * v / 255);
+                        uint8_t b = (uint8_t)(220 * v / 255);
                         vf->framebuf[y*320+x] =
-                            0xFF000000 | ((uint32_t)r<<16) | ((uint32_t)g<<8) | b;
+                            0xFF000000|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                    }
+                }
+                /* Layer 2: sec[2] data as horizon (mid 100px, 256-wide) */
+                for (int y = 80; y < 180; y++) {
+                    for (int x = 0; x < 320; x++) {
+                        int sx = x * 256 / 320;
+                        uint8_t v = vf->ram[sec2_off + (y-80) * 256 + sx];
+                        if (v == 0) continue;
+                        uint32_t old = vf->framebuf[y*320+x];
+                        uint8_t or2 = (old>>16)&0xFF, og = (old>>8)&0xFF, ob = old&0xFF;
+                        uint8_t r = (uint8_t)((or2/2) + (200 * v / 255)/2);
+                        uint8_t g = (uint8_t)((og/2) + (170 * v / 255)/2);
+                        uint8_t b = (uint8_t)((ob/2) + (120 * v / 255)/2);
+                        vf->framebuf[y*320+x] =
+                            0xFF000000|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                    }
+                }
+                /* Layer 3: sec[1] tile 5 (512x128) as ground (bottom 120px) */
+                {
+                    /* Tile 5 offset = sum of tiles 0-4 */
+                    uint32_t t5 = tile_off + 512*256 + 256*128 + 512*32 + 256*128 + 512*32;
+                    for (int y = 120; y < 240; y++) {
+                        int sy = (y - 120) * 128 / 120;
+                        for (int x = 0; x < 320; x++) {
+                            int sx = x * 512 / 320;
+                            if (t5 + sy*512 + sx >= VFLASH_RAM_SIZE) break;
+                            uint8_t v = vf->ram[t5 + sy * 512 + sx];
+                            if (v == 0) continue;
+                            uint8_t r = (uint8_t)(180 * v / 255);
+                            uint8_t g = (uint8_t)(130 * v / 255);
+                            uint8_t b = (uint8_t)(70 * v / 255);
+                            vf->framebuf[y*320+x] =
+                                0xFF000000|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                        }
                     }
                 }
                 ent_count = nz;
                 static int tile_log = 0;
                 if (!tile_log) {
                     tile_log = 1;
-                    printf("[TILE] Rendered decompressed tile %dx%d (%d non-zero pixels)\n",
-                           tile_w, tile_h, nz);
+                    printf("[TILE] Multi-layer scene: sky+horizon+ground (%d pixels)\n", nz);
                 }
             } else {
-                /* Fallback: render sec[1] raw data */
-                uint32_t vff_gfx = 0x501800;
-                uint32_t vff_gfx_sz = 1772 * 1024;
-                memset(vf->framebuf, 0, 320*240*4);
-                uint8_t *gfx = vf->ram + vff_gfx;
-                int stride = 256;
-                for (int y = 0; y < 240; y++) {
-                    for (int x = 0; x < 320 && (y*stride+x) < (int)vff_gfx_sz; x++) {
-                        uint8_t v = gfx[y * stride + x];
-                        vf->framebuf[y*320+x] = 0xFF000000|(v<<16)|(v<<8)|v;
-                    }
-                }
-                ent_count = vff_gfx_sz / 64;
+                ent_count = 0;
             }
             vf->vid.fb_dirty = 1;
             static int ptx_log = 0;
