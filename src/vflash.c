@@ -4679,6 +4679,17 @@ void vflash_run_frame(VFlash *vf) {
                 phase = 101; /* sync both */
                 phase = 101;
                 printf("[BOOT] BOOT.BIN init complete → idle at 0x%08X\n", pc);
+                /* Early backup: RTOS code should be intact at this point.
+                 * Do it unconditionally (even if later backup exists). */
+                {
+                    if (!vf->rtos_backup) vf->rtos_backup = malloc(VFLASH_RAM_SIZE);
+                    if (vf->rtos_backup) {
+                        memcpy(vf->rtos_backup, vf->ram, VFLASH_RAM_SIZE);
+                        printf("[EARLY-BACKUP] [109D1BD0]=%08X [A8CDE4]=%08X\n",
+                               *(uint32_t*)(vf->ram+0x9D1BD0),
+                               *(uint32_t*)(vf->ram+0xA8CDE4));
+                    }
+                }
                 /* Check if BSS service table got populated */
                 uint32_t svc = *(uint32_t*)(vf->ram + 0x9A0950);
                 printf("[BOOT] BSS[0x109A0950] = 0x%08X (%s)\n",
@@ -5748,6 +5759,12 @@ void vflash_run_frame(VFlash *vf) {
                 if (vf->rtos_backup) {
                     memcpy(vf->rtos_backup, vf->ram, VFLASH_RAM_SIZE);
                     printf("[RAM-BACKUP] Saved full 16MB RAM state\n");
+                    /* Dump backup for analysis */
+                    FILE *bf = fopen("/tmp/vflash_backup.bin", "wb");
+                    if (bf) { fwrite(vf->rtos_backup, 1, VFLASH_RAM_SIZE, bf); fclose(bf); }
+                    printf("[RAM-BACKUP] [109D1BD0]=%08X [109D11E0]=%08X\n",
+                           *(uint32_t*)(vf->ram + 0x9D1BD0),
+                           *(uint32_t*)(vf->ram + 0x9D11E0));
                 }
                 /* Flush JIT cache so all blocks get recompiled with
                  * write protection enabled (boot_phase >= 800) */
