@@ -663,9 +663,14 @@ int jit_run(JitContext *jit, int cycles) {
     while (executed < cycles) {
         uint32_t pc = cpu->r[15];
 
-        /* Check HLE intercepts first */
-        if (pc >= 0x109A0000 && pc < 0x10D00000) {
-            /* Potential HLE target — fall back to interpreter */
+        /* Check specific HLE intercept addresses — only these need interpreter */
+        if (pc == 0x10A881F0 || pc == 0x10A8CDE4 || pc == 0x10A6FC60 ||
+            pc == 0x10AB085C || pc == 0x10AB889C || pc == 0x10AB7A00 ||
+            pc == 0x10A89100 || /* render_processing */
+            (pc >= 0x10A86E00 && pc <= 0x10A871C0) || /* HLE division */
+            pc == 0x10A00840 || pc == 0x10A4D500 || /* HLE memcpy/memset */
+            pc == 0x10A4F934 || pc == 0x10A51740 || pc == 0x10A711D0 || /* HLE byte copy */
+            pc == 0x10A4DF10) { /* HLE strcmp */
             arm9_step(cpu);
             executed++;
             continue;
