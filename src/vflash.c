@@ -1290,6 +1290,15 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                     if (v) printf("[BOOT-FLAG] Read 0x900A000C = 0x%08X (warm=%d)\n", v, (v>>1)&1);
                     return v;
                 }
+                case 0x18: {
+                    /* Display status: bit25 = VBlank toggle.
+                     * Render processing checks this to know when to draw.
+                     * Toggle bit25 on each read to simulate VBlank. */
+                    uint32_t v = vf->misc_regs[0x18 >> 2];
+                    v ^= 0x02000000;
+                    vf->misc_regs[0x18 >> 2] = v;
+                    return v;
+                }
                 case 0x28: return 0x00000000; /* ASIC ID low */
                 case 0x2C: return 0x00000000; /* ASIC ID high */
                 default:
@@ -3505,6 +3514,10 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         /* Set dirty flag so render_processing attempts to draw */
         *(uint32_t*)(vf2->ram + 0xBE3C40) = 1;      /* ctx[0] = dirty */
         *(uint32_t*)(vf2->ram + 0xBE3C4C) = 3;      /* ctx[3] = flags */
+        /* TODO: Display list at ctx+0xE4 needs proper structure from render_init.
+         * Entity list head at [10B92BE0] also needs initialization.
+         * VBlank toggle (0x900A0018 bit25) now works — render enters draw path
+         * but display list is empty so no entity draw calls happen yet. */
         vf2->render_budget = 50000;
         return 0;
     }
