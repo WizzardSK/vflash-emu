@@ -5739,24 +5739,14 @@ void vflash_run_frame(VFlash *vf) {
             }
         }
         if (!entry) {
-            /* Game task $QCB at 0x10358580 has entry=0 because
-             * RTOS never registered the game task in this boot flow.
-             * Set entry directly to game_main in BOOT.BIN. */
-            entry = 0x10CFAEA0; /* game_main in BOOT.BIN */
+            /* Let kernel scheduler run — it will dispatch tasks natively.
+             * Service entry is at [0xFFCC] = 0x10087160 (kernel scheduler). */
+            entry = *(uint32_t*)(vf->ram + 0xFFCC);
+            if (entry < 0x10000000 || entry >= 0x10100000)
+                entry = 0x10087160;
             sbase = 0x10B6DB28;
             ssz = 0x20000;
-            /* Also populate $QCB so kernel scheduler can find it */
-            *(uint32_t*)(vf->ram + 0x35858C) = entry; /* $QCB+0x2C = entry */
-            *(uint32_t*)(vf->ram + 0x3585B0) = sbase; /* $QCB+0x30 = stack base */
-            *(uint32_t*)(vf->ram + 0x3585B4) = ssz;   /* $QCB+0x34 = stack size */
-            /* Set game state flags */
-            *(uint16_t*)(vf->ram + 0xBE49E0) = 1;  /* game_main start flag */
-            *(uint32_t*)(vf->ram + 0xB009C4) = 1;
-            *(uint32_t*)(vf->ram + 0xB902C0) = 3;
-            *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;
-            *(uint32_t*)(vf->ram + 0xB05A18) = 8;
-            *(uint32_t*)(vf->ram + 0xB05A1C) = 8;
-            printf("[AUTO-LAUNCH] Set game_main 0x%08X in $QCB\n", entry);
+            printf("[AUTO-LAUNCH] Using service dispatcher 0x%08X\n", entry);
         }
         {
             printf("[AUTO-LAUNCH] Game task: entry=%08X stack=%08X+%X\n", entry, sbase, ssz);
