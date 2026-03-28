@@ -911,6 +911,7 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         uint32_t roff = addr - VFLASH_RAM_BASE;
         /* Flash completion: µMORE loop checks [0x10BBCFF4] and [0x10BBD010].
          * Force bit 0 on both to signal operation complete. */
+        /* (render context trace removed) */
         /* Detect game task reaching BOOT.BIN code (0x10C00000+) */
         if (vf->boot_phase >= 800 && roff >= 0xC00000 && roff < 0xE00000) {
             static int bootbin_access = 0;
@@ -1533,11 +1534,11 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
             val = 3;
         }
         /* GPU completion flag at [10BE3CA0] (render_ctx+0x60).
-         * Render_init polls this until non-zero (GPU frame done).
-         * On real HW, GPU sets it after processing. Force to 1. */
-        if (roff >= 0xBE3C40 && roff < 0xBE3D40 && val == 0 &&
-            vf->boot_phase >= 900) {
-            val = 1; /* keep render state at "ready/done" */
+         * Only protect THIS SPECIFIC BYTE, not the whole 256-byte range.
+         * Previous wide range (0xBE3C40-0xBE3D40) prevented render_processing
+         * from managing its own state fields (all zeros became 1). */
+        if (roff == 0xBE3CA0 && val == 0 && vf->boot_phase >= 900) {
+            val = 1; /* keep GPU completion at "done" */
         }
         /* Protect game callback pointer at [0x10BBD3C0].
          * µMORE game task init writes 0 here — prevent clearing. */
@@ -3500,14 +3501,12 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     if (addr == 0x10A89100 && ((VFlash*)ctx)->boot_phase >= 900) {
         static int r_log = 0;
         VFlash *vf2 = (VFlash*)ctx;
-        if (r_log < 3) {
-            printf("[RENDER-PROC] render_processing called (R0=%08X)\n", cpu->r[0]);
-            r_log++;
-        }
-        /* Set instruction budget: after 50000 instructions in render_processing,
-         * check if we're still inside it and force return if stuck. */
+        if (r_log < 3) r_log++;
+        /* Set dirty flag so render_processing attempts to draw */
+        *(uint32_t*)(vf2->ram + 0xBE3C40) = 1;      /* ctx[0] = dirty */
+        *(uint32_t*)(vf2->ram + 0xBE3C4C) = 3;      /* ctx[3] = flags */
         vf2->render_budget = 50000;
-        return 0; /* let it run natively */
+        return 0;
     }
     /* (budget check moved to top of function) */
     if (addr == 0x10B265E8 && ((VFlash*)ctx)->boot_phase >= 900) {
