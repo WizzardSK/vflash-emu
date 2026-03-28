@@ -169,6 +169,8 @@ typedef struct {
     uint32_t control;     /* 0x18: control register */
     uint32_t imsc;        /* 0x1C: interrupt mask */
     uint32_t ris;         /* 0x20: raw interrupt status */
+    uint16_t palette[256]; /* 0x200-0x3FF: 256-entry XBGR1555 palette */
+    int      pal_written;  /* number of palette entries written */
 } LCDRegs;
 
 /* Audio DMA state */
@@ -1648,6 +1650,23 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                     break;
                 case 0x1C: vf->lcd.imsc = val; break;
                 case 0x28: vf->lcd.ris &= ~val; break; /* ICR: clear interrupts */
+                default:
+                    /* PL111 palette RAM at 0x200-0x3FF */
+                    if (lreg >= 0x200 && lreg < 0x400) {
+                        uint32_t idx = (lreg - 0x200) / 2;
+                        if (idx < 256) {
+                            /* PL111 palette: each 32-bit write stores two 16-bit entries */
+                            vf->lcd.palette[idx] = (uint16_t)(val & 0xFFFF);
+                            if (idx + 1 < 256)
+                                vf->lcd.palette[idx + 1] = (uint16_t)(val >> 16);
+                            if (!vf->lcd.pal_written) {
+                                printf("[LCD] First palette write: [%d]=0x%04X [%d]=0x%04X\n",
+                                       idx, val & 0xFFFF, idx+1, val >> 16);
+                            }
+                            vf->lcd.pal_written++;
+                        }
+                    }
+                    break;
             }
             return;
         }
@@ -3361,6 +3380,34 @@ static void play_wav_from_cd(VFlash *vf, CDEntry *entry) {
 static int hle_service_intercept(void *ctx, uint32_t addr) {
     VFlash *vf = ctx;
     ARM9 *cpu = &vf->cpu;
+
+    /* Capture palette: if render code hits tile LUT functions,
+     * R5/R6 holds the 32-bit ARGB palette pointer (256 entries × 4 bytes). */
+    if ((addr == 0x10A26470 || addr == 0x10A2687C || addr == 0x10A26898) &&
+        vf->lcd.pal_written == 0) {
+        uint32_t pal_ptr = cpu->r[5];
+        if (addr != 0x10A26470) pal_ptr = cpu->r[6]; /* R6 for 0x10A2687C/898 */
+        if (pal_ptr >= 0x10000000 && pal_ptr + 1024 <= 0x10000000 + VFLASH_RAM_SIZE) {
+            uint32_t p_off = pal_ptr - 0x10000000;
+            printf("[PALETTE] Captured at 0x10A26470: R5=0x%08X\n", pal_ptr);
+            /* Convert ARGB32 palette to XBGR1555 for PL111 */
+            for (int i = 0; i < 256; i++) {
+                uint32_t c = *(uint32_t*)(vf->ram + p_off + i*4);
+                uint8_t r = (c >> 16) & 0xFF;
+                uint8_t g = (c >> 8) & 0xFF;
+                uint8_t b = c & 0xFF;
+                vf->lcd.palette[i] = ((r >> 3) & 0x1F) |
+                                     (((g >> 3) & 0x1F) << 5) |
+                                     (((b >> 3) & 0x1F) << 10);
+            }
+            vf->lcd.pal_written = 256;
+            printf("[PALETTE] e0=0x%08X e1=0x%08X e18=0x%08X e212=0x%08X\n",
+                   *(uint32_t*)(vf->ram+p_off),
+                   *(uint32_t*)(vf->ram+p_off+4),
+                   *(uint32_t*)(vf->ram+p_off+18*4),
+                   *(uint32_t*)(vf->ram+p_off+212*4));
+        }
+    }
 
     /* Render budget: decrement FIRST before any other intercepts. */
     if (vf->render_budget > 0) {
@@ -5971,8 +6018,15 @@ void vflash_run_frame(VFlash *vf) {
                         if (sx >= tile_w) sx = tile_w - 1;
                         uint8_t v = gfx[sy * tile_w + sx];
                         if (v == 0) continue; /* transparent */
-                        /* Render as grayscale for now (palette TODO) */
-                        vf->framebuf[y*320+x] = 0xFF000000|(v<<16)|(v<<8)|v;
+                        /* V.Flash uses single-color gradient: each layer has
+                         * a base color, tile values are intensity (0=transparent,
+                         * 255=full color). Desert brown for Cars background. */
+                        uint32_t base_r = 200, base_g = 150, base_b = 90;
+                        uint8_t r = (uint8_t)(base_r * v / 255);
+                        uint8_t g = (uint8_t)(base_g * v / 255);
+                        uint8_t b = (uint8_t)(base_b * v / 255);
+                        vf->framebuf[y*320+x] =
+                            0xFF000000 | ((uint32_t)r<<16) | ((uint32_t)g<<8) | b;
                     }
                 }
                 ent_count = nz;
