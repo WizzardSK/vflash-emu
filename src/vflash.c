@@ -249,6 +249,7 @@ struct VFlash {
 
     int      boot_phase; /* Boot flow phase tracking */
     int      render_budget; /* Instructions remaining in render pipeline (0=unlimited) */
+    uint32_t native_alloc_lr; /* Track native alloc return address for logging */
     uint32_t flash_last_write; /* Last value written to NOR flash (for status polling) */
     /* Saved game task info from BOOT TCB scan (before service entry may overwrite) */
     uint32_t saved_game_entry;
@@ -3660,13 +3661,31 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
      * Bump allocator with dummy vtable at [+0] for safe virtual calls. */
     /* Let 10A775E0 (main alloc) run natively — it may create objects with
      * real vtables. Only HLE 10A77648 (variant that crashes on 40000010). */
+    /* HLE native alloc (10A775E0): bump allocator WITHOUT dummy vtable.
+     * Let the caller (VFF scene code) set whatever vtable it wants.
+     * Native alloc gets stuck in uninitialized game heap. */
     if (addr == 0x10A775E0 && ((VFlash*)ctx)->boot_phase >= 800) {
-        static int na_log = 0;
-        if (na_log < 5) {
-            printf("[NATIVE-ALLOC] 10A775E0(size=%u) LR=%08X\n", cpu->r[0], cpu->r[14]);
-            na_log++;
+        static uint32_t native_bump = 0x390000; /* separate from HLE alloc area */
+        uint32_t size = cpu->r[0];
+        if (size == 0) size = 64;
+        if (size > 0x10000) size = 0x10000;
+        VFlash *vf2 = (VFlash*)ctx;
+        if (native_bump + size < 0x400000) {
+            uint32_t ptr = 0x10000000 + native_bump;
+            memset(vf2->ram + native_bump, 0, size);
+            static int na_log = 0;
+            if (na_log < 10) {
+                printf("[HLE-ALLOC] 10A775E0(size=%u) → %08X LR=%08X\n",
+                       size, ptr, cpu->r[14]);
+                na_log++;
+            }
+            native_bump = (native_bump + size + 15) & ~15u;
+            cpu->r[0] = ptr;
+        } else {
+            cpu->r[0] = 0;
         }
-        return 0; /* let it run natively */
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
     }
     if (addr == 0x10A77648 &&
         ((VFlash*)ctx)->boot_phase >= 800) {
@@ -5640,32 +5659,36 @@ void vflash_run_frame(VFlash *vf) {
                     if (pc == 0x10FFF000 || (pc > 0x11000000 && pc < 0x80000000)) break;
                 }
                 printf("[VFF-SCENE] Entity callback: %d steps\n", si);
-                /* Log entity data BEFORE vtable restore to find real vtable ptrs */
-                printf("[VFF-SCENE] Entity data before restore:\n");
-                int real_vt = 0;
-                for (uint32_t ea = 0x320000; ea < 0x370000; ea += 64) {
+                /* Log entity vtable values after scene callback */
+                printf("[VFF-SCENE] Entity data after callback:\n");
+                int real_vt = 0, dummy_vt = 0, data_vt = 0;
+                for (uint32_t ea = 0x320000; ea < 0x400000; ea += 64) {
                     uint32_t v = *(uint32_t*)(vf->ram + ea);
-                    if (v != 0 && v != 0x10310800 && real_vt < 10) {
-                        printf("  [%08X]+0 = %08X", 0x10000000+ea, v);
-                        /* Check if it's a plausible vtable pointer (in code range) */
-                        if (v >= 0x10A00000 && v < 0x10E00000)
-                            printf(" ← VTABLE in code range!");
-                        else if (v == 0xBDBDBDBD)
-                            printf(" ← debug fill");
-                        printf("\n");
+                    if (v == 0) continue;
+                    if (v == 0x10310800) { dummy_vt++; continue; }
+                    if (v >= 0x10A00000 && v < 0x10E00000) {
+                        if (real_vt < 10)
+                            printf("  [%08X]+0 = %08X ← REAL VTABLE!\n", 0x10000000+ea, v);
                         real_vt++;
+                    } else if (v >= 0x104E0000 && v < 0x10600000) {
+                        if (real_vt < 10)
+                            printf("  [%08X]+0 = %08X ← VFF VTABLE!\n", 0x10000000+ea, v);
+                        real_vt++;
+                    } else {
+                        data_vt++;
                     }
                 }
-                /* Re-set dummy vtable on ALL allocated entities.
-                 * Scene callback overwrites [entity+0] with data.
-                 * Restore vtable pointer so virtual method calls go to stubs. */
-                for (uint32_t ea = 0x320000; ea < 0x380000; ea += 0x10) {
+                printf("[VFF-SCENE] vtables: %d real, %d dummy, %d data\n",
+                       real_vt, dummy_vt, data_vt);
+                /* Only restore dummy vtable on HLE alloc area (0x320000-0x390000).
+                 * Leave native alloc area (0x390000+) alone — may have real vtables. */
+                for (uint32_t ea = 0x320000; ea < 0x390000; ea += 0x10) {
                     uint32_t v = *(uint32_t*)(vf->ram + ea);
                     if (v != 0 && v != 0x10310800) {
                         *(uint32_t*)(vf->ram + ea) = 0x10310800;
                     }
                 }
-                printf("[VFF-SCENE] Restored dummy vtable on alloc'd entities\n");
+                printf("[VFF-SCENE] Restored dummy vtable on HLE alloc area only\n");
                 vf->cpu.r[15]=spc; vf->cpu.r[13]=ssp;
                 vf->cpu.r[14]=slr; vf->cpu.cpsr=scp;
             }
