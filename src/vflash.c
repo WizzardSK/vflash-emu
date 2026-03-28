@@ -3558,6 +3558,42 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         return 1;
     }
 
+    /* HLE byte copy loops — multiple variants of byte-by-byte memcpy.
+     * These 7-instruction loops run millions of times during rendering.
+     * Replace with native memcpy for ~50x speedup per call. */
+    if ((addr == 0x10A4F934 || addr == 0x10A51740 || addr == 0x10A711D0) &&
+        ((VFlash*)ctx)->boot_phase >= 100) {
+        VFlash *vf2 = (VFlash*)ctx;
+        uint32_t src = cpu->r[2] - 0x10000000; /* R2 = source ptr */
+        uint32_t dst = cpu->r[12] - 0x10000000; /* R12 = dest ptr */
+        uint32_t cnt = cpu->r[4]; /* R4 = count */
+        if (cnt > 0 && cnt < 0x100000 &&
+            src < VFLASH_RAM_SIZE && dst < VFLASH_RAM_SIZE &&
+            src + cnt <= VFLASH_RAM_SIZE && dst + cnt <= VFLASH_RAM_SIZE) {
+            memmove(vf2->ram + dst, vf2->ram + src, cnt);
+            cpu->r[4] = 0; /* counter = 0 (done) */
+            cpu->r[2] = cpu->r[2] + cnt; /* advance src */
+            cpu->r[12] = cpu->r[12] + cnt; /* advance dst */
+            /* Skip to instruction after the BNE */
+            cpu->r[15] = addr + (addr == 0x10A711D0 ? 0x20 : 0x18);
+            return 1;
+        }
+    }
+    /* HLE strcmp loop at 10A4DF10: byte-by-byte compare */
+    if (addr == 0x10A4DF10 && ((VFlash*)ctx)->boot_phase >= 100) {
+        VFlash *vf2 = (VFlash*)ctx;
+        uint32_t s1 = cpu->r[0] - 0x10000000;
+        uint32_t s2 = cpu->r[1] - 0x10000000;
+        if (s1 < VFLASH_RAM_SIZE - 256 && s2 < VFLASH_RAM_SIZE - 256) {
+            int result = strncmp((char*)vf2->ram + s1, (char*)vf2->ram + s2, 256);
+            cpu->r[0] = result > 0 ? 1 : (result < 0 ? -1 : 0);
+            cpu->cpsr = (cpu->cpsr & ~0xF0000000) | (result == 0 ? 0x40000000 :
+                         result > 0 ? 0x20000000 : 0x80000000);
+            cpu->r[15] = cpu->r[14] & ~3u;
+            return 1;
+        }
+    }
+
     /* HLE memcpy at 10A00840: R0=dst, R1=src, R2=len → R0=dst */
     if (addr == 0x10A00840) {
         VFlash *vf2 = (VFlash*)ctx;
