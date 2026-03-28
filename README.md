@@ -31,14 +31,15 @@ Background voice/SFX audio plays automatically from 561 WAV files on disc.
 
 ## Status
 
-**JIT compiler: 37 FPS, render pipeline running natively** — ARM926EJ-S → x86_64
+**JIT compiler: 37 FPS, 1.4MB game code relocated from BOOT.BIN** — ARM926EJ-S → x86_64
 basic block JIT compiler translates 9000+ code blocks on the fly. µMORE v4.0 RTOS
-boots, game task launched, render pipeline executes real rendering code (software
-division, pixel blending, entity iteration). VFF tile decompression: 29 tiles
-(1.2MB) decompressed from disc. RTOS code area protected from game BSS clear with
-per-frame backup/restore. HLE hot functions: software division (~40x speedup),
-memcpy, memset, byte copy, strcmp. Game loop runs at full speed with all engine
-subsystems active.
+boots, game task launched via HLE FIQ handler + Nucleus TCB creation. Real game loop
+code (not stub) relocated from BOOT.BIN CD: game logic (0x109D0000, 704KB), render
+engine (0x10A80000, 566KB), unrelocated functions (0x10B0DB0C, 100KB). Render pipeline
+executes real code: render_processing, display controller setup, VIC configuration.
+VFF tile decompression: 29 tiles (1.2MB) decompressed from disc. RTOS code area
+protected from BSS clear (write protection 0x109D0000-0x10BF0000). HLE hot functions:
+software division (~40x speedup), memcpy, memset, byte copy, strcmp, event pump skip.
 
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spider-Man.
 
@@ -71,7 +72,12 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **JIT compiler** | ✅ ARM→x86_64, 9000+ blocks, 1B+ instructions JIT'd |
 | **HLE hot functions** | ✅ Division, memcpy, memset, strcmp — native C |
 | **RTOS code protection** | ✅ Backup/restore survives game BSS clear |
-| **Render processing** | 🔧 Pipeline runs natively but RTOS dispatch stubbed |
+| **HLE FIQ handler** | ✅ Timer IRQ → task ready flag, Nucleus TCB at 0x10F00100 |
+| **BOOT.BIN code relocation** | ✅ 1.4MB: game loop + render + engine from CD |
+| **Display controller MMIO** | ✅ 0xB80007xx registers intercepted (VBlank, framebuffer) |
+| **Event pump HLE** | ✅ 0x10138000 data table skip (was crashing as code) |
+| **Per-slice PC escape** | ✅ Instant redirect from flash ROM / low memory |
+| **Render processing** | 🔧 Called but draw path not yet entered (flag analysis needed) |
 | **PTX display** | ✅ Game artwork (XBGR1555 sprites) on screen |
 
 ### Remaining for gameplay
@@ -83,10 +89,13 @@ Dispatch table (58 entries in 0x30-byte groups) decoded: graphics layers with
 compressed sizes, audio channels (22050Hz stereo), and render layers with tile
 data pointers + X/Y position offsets.
 
-**RTOS dispatch needed**: render_init is HLE'd (native corrupts vtables).
-Engine needs functional Nucleus RTOS task scheduler to dispatch render
-subsystems. 10A8CDE4 (tree traversal) currently stubbed → engine creates
-no render objects → framebuffer empty despite 37 FPS execution speed.
+**Render draw path**: render_processing (0x10A89100) is called every game loop
+iteration but returns early. The function checks render context flags at
+0x10BE3C40 (ctx[0]=error, ctx[1]=frame_ready) and render enable at 0x10BE3EC0.
+These are set per-frame but the inner draw path has additional state dependencies
+(display list population, entity vtable dispatch, VBlank callback) that need
+further analysis. The relocated render code writes to display controller registers
+(0xB80007xx) configuring VIC, framebuffer address, and VBlank callback.
 
 **Native alloc**: 10A775E0 gets stuck in uninitialized game heap. HLE'd with
 separate bump area at 0x390000. 10A77648 (variant) HLE'd at 0x320000.
@@ -96,7 +105,13 @@ separate bump area at 0x390000. 10A77648 (variant) HLE'd at 0x320000.
 - NULL entity read trap: returns ready(1) for [0x00-0x1F] (breaks ALL polling loops)
 - Dummy vtable at 0x10310800: 64 ARM stubs (MOV R0,#0; BX LR)
 - Engine wait skip (10A20B30): breaks BEQ loop waiting for entity state
-- 73 unrelocated functions: 100KB block copy (10D48B20→10B0DB0C)
+- 1.4MB BOOT.BIN relocation: game loop (704KB, 0xB0014→0x109D0000),
+  render engine (566KB, 0xBB014→0x10A80000), 73 functions (100KB, 0x10D48B20→0x10B0DB0C)
+- HLE FIQ handler at 0x10A15DA4: clears timer, creates Nucleus TCB, mode switch
+- Game task TCB at 0x10F00100: entry 0x10C16CC0, ready list at 0x100AC030
+- Display controller MMIO (0xB80007xx): VBlank callback, framebuffer, IRQ handler
+- Event pump HLE (0x10138000-0x10139000): skip data-as-code table
+- Per-slice PC escape: redirect from 0xB8000000+ / low ROM to game loop
 - HLE render_init (10A881F0): sets 5 ready flags, skips RTOS callbacks
 - VBlank toggle: MMIO 0x900A0018 bit25 flips on each read
 - Display list vector: 100 entity pointers at 0x10B90000
@@ -165,7 +180,10 @@ ROM[0x00] → flash copy → flash remap (0x118)
   → BOOT.BIN bootstrap (0x10C00010) → warm reboot #2
   → BOOT.BIN init (0x10C0011C) → populates 0x109D11E0 + vectors
   → µMORE service entry → "µMORE v4.0 SDK ARM9T version"
-  → scheduler halt → FIQ dispatch (0x10A15DA4)
+  → scheduler halt → HLE FIQ handler (0x10A15DA4)
+  → game task TCB (0x10F00100) → ready list (0x100AC030)
+  → AUTO-LAUNCH → 1.4MB BOOT.BIN relocation from CD
+  → game loop (0x109D1CE0) → render_processing (0x10A89100)
 ```
 
 ### Physical Memory Map (ZEVIO 1020)
@@ -227,6 +245,15 @@ ROM[0x00] → flash copy → flash remap (0x118)
 | VFF entry hardcoded | Only one scene worked | Dynamic entry scan (LDR+PUSH pattern) |
 | VFF section offset | Data shifted by 0x3A0 | Header is 0x60 bytes, loader uses 0x400 padded |
 | Scene callbacks stub | Tiles not decompressed | Call all 65 dispatch table callbacks |
+| FIQ handler BSS zero | Timer IRQ → zero code → crash | HLE FIQ at 0x10A15DA4 with mode switch |
+| Event pump as code | 0x10138000 data executed as BL | HLE skip data table range |
+| Render code not loaded | 0x10A80000 all BSS zeros | Reload 566KB from BOOT.BIN CD |
+| Game loop code missing | 0x109D1CE0 was empty | Reload 704KB from BOOT.BIN CD |
+| Phase 101 overwrites bp | boot_phase 800→300 race | Guard with boot_phase < 800 |
+| PC escape to flash ROM | Render writes to 0xB80007xx | DC MMIO intercept + per-slice redirect |
+| CPSR mode corruption | Mode bits = 0x00 (invalid) | Per-frame sanity check → force SVC |
+| DC regs as flash writes | 0xB80007xx absorbed silently | Separate DC register handler |
+| BSS clear kills render | Game zeroes 0x10A80000+ | Write protection 0x9D0000-0xBF0000 |
 
 ### Subsystems
 - ATAPI CD-ROM: INQUIRY, READ(10), READ CD, READ TOC, READ CAPACITY, MODE SENSE

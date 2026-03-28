@@ -261,6 +261,9 @@ struct VFlash {
     uint32_t saved_game_entry;
     uint32_t saved_game_stack;
     uint32_t saved_game_stack_sz;
+    uint32_t fiq_saved_r8_12[5]; /* r[8]-r[12] saved before FIQ mode switch */
+    uint32_t dc_vblank_cb;       /* Display controller VBlank callback (from 0xB80007C0) */
+    uint32_t dc_irq_handler;     /* Display controller IRQ handler (from 0xB8000784) */
 
     uint32_t  framebuf[VFLASH_SCREEN_W * VFLASH_SCREEN_H];
 };
@@ -1146,6 +1149,21 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         /* NOR Flash controller at 0xB8000000 (2MB). */
         if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
             uint32_t foff = off - 0x38000000u;
+
+            /* Display controller registers at 0xB8000700-0xB80007FF (reads).
+             * Return safe defaults so render code doesn't branch to ROM. */
+            if (foff >= 0x700 && foff < 0x800) {
+                switch (foff) {
+                case 0x770: return 1;    /* status: ready */
+                case 0x774: return 0;    /* clear */
+                case 0x784: return 0;    /* irq handler (none) */
+                case 0x7A8: return 1;    /* enabled */
+                case 0x7AC: return 0;    /* ID/status */
+                case 0x7B0: return vf->lcd.upbase; /* framebuffer addr */
+                default:    return 0;
+                }
+            }
+
             if (foff < 0x800) {
                 /* NOR flash: µMORE writes data then polls to verify.
                  * Return last written value (flash write completes instantly).
@@ -1818,6 +1836,30 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
          * We buffer all writes to 0xB8000800+ and flush to RAM on remap. */
         if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
             uint32_t foff = off - 0x38000000u;
+
+            /* Display controller registers at 0xB8000700-0xB80007FF.
+             * Render code writes VBlank callback, framebuffer pointer, etc.
+             * These are NOT flash commands — intercept before flash handler. */
+            if (foff >= 0x700 && foff < 0x800) {
+                static int dc_log = 0;
+                if (dc_log < 20) {
+                    printf("[DC] Write 0x%08X = 0x%08X PC=%08X\n",
+                           addr, val, vf->cpu.r[15]);
+                    dc_log++;
+                }
+                /* 0x7C0: VBlank callback address */
+                if (foff == 0x7C0 && val >= 0x10000000 && val < 0x11000000)
+                    vf->dc_vblank_cb = val;
+                /* 0x7B0: framebuffer address */
+                if (foff == 0x7B0 && val >= 0x10000000 && val < 0x11000000)
+                    vf->lcd.upbase = val;
+                /* 0x784: interrupt handler address */
+                if (foff == 0x784 && val >= 0x10000000 && val < 0x11000000)
+                    vf->dc_irq_handler = val;
+                /* Absorb all display controller writes */
+                return;
+            }
+
             /* Track writes to flash data area (for status polling read-back) */
             if (foff < 0x800) {
                 vf->flash_last_write = val;
@@ -3619,8 +3661,8 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         uint32_t len = cpu->r[2];
         if (dst < VFLASH_RAM_SIZE && src < VFLASH_RAM_SIZE &&
             dst + len <= VFLASH_RAM_SIZE && src + len <= VFLASH_RAM_SIZE && len < 0x100000) {
-            /* Protect RTOS code from overwrite */
-            if (dst >= 0xA00000 && dst < 0xB10000) {
+            /* Protect relocated game+render code from BSS clear overwrite */
+            if (dst >= 0x9D0000 && dst < 0xB30000) {
                 cpu->r[15] = cpu->r[14] & ~3u;
                 return 1;
             }
@@ -3637,8 +3679,8 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         uint32_t val = cpu->r[1] & 0xFF;
         uint32_t len = cpu->r[2];
         if (dst < VFLASH_RAM_SIZE && dst + len <= VFLASH_RAM_SIZE && len < 0x100000) {
-            /* Skip if trying to zero RTOS code area */
-            if (val == 0 && dst >= 0xA00000 && dst < 0xB10000) {
+            /* Skip if trying to zero relocated game+render code area */
+            if (val == 0 && dst >= 0x9D0000 && dst < 0xB30000) {
                 static int prot_log = 0;
                 if (prot_log++ < 3)
                     printf("[MEMSET-PROTECT] Blocked zero of RTOS area %08X+%X\n",
@@ -3913,6 +3955,22 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         /* Functions that MAY do CD-ROM I/O — let them run.
          * 109D1F28: peripheral wait — runs init code then blocks
          * 10A176BC: event setup — registers event handlers then blocks */
+
+        /* HLE event pump: 0x10138000-0x10139000 contains a 16-bit offset
+         * table (µMORE event dispatch), NOT executable code.  Init task
+         * should have populated it with function pointers but was HLE'd.
+         * CPU lands here via indirect BL from game loop — just return. */
+        if (addr >= 0x10138000 && addr < 0x10139000) {
+            static int evp_log = 0;
+            if (evp_log < 5) {
+                printf("[HLE-EVPUMP] Skip data-as-code at 0x%08X LR=%08X\n",
+                       addr, cpu->r[14]);
+                evp_log++;
+            }
+            cpu->r[0] = 0;
+            cpu->r[15] = cpu->r[14] & ~3u;
+            return 1;
+        }
     }
 
     /* Intercept scheduler init: set sched_state=3 before task_start. */
@@ -3956,6 +4014,107 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         }
         printf("[HLE] Cleared guards for task_start\n");
         return 0;
+    }
+
+    /* HLE FIQ/IRQ handler: timer interrupt reaches 0x10A15DA4 (unpopulated BSS).
+     * µMORE never populated this handler — HLE it to:
+     * 1. Clear timer IRQ
+     * 2. Create game task TCB with entry 0x10C16CC0
+     * 3. Enqueue in Nucleus ready list at 0x100AC030
+     * 4. Return from exception so scheduler at 0x10087160 can dispatch */
+    if (addr == 0x10A15DA4 && ((VFlash*)ctx)->boot_phase >= 800) {
+        VFlash *vf = (VFlash *)ctx;
+        static int fiq_count = 0;
+
+        /* Clear timer IRQ */
+        vf->timer.timer[0].irq_pending = 0;
+        ztimer_clear_irq(&vf->timer, 0);
+        vf->timer.irq.status &= ~1u;
+
+        /* Create game task TCB at 0x10F00100 (once) */
+        uint32_t tcb = 0xF00100;
+        if (*(uint32_t*)(vf->ram + tcb) != 0x42435124) {
+            memset(vf->ram + tcb, 0, 0x100);
+            *(uint32_t*)(vf->ram + tcb + 0x00) = 0x42435124; /* $QCB magic */
+            *(uint32_t*)(vf->ram + tcb + 0x04) = 0;          /* next = NULL (single task) */
+            *(uint32_t*)(vf->ram + tcb + 0x08) = 1;          /* priority */
+            *(uint32_t*)(vf->ram + tcb + 0x0C) = 1;          /* status: active */
+            *(uint32_t*)(vf->ram + tcb + 0x1C) = 0x42435424; /* $QBT stack marker */
+            *(uint32_t*)(vf->ram + tcb + 0x28) = 10;         /* task ID */
+            *(uint32_t*)(vf->ram + tcb + 0x2C) = 0x10C16CC0; /* entry point */
+            *(uint32_t*)(vf->ram + tcb + 0x30) = 0x10FFD000; /* stack base */
+            *(uint32_t*)(vf->ram + tcb + 0x34) = 0x20000;    /* stack size 128KB */
+            printf("[HLE-FIQ] Created game task TCB at 0x%08X entry=0x10C16CC0\n",
+                   0x10000000 + (unsigned)tcb);
+        }
+
+        /* Mark task as ready with saved context for scheduler */
+        *(uint32_t*)(vf->ram + tcb + 0x20) = 4;                  /* state: ready */
+        *(uint32_t*)(vf->ram + tcb + 0x58) = 0x10C16CC0;         /* saved PC */
+        *(uint32_t*)(vf->ram + tcb + 0x5C) = 0x00000013;         /* saved CPSR: SVC+IRQ en */
+        *(uint32_t*)(vf->ram + tcb + 0x60) = 0x10FFD000+0x20000-4; /* saved SP (stack top) */
+
+        /* Enqueue in Nucleus ready list at 0x100AC030 */
+        *(uint32_t*)(vf->ram + 0xAC030) = 0x10000000 + tcb;
+
+        /* Set scheduler dispatch flags */
+        *(uint32_t*)(vf->ram + 0xBC2BC0) = 1; /* dispatch flag */
+        *(uint32_t*)(vf->ram + 0x3585E0) = 3; /* sched_state = running */
+
+        /* Return from exception: restore CPU to pre-interrupt state */
+        {
+            uint32_t mode = cpu->cpsr & 0x1F;
+            if (mode == ARM9_MODE_FIQ || mode == ARM9_MODE_IRQ) {
+                uint32_t return_pc = cpu->r[14] - 4;
+                uint32_t return_cpsr = cpu->spsr;
+
+                /* Save current exception mode bank */
+                if (mode == ARM9_MODE_FIQ) {
+                    cpu->r8_fiq = cpu->r[8]; cpu->r9_fiq = cpu->r[9];
+                    cpu->r10_fiq = cpu->r[10]; cpu->r11_fiq = cpu->r[11];
+                    cpu->r12_fiq = cpu->r[12];
+                    cpu->r13_fiq = cpu->r[13]; cpu->r14_fiq = cpu->r[14];
+                    cpu->spsr_fiq = cpu->spsr;
+                } else {
+                    cpu->r13_irq = cpu->r[13]; cpu->r14_irq = cpu->r[14];
+                    cpu->spsr_irq = cpu->spsr;
+                }
+
+                /* Restore previous mode */
+                cpu->cpsr = return_cpsr;
+                switch (return_cpsr & 0x1F) {
+                case ARM9_MODE_SVC:
+                    cpu->r[13] = cpu->r13_svc; cpu->r[14] = cpu->r14_svc;
+                    cpu->spsr = cpu->spsr_svc; break;
+                case ARM9_MODE_IRQ:
+                    cpu->r[13] = cpu->r13_irq; cpu->r[14] = cpu->r14_irq;
+                    cpu->spsr = cpu->spsr_irq; break;
+                case ARM9_MODE_FIQ:
+                    cpu->r[8] = cpu->r8_fiq; cpu->r[9] = cpu->r9_fiq;
+                    cpu->r[10] = cpu->r10_fiq; cpu->r[11] = cpu->r11_fiq;
+                    cpu->r[12] = cpu->r12_fiq;
+                    cpu->r[13] = cpu->r13_fiq; cpu->r[14] = cpu->r14_fiq;
+                    cpu->spsr = cpu->spsr_fiq; break;
+                default: break; /* USR/SYS: no banked regs */
+                }
+
+                /* Restore r[8]-r[12] if returning from FIQ (fix FIQ banking) */
+                if (mode == ARM9_MODE_FIQ)
+                    memcpy(cpu->r + 8, vf->fiq_saved_r8_12, 5 * sizeof(uint32_t));
+
+                cpu->r[15] = return_pc;
+            } else {
+                /* Called via BL from normal code */
+                cpu->r[0] = 0;
+                cpu->r[15] = cpu->r[14] & ~3u;
+            }
+        }
+
+        if (fiq_count < 10)
+            printf("[HLE-FIQ] Timer IRQ #%d → task ready @0x%08X, return PC=%08X mode=%02X\n",
+                   fiq_count, 0x10000000 + (unsigned)tcb, cpu->r[15], cpu->cpsr & 0x1F);
+        fiq_count++;
+        return 1;
     }
 
     if (addr >= 0x10190000 && addr < 0x10C00000) {
@@ -4078,6 +4237,17 @@ void vflash_run_frame(VFlash *vf) {
 
         ztimer_tick(&vf->timer, actual);
         done += (int)actual;
+
+        /* Per-slice PC escape check: if render code branches to flash ROM
+         * (0xB8000000+) or other non-RAM areas, redirect to game loop. */
+        if (vf->boot_phase >= 900) {
+            uint32_t esc_pc = vf->cpu.r[15];
+            if ((esc_pc >= 0xB8000000u && esc_pc < 0xB8200000u) ||
+                (esc_pc < 0x10000000u && esc_pc > 0x1000u)) {
+                vf->cpu.r[15] = 0x109D1CE0;
+                vf->cpu.cpsr = 0x000000D3;
+            }
+        }
 
         /* Detect kernel loop and enable timer + IRQ */
         if (vf->has_rom && vf->frame_count > 5) {
@@ -4684,8 +4854,11 @@ void vflash_run_frame(VFlash *vf) {
             }
 
             /* Phase 101: BOOT.BIN init done → idle reached → launch service entry.
-             * Triggered by either static phase==100 OR boot_phase==100 (from reboot handler). */
-            if ((phase == 100 || vf->boot_phase == 100) && (pc == 0x10FFF000 || pc == 0x10FFF00C)) {
+             * Triggered by either static phase==100 OR boot_phase==100 (from reboot handler).
+             * Guard: skip if AUTO-LAUNCH already advanced boot_phase past this. */
+            if ((phase == 100 || vf->boot_phase == 100) &&
+                vf->boot_phase < 800 &&
+                (pc == 0x10FFF000 || pc == 0x10FFF00C)) {
                 phase = 101; /* sync both */
                 phase = 101;
                 printf("[BOOT] BOOT.BIN init complete → idle at 0x%08X\n", pc);
@@ -5173,11 +5346,55 @@ void vflash_run_frame(VFlash *vf) {
                     del_log++;
                 }
             }
-            if (use_fiq)
+            if (use_fiq) {
+                memcpy(vf->fiq_saved_r8_12, vf->cpu.r + 8, 5 * sizeof(uint32_t));
                 arm9_fiq(&vf->cpu);
-            else
+            } else
                 arm9_irq(&vf->cpu);
         }
+    }
+
+    /* HLE scheduler tick: when timer fires during game phase, create game
+     * task TCB and enqueue in Nucleus ready list so the native scheduler
+     * at 0x10087160 can dispatch it.  The custom IRQ handler at 0x10FFE000
+     * only clears the timer — this HLE adds the missing scheduler work. */
+    if (vf->boot_phase >= 800 && vf->timer.timer[0].irq_pending == 0 &&
+        (vf->timer.irq.status & 1)) {
+        /* Timer just fired (irq_pending cleared by handler, status still set).
+         * Alternatively, trigger on every frame after boot_phase 800. */
+    }
+    /* Per-frame scheduler tick — ensure game task is in ready list.
+     * Only active during boot_phase 800 (before game loop takes over at 900). */
+    if (vf->boot_phase == 800 && vf->has_rom) {
+        static int sched_tick_init = 0;
+        uint32_t tcb = 0xF00100;
+
+        /* Create game task TCB once */
+        if (!sched_tick_init) {
+            sched_tick_init = 1;
+            memset(vf->ram + tcb, 0, 0x100);
+            *(uint32_t*)(vf->ram + tcb + 0x00) = 0x42435124; /* $QCB magic */
+            *(uint32_t*)(vf->ram + tcb + 0x04) = 0x10000000 + tcb; /* next = self (circular) */
+            *(uint32_t*)(vf->ram + tcb + 0x08) = 1;          /* priority */
+            *(uint32_t*)(vf->ram + tcb + 0x0C) = 1;          /* status: active */
+            *(uint32_t*)(vf->ram + tcb + 0x1C) = 0x42435424; /* $QBT stack marker */
+            *(uint32_t*)(vf->ram + tcb + 0x20) = 4;          /* state: NU_READY */
+            *(uint32_t*)(vf->ram + tcb + 0x28) = 10;         /* task ID */
+            *(uint32_t*)(vf->ram + tcb + 0x2C) = 0x10C16CC0; /* entry point */
+            *(uint32_t*)(vf->ram + tcb + 0x30) = 0x10FFD000; /* stack base */
+            *(uint32_t*)(vf->ram + tcb + 0x34) = 0x20000;    /* stack size 128KB */
+            /* Saved context for scheduler to restore (Nucleus TCB layout) */
+            *(uint32_t*)(vf->ram + tcb + 0x58) = 0x10C16CC0;         /* saved PC */
+            *(uint32_t*)(vf->ram + tcb + 0x5C) = 0x00000013;         /* saved CPSR: SVC */
+            *(uint32_t*)(vf->ram + tcb + 0x60) = 0x10FFD000+0x20000-4; /* saved SP */
+            printf("[HLE-SCHED] Created game task TCB at 0x%08X entry=0x10C16CC0\n",
+                   0x10000000 + (unsigned)tcb);
+        }
+
+        /* Keep task in ready list at 0x100AC030 every frame */
+        *(uint32_t*)(vf->ram + 0xAC030) = 0x10000000 + tcb;
+        *(uint32_t*)(vf->ram + 0xBC2BC0) = 1; /* dispatch flag */
+        *(uint32_t*)(vf->ram + 0x3585E0) = 3; /* sched_state = running */
     }
 
     /* Don't force-raise timer IRQ — timer fires naturally via ztimer_tick.
@@ -5754,8 +5971,42 @@ void vflash_run_frame(VFlash *vf) {
              * Only sleep/wait are skipped; mutex init runs normally. */
             /* Launch game task at service entry — let init run naturally.
              * BSS clear is handled by write protection + code restore. */
-            printf("[AUTO-LAUNCH] → Task entry at 0x%08X (with code protection)\n", entry);
-            vf->cpu.cpsr = 0x00000013;
+            /* Create game task TCB at 0x10F00100 BEFORE launching scheduler,
+             * so the scheduler finds it in the ready list immediately. */
+            {
+                uint32_t tcb = 0xF00100;
+                memset(vf->ram + tcb, 0, 0x100);
+                *(uint32_t*)(vf->ram + tcb + 0x00) = 0x42435124; /* $QCB magic */
+                *(uint32_t*)(vf->ram + tcb + 0x04) = 0x10000000 + tcb; /* next = self (circular) */
+                *(uint32_t*)(vf->ram + tcb + 0x08) = 1;          /* priority */
+                *(uint32_t*)(vf->ram + tcb + 0x0C) = 1;          /* status: active */
+                *(uint32_t*)(vf->ram + tcb + 0x1C) = 0x42435424; /* $QBT stack marker */
+                *(uint32_t*)(vf->ram + tcb + 0x20) = 4;          /* state: NU_READY */
+                *(uint32_t*)(vf->ram + tcb + 0x28) = 10;         /* task ID */
+                *(uint32_t*)(vf->ram + tcb + 0x2C) = 0x10C16CC0; /* entry point */
+                *(uint32_t*)(vf->ram + tcb + 0x30) = 0x10FFD000; /* stack base */
+                *(uint32_t*)(vf->ram + tcb + 0x34) = 0x20000;    /* stack size 128KB */
+                /* Saved context at +0x58 for scheduler context switch */
+                *(uint32_t*)(vf->ram + tcb + 0x58) = 0x10C16CC0;         /* saved PC */
+                *(uint32_t*)(vf->ram + tcb + 0x5C) = 0x00000013;         /* saved CPSR: SVC */
+                *(uint32_t*)(vf->ram + tcb + 0x60) = 0x10FFD000+0x20000-4; /* saved SP */
+                /* Enqueue in Nucleus ready list at 0x100AC030 */
+                *(uint32_t*)(vf->ram + 0xAC030) = 0x10000000 + tcb;
+                *(uint32_t*)(vf->ram + 0xBC2BC0) = 1; /* dispatch flag */
+                *(uint32_t*)(vf->ram + 0x3585E0) = 3; /* sched_state = running */
+                *(uint32_t*)(vf->ram + 0x3585C0) = 0x10000000 + tcb; /* task list head */
+                *(uint32_t*)(vf->ram + 0xACC78)  = 0x10000000 + tcb; /* task mgr pointer */
+                printf("[AUTO-LAUNCH] Created game TCB at 0x%08X entry=0x10C16CC0\n",
+                       0x10000000 + (unsigned)tcb);
+            }
+            /* Launch game task directly at 0x10C16CC0.
+             * The native scheduler at 0x10087160 can't dispatch because its
+             * µMORE service dependencies are in BSS (unpopulated).
+             * HLE timer tick (per-frame) handles re-scheduling. */
+            entry = 0x10C16CC0;
+            printf("[AUTO-LAUNCH] → Game entry at 0x%08X (direct, scheduler HLE)\n", entry);
+            vf->cpu.r[15] = entry;
+            vf->cpu.cpsr = 0x00000013; /* SVC, IRQ enabled */
             vf->cpu.r[13] = sbase + ssz - 4;
             vf->cpu.r[14] = 0x10FFF000;
             vf->timer.timer[0].load = 37500;
@@ -5795,7 +6046,48 @@ void vflash_run_frame(VFlash *vf) {
      * zeroing everything. When detected, restore code and skip ahead. */
     if (vf->rtos_backup && vf->boot_phase >= 800) {
         uint32_t pc = vf->cpu.r[15];
-        /* After any restore, re-set game flags (backup has them at 0) */
+
+        /* Per-frame sanity: fix CPSR if mode bits are invalid.
+         * Game code or HLE stubs can corrupt CPSR to 0x00 (invalid mode).
+         * Force SVC mode (0x13) with IRQ+FIQ disabled. */
+        {
+            uint32_t mode = vf->cpu.cpsr & 0x1F;
+            if (mode != 0x10 && mode != 0x11 && mode != 0x12 &&
+                mode != 0x13 && mode != 0x17 && mode != 0x1B && mode != 0x1F) {
+                vf->cpu.cpsr = 0x000000D3; /* SVC, I+F disabled */
+            }
+        }
+
+        /* Per-frame recovery: if PC wandered into BX LR stub area
+         * (low RAM below game code, or above BOOT.BIN), redirect to game loop. */
+        if (vf->boot_phase >= 900 &&
+            (pc < 0x10090000 || pc > 0x10F00000) &&
+            pc != 0x10FFF00C && pc != 0x10FFF000) {
+            static int recover_log = 0;
+            if (recover_log < 5) {
+                printf("[RECOVER] PC=0x%08X wandered → redirect to game loop\n", pc);
+                recover_log++;
+            }
+            vf->cpu.r[15] = 0x109D1CE0;
+            vf->cpu.cpsr = 0x000000D3;
+        }
+
+        /* Ensure game loop code is intact (BSS clear may zero it).
+         * The first instruction at 0x109D1CE0 should be EB000588 (BL). */
+        if (vf->boot_phase >= 900 &&
+            *(uint32_t*)(vf->ram + 0x9D1CE0) == 0 && vf->cd && vf->cd->is_open) {
+            CDEntry gl_re;
+            if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &gl_re)) {
+                cdrom_read_file(vf->cd, &gl_re, vf->ram + 0x9D0000, 0xB0014,
+                                0xA80000 - 0x9D0000);
+            }
+        }
+
+        /* After any restore, re-set game flags (backup has them at 0).
+         * Also reset render context so render_processing doesn't skip. */
+        *(uint32_t*)(vf->ram + 0xBE3C40) = 0;  /* ctx[0] = 0 (no error) */
+        *(uint32_t*)(vf->ram + 0xBE3C44) = 1;  /* ctx[1] = 1 (frame ready) */
+        *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;  /* render enable flag */
         *(uint16_t*)(vf->ram + 0xBE49E0) = 1;
         *(uint32_t*)(vf->ram + 0xB009C4) = 1;
         *(uint32_t*)(vf->ram + 0xB902C0) = 3;
@@ -6101,13 +6393,59 @@ void vflash_run_frame(VFlash *vf) {
             *(uint32_t*)(vf->ram + 0xBE3C4C) = 0;  /* ctx[3] = no flags */
             printf("[ENTITY] Created 8 dummy entities at %08X\n", ent_addr);
         }
-        /* Enter main game loop directly */
-        printf("[GAME-LOOP] Entering main game loop at 0x109D1CE0\n");
+        /* Relocate game loop code from BOOT.BIN to 0x109D0000 area.
+         * BOOT.BIN source: 0x10C0CCF4 → dest 0x109D1CE0 (offset 0x23B014).
+         * Covers game main loop + surrounding functions.
+         * BL offsets are PC-relative and automatically correct after copy. */
+        if (vf->cd && vf->cd->is_open) {
+            CDEntry gl_entry;
+            if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &gl_entry)) {
+                /* Copy 0x109D0000-0x10A80000 from BOOT.BIN.
+                 * Source in file: 0xCB0014 - 0xC00000 = 0xB0014. */
+                uint32_t dst = 0x9D0000;
+                uint32_t file_off = 0xB0014; /* 0x10CB0014 - 0x10C00000 */
+                uint32_t sz = 0xA80000 - 0x9D0000; /* 0xB0000 = 704KB */
+                int rd = cdrom_read_file(vf->cd, &gl_entry,
+                            vf->ram + dst, file_off, sz);
+                if (rd > 0) {
+                    uint32_t gl_first = *(uint32_t*)(vf->ram + 0x9D1CE0);
+                    printf("[RELOC-GAMELOOP] Loaded %d bytes: BOOT.BIN+0x%X→%08X"
+                           " (game_loop[0]=%08X)\n",
+                           rd, file_off, 0x10000000 + dst, gl_first);
+                }
+            }
+        }
         vf->cpu.r[15] = 0x109D1CE0;
         vf->cpu.cpsr = 0x000000D3;  /* SVC mode, IRQ+FIQ disabled */
         vf->timer.timer[0].ctrl = 0;
         vf->timer.irq.enable = 0;
         vf->timer.irq.status = 0;
+        /* Relocate render/engine code from BOOT.BIN to BSS area.
+         * Relocation offset: 0x23B014 (same as RELOC-FIX below).
+         * Covers 0x10A80000-0x10B0DB0C (566KB): render_processing,
+         * division routines, render_init, tree dispatch, etc.
+         * Source: BOOT.BIN 0x10CBB014-0x10D48B20.
+         * BOOT.BIN's own init BSS-clears the source area, so we
+         * re-load BOOT.BIN from CD to get the original code. */
+        if (vf->cd && vf->cd->is_open) {
+            CDEntry boot_e;
+            if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &boot_e)) {
+                /* Reload BOOT.BIN to a temp area — only the range we need.
+                 * Source in BOOT.BIN file: 0xBB014 (= 0xCBB014 - 0xC00000).
+                 * Dest: RAM 0xA80000. Size: 0x8DB0C. */
+                uint32_t file_off = 0xBB014;
+                uint32_t dst = 0xA80000;
+                uint32_t sz  = 0x8DB0C;
+                int rd = cdrom_read_file(vf->cd, &boot_e,
+                            vf->ram + dst, file_off, sz);
+                if (rd > 0) {
+                    uint32_t first = *(uint32_t*)(vf->ram + dst + 0x9100);
+                    printf("[RELOC-RENDER] Loaded %d bytes from BOOT.BIN+0x%X→%08X"
+                           " (render_processing[0]=%08X)\n",
+                           rd, file_off, 0x10000000+dst, first);
+                }
+            }
+        }
         /* Copy 73 unrelocated functions from BOOT.BIN area to relocation targets.
          * BOOT.BIN bootstrap copies game code from 10C0xxxx to 109Dxxxx but never
          * relocates the 10B0xxxx-10B2xxxx range. BL targets in this range hit data
@@ -6375,6 +6713,45 @@ void vflash_run_frame(VFlash *vf) {
         }
     }
 
+    /* Fire VBlank callback per-frame: the render pipeline sets a callback
+     * via DC register 0xB80007C0. On real HW, the display controller fires
+     * this at VBlank. We invoke it here to advance the render pipeline. */
+    if (vf->boot_phase >= 900 && vf->dc_vblank_cb &&
+        vf->dc_vblank_cb >= 0x10000000 && vf->dc_vblank_cb < 0x11000000) {
+        /* Save CPU state */
+        uint32_t save_pc = vf->cpu.r[15];
+        uint32_t save_lr = vf->cpu.r[14];
+        uint32_t save_cpsr = vf->cpu.cpsr;
+        /* Call VBlank callback with a small execution budget */
+        vf->cpu.r[15] = vf->dc_vblank_cb;
+        vf->cpu.r[14] = 0x10FFF000; /* return to idle */
+        vf->cpu.cpsr = 0x00000013;  /* SVC, IRQ enabled */
+        int vbl_budget = 50000;
+        while (vbl_budget > 0 && vf->cpu.r[15] != 0x10FFF000 &&
+               vf->cpu.r[15] != 0x10FFF00C) {
+            uint64_t cb = vf->cpu.cycles;
+            arm9_step(&vf->cpu);
+            int cost = (int)(vf->cpu.cycles - cb);
+            vbl_budget -= cost > 0 ? cost : 1;
+            /* Escape check */
+            uint32_t vpc = vf->cpu.r[15];
+            if (vpc >= 0xB8000000u || (vpc < 0x10000000u && vpc > 0x1000u)) {
+                vf->cpu.r[15] = 0x10FFF000;
+                break;
+            }
+        }
+        /* Restore CPU state (callback may have changed registers) */
+        vf->cpu.r[15] = save_pc;
+        vf->cpu.r[14] = save_lr;
+        vf->cpu.cpsr = save_cpsr;
+        static int vbl_log = 0;
+        if (vbl_log < 5) {
+            printf("[VBLANK] Fired callback 0x%08X (budget left: %d)\n",
+                   vf->dc_vblank_cb, vbl_budget);
+            vbl_log++;
+        }
+    }
+
     /* PL111 LCD framebuffer blit: only when game actually writes to LCD
      * (not during asset browser mode where MJP/PTX write directly to framebuf).
      * Skip if video is playing or if the LCD framebuffer hasn't been written by game code. */
@@ -6618,8 +6995,11 @@ int vflash_step(VFlash *vf) {
     uint32_t cyc = (uint32_t)(vf->cpu.cycles - before);
 
     ztimer_tick(&vf->timer, cyc);
-    if (ztimer_fiq_pending(&vf->timer)) arm9_fiq(&vf->cpu);
-    else if (ztimer_irq_pending(&vf->timer)) arm9_irq(&vf->cpu);
+    if (ztimer_fiq_pending(&vf->timer)) {
+        memcpy(vf->fiq_saved_r8_12, vf->cpu.r + 8, 5 * sizeof(uint32_t));
+        arm9_fiq(&vf->cpu);
+    } else if (ztimer_irq_pending(&vf->timer))
+        arm9_irq(&vf->cpu);
 
     /* Check breakpoints against new PC */
     uint32_t pc = vf->cpu.r[15];
