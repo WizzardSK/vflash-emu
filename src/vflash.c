@@ -3618,6 +3618,21 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
             printf("[VSTUB] slot[%d] R0=%08X LR=%08X (total=%d)\n",
                    slot, cpu->r[0], cpu->r[14], total_stubs);
         }
+        /* HLE draw: when vtable[2] is called with valid entity ptr,
+         * draw a colored marker directly to display framebuffer */
+        if (slot == 2 && cpu->r[0] >= 0x10320000 && cpu->r[0] < 0x10380000) {
+            VFlash *vf2 = (VFlash*)ctx;
+            uint32_t ent = cpu->r[0] - 0x10000000;
+            int idx = (ent - 0x320000) / 64;
+            int x = (idx * 37) % 300 + 10;
+            int y = (idx * 23) % 220 + 10;
+            /* Draw colored marker to ARGB32 framebuffer */
+            uint32_t color = 0xFFFF0000 | ((idx * 17) & 0xFF) << 8;
+            for (int dy = 0; dy < 10 && y+dy < VFLASH_SCREEN_H; dy++)
+                for (int dx = 0; dx < 10 && x+dx < VFLASH_SCREEN_W; dx++)
+                    vf2->framebuf[(y+dy)*VFLASH_SCREEN_W + (x+dx)] = color;
+            vf2->vid.fb_dirty = 1;
+        }
         return 0; /* let stub execute */
     }
 
@@ -5826,10 +5841,24 @@ void vflash_run_frame(VFlash *vf) {
                         0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
                 }
             }
+            /* Draw entity markers ON TOP of PTX */
+            int ent_markers = 0;
+            for (uint32_t ea = 0x320000; ea < 0x370000; ea += 64) {
+                uint32_t vt = *(uint32_t*)(vf->ram + ea);
+                if (vt != 0x10310800) continue; /* not an entity */
+                int idx = (ea - 0x320000) / 64;
+                int ex = (idx * 37) % 300 + 10;
+                int ey = (idx * 23) % 220 + 10;
+                uint32_t color = 0xFFFF0000 | ((idx*17)&0xFF)<<8 | (idx*7&0xFF);
+                for (int dy = 0; dy < 8 && ey+dy < 240; dy++)
+                    for (int dx = 0; dx < 8 && ex+dx < 320; dx++)
+                        vf->framebuf[(ey+dy)*320 + (ex+dx)] = color;
+                ent_markers++;
+            }
             vf->vid.fb_dirty = 1;
             static int ptx_log = 0;
             if (!ptx_log) {
-                printf("[GAME-DISPLAY] PTX #%d rendered to framebuffer\n", ptx_idx);
+                printf("[GAME-DISPLAY] PTX + %d entity markers\n", ent_markers);
                 ptx_log = 1;
             }
         }
