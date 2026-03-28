@@ -3547,29 +3547,41 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
      * 10AB889C/7A00: other registrations
      * 10A8CDE4: RTOS tree traversal
      * 10A6FC60: task_notify */
-    if (addr == 0x10AB085C && ((VFlash*)ctx)->boot_phase >= 900) {
-        VFlash *vf2 = (VFlash*)ctx;
-        static int reg_skip = 0;
-        /* Write success indicator: set halfword at [R0] to 1 */
-        uint32_t ctx_ptr = cpu->r[0];
-        if (ctx_ptr >= 0x10000000 && ctx_ptr < 0x10000000 + VFLASH_RAM_SIZE - 4) {
-            *(uint16_t*)(vf2->ram + (ctx_ptr - 0x10000000)) = 1;
-        }
-        if (reg_skip < 30)
-            printf("[RTOS-REG] %08X ctx=%08X → success\n", addr, ctx_ptr);
-        reg_skip++;
-        cpu->r[0] = 1; /* success */
-        cpu->r[15] = cpu->r[14] & ~3u;
-        return 1;
-    }
-    if ((addr == 0x10AB889C || addr == 0x10AB7A00 ||
-         addr == 0x10A8CDE4 || addr == 0x10A6FC60) &&
+    /* Let 10AB085C (callback registration) run natively.
+     * It calls 10AAFF48 and 10AB0570 which set up render objects.
+     * The stuck function 10A8CDE4 is skipped separately below. */
+    if ((addr == 0x10AB889C || addr == 0x10AB7A00) &&
         ((VFlash*)ctx)->boot_phase >= 900) {
         static int rtos_skip = 0;
         if (rtos_skip < 10)
-            printf("[RTOS-SKIP] %08X → return 1\n", addr);
+            printf("[RTOS-SKIP] %08X → return 0\n", addr);
         rtos_skip++;
-        cpu->r[0] = 1;
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* 10A8CDE4: RTOS tree traversal — check if queue is empty first.
+     * Reads [R5+8]: if 0, returns immediately. If non-zero, traverses.
+     * Force queue[+8]=0 to make it skip traversal and continue. */
+    if (addr == 0x10A8CDE4 && ((VFlash*)ctx)->boot_phase >= 900) {
+        VFlash *vf2 = (VFlash*)ctx;
+        uint32_t queue_ptr = cpu->r[5];
+        if (queue_ptr >= 0x10000000 && queue_ptr + 16 <= 0x10000000 + VFLASH_RAM_SIZE) {
+            uint32_t q_off = queue_ptr - 0x10000000;
+            /* Force queue empty: clear [+8] and [+0] */
+            *(uint32_t*)(vf2->ram + q_off + 8) = 0;
+            *(uint32_t*)(vf2->ram + q_off + 0) = 0;
+        }
+        static int cde4_skip = 0;
+        if (cde4_skip < 5)
+            printf("[RTOS-TREE] %08X R5=%08X → force empty queue\n", addr, queue_ptr);
+        cde4_skip++;
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    if (addr == 0x10A6FC60 && ((VFlash*)ctx)->boot_phase >= 900) {
+        cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
