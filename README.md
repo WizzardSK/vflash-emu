@@ -31,14 +31,14 @@ Background voice/SFX audio plays automatically from 561 WAV files on disc.
 
 ## Status
 
-**Render pipeline end-to-end with entity draw calls** — µMORE v4.0 RTOS boots,
-game task launched, native kernel service dispatch through vtable, CD-ROM init
-succeeds natively. VFF scene data loaded, scene builder allocates 320KB of entity
-data via HLE alloc. Game loop runs with all engine subsystems executing natively.
-73 unrelocated functions (100KB) recovered from BOOT.BIN. Native render function
-restored, render_init HLE'd, VBlank toggle drives entity draw path. Display list
-vector with 100 entities, vtable[2] draw called 2000+×/session. PTX sprite
-artwork from disc displayed on screen with entity markers overlay.
+**VFF tile decompression working, scene dispatch table decoded** — µMORE v4.0 RTOS
+boots, game task launched, native kernel service dispatch through vtable, CD-ROM
+init succeeds natively. VFF scene data loaded from disc, scene init populates 58-entry
+dispatch table with render layer callbacks. 65 scene callbacks execute natively,
+decompressing 1.2MB of 8bpp tile pixel data (29 tiles, 512×256 to 128×16). Tilemap
+decompressed at 0x101B8000. Decompressed tiles rendered to LCD framebuffer. Game loop
+runs with all engine subsystems active. 73 unrelocated functions (100KB) recovered
+from BOOT.BIN. PTX sprite artwork from disc displayed on screen.
 
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spider-Man.
 
@@ -63,9 +63,10 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **Kernel service vtable** | ✅ Initialized from ROM, native dispatch works |
 | **CD-ROM init** | ✅ Native through kernel vtable, disc query succeeds |
 | **VFF scene loading** | ✅ ARM code + graphics + tilemap loaded to RAM |
-| **VFF scene init** | ✅ Scene descriptor table populated at 0x10500808 |
-| **VFF scene builder** | ✅ Entity alloc (320KB) + callback populates entities |
-| **VFF tile display** | ✅ sec[1] graphics rendered to LCD framebuffer |
+| **VFF scene init** | ✅ 58-entry dispatch table (graphics/audio/render layers) |
+| **VFF scene builder** | ✅ 65 callbacks decompress 1.2MB tile data (29 tiles) |
+| **VFF tile decompression** | ✅ 8bpp tiles decompressed, rendered to framebuffer |
+| **VFF tile display** | 🔧 Grayscale rendering (palette lookup not yet found) |
 | **Game loop** | ✅ tick→sync→render, all subsystems active |
 | **NULL entity protection** | ✅ Dummy vtable + read trap for safe execution |
 | **Native render function** | ✅ Copied from BOOT.BIN (10D615FC→10B265E8) |
@@ -78,20 +79,20 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 
 ### Remaining for gameplay
 
-Render pipeline works end-to-end: init(HLE) → processing(native, 200K budget)
-→ VBlank toggle (0x900A0018 bit25) → display list iterate → vtable[2] draw
-called 2000+×/session. Current draw calls hit dummy stubs (return 0).
+**VFF tile decompression working**: Scene callbacks (65 total) decompress sec[1]
+compressed tile data into 1.2MB of 8bpp indexed pixels at 0x10240000 (29 tiles).
+Tilemap at 0x101B8000 (64-byte stride) maps tile indices to screen positions.
+Dispatch table (58 entries in 0x30-byte groups) decoded: graphics layers with
+compressed sizes, audio channels (22050Hz stereo), and render layers with tile
+data pointers + X/Y position offsets.
 
-**Render layer objects needed**: Display list should contain render layer objects
-(display layers, sprite engine, texture manager) created by render_init's 10
-callback functions. Native render_init gets stuck on internal RTOS task queue
-operations — not just task_notify but deeper tree traversal primitives at
-10A8CDE4. HLE render_init sets flags but cannot create these objects.
+**Color palette needed**: Tiles use 8bpp palette indices but the 256-color lookup
+table has not been located. Engine writes palette to PL111 LCD controller during
+render_processing which we don't fully execute. Currently rendered as grayscale.
 
-**VFF tile decoding**: sec[1] (1772KB at 10501800) is proprietary compressed
-format. sec[0] (122KB at 104E2000) is the ARM decoder but runs as scene
-callback populating tile data buffers, not rendering directly. Scene callback
-writes 8-bit tile pixel data to alloc area — no vtable pointers set.
+**Tilemap composition**: Decompressed tilemap + tile pixel data need to be
+combined to render full scene backgrounds. Render layer X/Y offsets available
+in dispatch table at 0x104F8D64+ (values like 64, 192, 32 = pixel positions).
 
 **Native alloc**: 10A775E0 gets stuck in uninitialized game heap. HLE'd with
 separate bump area at 0x390000. 10A77648 (variant) HLE'd at 0x320000.
@@ -112,9 +113,14 @@ separate bump area at 0x390000. 10A77648 (variant) HLE'd at 0x320000.
 - ATAPI sense fix: no error (0x00) instead of unit attention (0x06)
 - Kernel vtable: 7 function pointers from ROM at [1000C76C+0x2C..+0x44]
 
-**Ghidra RE completed**: full game task entry, render pipeline, VFF scene format
-(sec[0]=ARM scene script, sec[1]=tile graphics, sec[2]=tilemap), BOOT.BIN
-CD driver (10C21680), kernel service dispatch, game engine object system.
+**VFF format decoded**: header (0x60 bytes) with entry point (+0x10), init callback
+(+0x20), section count (+0x2C). sec[0]=ARM scene script (up to 1.8MB), sec[1]=tile
+descriptors (29×44B: width/height/8bpp) + compressed tile pixel data, sec[2]=compressed
+tilemap. Dispatch table at header+0x10: 0x30-byte groups of {graphics_layer, audio,
+render_layer} with IDs, compressed sizes, callbacks, tile data pointers, and XY offsets.
+
+**Ghidra RE completed**: full game task entry, render pipeline, VFF scene format,
+BOOT.BIN CD driver (10C21680), kernel service dispatch, game engine object system.
 
 **Nucleus RTOS** confirmed (NU_ API). TCB: `$QCB`/`$QBT`, entry +0x2C, stack +0x30/+0x34.
 **Firebird interrupt controller** at 0xDC000000. Tested 6 games.
@@ -212,13 +218,17 @@ ROM[0x00] → flash copy → flash remap (0x118)
 | task_notify stuck | RTOS priority tree traversal | Skip 10A6FC60 during game phase |
 | GPU write intercept wide | All ctx writes forced to 1 | Narrow to single byte [10BE3CA0] |
 | Native alloc stuck | Game heap not initialized | HLE bump alloc at 0x390000 |
+| VFF entry hardcoded | Only one scene worked | Dynamic entry scan (LDR+PUSH pattern) |
+| VFF section offset | Data shifted by 0x3A0 | Header is 0x60 bytes, loader uses 0x400 padded |
+| Scene callbacks stub | Tiles not decompressed | Call all 65 dispatch table callbacks |
 
 ### Subsystems
 - ATAPI CD-ROM: INQUIRY, READ(10), READ CD, READ TOC, READ CAPACITY, MODE SENSE
 - MJP video: byte-swap, byte-stuffing restore, in-place decode, scaling
 - IMA ADPCM + PCM WAV audio, 22050→44100Hz stereo resampling
 - PTX: XBGR1555, 512px stride, interleaved scene/sprite
-- VFF: "vfD0" container, 3 sections (code + graphics + background)
+- VFF: "vfD0" container, 3 sections (ARM script + tile descriptors/pixels + tilemap)
+- VFF tile decompression: scene callbacks decompress 8bpp tiles (29 tiles, 1.2MB)
 - ISO 9660 with recursive search, BIN/CUE auto-detect
 - Interactive debugger with breakpoints, disassembly, memory dump
 
