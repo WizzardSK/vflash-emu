@@ -31,13 +31,14 @@ Background voice/SFX audio plays automatically from 561 WAV files on disc.
 
 ## Status
 
-**Game engine running natively with render pipeline** — µMORE v4.0 RTOS boots,
+**Render pipeline end-to-end with entity draw calls** — µMORE v4.0 RTOS boots,
 game task launched, native kernel service dispatch through vtable, CD-ROM init
 succeeds natively. VFF scene data loaded, scene builder allocates 320KB of entity
 data via HLE alloc. Game loop runs with all engine subsystems executing natively.
-Native render function recovered from BOOT.BIN, render_init HLE'd (3-step state
-machine), render processing runs with instruction budget. PTX sprite artwork
-from disc displayed on screen.
+73 unrelocated functions (100KB) recovered from BOOT.BIN. Native render function
+restored, render_init HLE'd, VBlank toggle drives entity draw path. Display list
+vector with 100 entities, vtable[2] draw called 2000+×/session. PTX sprite
+artwork from disc displayed on screen with entity markers overlay.
 
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spider-Man.
 
@@ -77,23 +78,35 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 
 ### Remaining for gameplay
 
-Render pipeline works end-to-end: init(HLE) → processing(native) → VBlank
-check → display list iterate → vtable[2] draw called on entities. 73
-unrelocated functions (100KB) recovered from BOOT.BIN. Entity draw methods
-are dummy stubs — real vtable pointers needed from native alloc (10A775E0).
-VFF scene callback uses HLE alloc area as tile data scratchpad, not as
-entity objects. VFF sec[1] tiles (1772KB) are compressed, requiring the
-game's ARM decoder in VFF sec[0] (122KB at 104E2000).
+Render pipeline works end-to-end: init(HLE) → processing(native, 200K budget)
+→ VBlank toggle (0x900A0018 bit25) → display list iterate → vtable[2] draw
+called 2000+×/session. Current draw calls hit dummy stubs (return 0).
+
+**Render layer objects needed**: Display list should contain render layer objects
+(display layers, sprite engine, texture manager) created by render_init's 10
+callback functions. Native render_init gets stuck on internal RTOS task queue
+operations — not just task_notify but deeper tree traversal primitives at
+10A8CDE4. HLE render_init sets flags but cannot create these objects.
+
+**VFF tile decoding**: sec[1] (1772KB at 10501800) is proprietary compressed
+format. sec[0] (122KB at 104E2000) is the ARM decoder but runs as scene
+callback populating tile data buffers, not rendering directly. Scene callback
+writes 8-bit tile pixel data to alloc area — no vtable pointers set.
+
+**Native alloc**: 10A775E0 gets stuck in uninitialized game heap. HLE'd with
+separate bump area at 0x390000. 10A77648 (variant) HLE'd at 0x320000.
 
 **Key HLE components**:
-- Game alloc (10A775E0, 10A77648): bump allocator with dummy vtable
+- Game alloc (10A775E0, 10A77648): HLE bump allocators at 0x390000/0x320000
 - NULL entity read trap: returns ready(1) for [0x00-0x1F] (breaks ALL polling loops)
 - Dummy vtable at 0x10310800: 64 ARM stubs (MOV R0,#0; BX LR)
 - Engine wait skip (10A20B30): breaks BEQ loop waiting for entity state
-- Render function copy: 192 bytes from BOOT.BIN (10D615FC→10B265E8)
-- HLE render_init (10A881F0): sets subsystem/queue/objects ready flags
-- Render budget: 50K instructions per frame, force return if stuck
-- Render state pre-fill: 10BE3C40 area (0x300 bytes) set to ready state
+- 73 unrelocated functions: 100KB block copy (10D48B20→10B0DB0C)
+- HLE render_init (10A881F0): sets 5 ready flags, skips RTOS callbacks
+- VBlank toggle: MMIO 0x900A0018 bit25 flips on each read
+- Display list vector: 100 entity pointers at 0x10B90000
+- Render budget: 200K instructions per frame, force return if stuck
+- Skip task_notify (10A6FC60): prevents RTOS tree traversal stuck
 - State machine fix: force [param_1+0x104] = 0x84 (done) at 109D2754
 - Game mode fix: intercept [10B902C0] reads, return 3 (not 4=error)
 - ATAPI sense fix: no error (0x00) instead of unit attention (0x06)
@@ -192,9 +205,13 @@ ROM[0x00] → flash copy → flash remap (0x118)
 | Invalid ptr deref | 10A355A4/109D2754 loop on garbage | Skip when R0 outside RAM range |
 | Auto-launch too late | Frame 200 unreachable (delay loop) | Changed to frame 75 |
 | IRQ handler stuck | 0x900D0018 returns wrong value | Return 0 during game phase |
-| Render fn not relocated | BL 10B265E8 hit data, not code | Copy 192B from BOOT.BIN 10D615FC |
-| Render_init stuck | RTOS task queue tree loop | HLE: set 3 ready flags, return |
-| Render_proc infinite | Entity draw stubs never finish | 50K instruction budget per frame |
+| Render fn not relocated | BL 10B265E8 hit data, not code | Copy 100KB from BOOT.BIN (73 functions) |
+| Render_init stuck | RTOS task queue tree loop (10A8CDE4) | HLE: set 5 ready flags, return |
+| Render_proc infinite | Entity draw stubs never finish | 200K instruction budget per frame |
+| No VBlank signal | Render never enters draw path | Toggle bit25 of MMIO 0x900A0018 |
+| task_notify stuck | RTOS priority tree traversal | Skip 10A6FC60 during game phase |
+| GPU write intercept wide | All ctx writes forced to 1 | Narrow to single byte [10BE3CA0] |
+| Native alloc stuck | Game heap not initialized | HLE bump alloc at 0x390000 |
 
 ### Subsystems
 - ATAPI CD-ROM: INQUIRY, READ(10), READ CD, READ TOC, READ CAPACITY, MODE SENSE
