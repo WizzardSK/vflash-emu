@@ -1515,11 +1515,8 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
         if (roff == 0x3585E0 && val != 3) {
             val = 3;
         }
-        /* Protect RTOS code (0x10A00000-0x10B10000) from zeroing.
-         * Both mem_write32 AND JIT inline writes can reach here.
-         * JIT inline writes go directly to ram[], bypassing this function.
-         * So also add a periodic check in the frame loop. */
-        if (val == 0 && roff >= 0xA00000 && roff < 0xB10000 &&
+        /* Protect ALL code areas (0x10090000-0x10B10000) from BSS zeroing */
+        if (val == 0 && roff >= 0x90000 && roff < 0xB10000 &&
             vf->boot_phase >= 800) {
             return; /* silently block */
         }
@@ -5741,12 +5738,13 @@ void vflash_run_frame(VFlash *vf) {
             vf->timer.timer[0].ctrl = 0xE2;
             vf->timer.irq.enable |= 0x01;
             vf->boot_phase = 800;
-            /* Backup RTOS code area — game BSS clear will zero it */
+            /* Backup ALL code areas — game BSS clear will zero everything.
+             * 0x10090000-0x10B10000 = kernel + RTOS + engine code (~10MB) */
             if (!vf->rtos_backup) {
-                vf->rtos_backup = malloc(0x110000);
+                vf->rtos_backup = malloc(0xA80000); /* 0x90000 to 0xB10000 */
                 if (vf->rtos_backup) {
-                    memcpy(vf->rtos_backup, vf->ram + 0xA00000, 0x110000);
-                    printf("[RTOS-BACKUP] Saved 0x10A00000-0x10B10000 (1.1MB)\n");
+                    memcpy(vf->rtos_backup, vf->ram + 0x90000, 0xA80000);
+                    printf("[CODE-BACKUP] Saved 0x10090000-0x10B10000 (10.5MB)\n");
                 }
             }
         }
@@ -5756,10 +5754,26 @@ void vflash_run_frame(VFlash *vf) {
      * The game's BSS clear zeros the RTOS area every frame via STR loops.
      * We restore it back but DON'T flush JIT — the JIT blocks are still valid
      * since the code content is restored to the same values. */
+    /* Detect BSS clear loop: PC advances through 109D0000-10A10000
+     * zeroing everything. When detected, restore code and skip ahead. */
     if (vf->rtos_backup && vf->boot_phase >= 800) {
+        uint32_t pc = vf->cpu.r[15];
+        /* BSS clear: PC is in the range being cleared */
+        if (pc >= 0x109D0000 && pc < 0x10A10000 &&
+            *(uint32_t*)(vf->ram + (pc - 0x10000000)) == 0) {
+            /* Code under PC is zero — BSS clear ate it. Restore and skip. */
+            memcpy(vf->ram + 0x90000, vf->rtos_backup, 0xA80000);
+            /* Jump to game init, skipping BSS clear */
+            vf->cpu.r[15] = 0x10C16CC0;
+            vf->cpu.r[13] = 0x10FFE000;
+            vf->cpu.r[14] = 0x10FFF000;
+            static int bss_skip = 0;
+            if (bss_skip++ < 3)
+                printf("[BSS-SKIP] PC=%08X was in BSS clear, jumping to game init\n", pc);
+        }
+        /* Also restore if RTOS code was zeroed */
         if (*(uint32_t*)(vf->ram + 0xA8CDE4) == 0) {
-            memcpy(vf->ram + 0xA00000, vf->rtos_backup, 0x110000);
-            /* NO jit_flush — code is restored to original values */
+            memcpy(vf->ram + 0x90000, vf->rtos_backup, 0xA80000);
         }
     }
 

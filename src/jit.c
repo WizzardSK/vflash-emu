@@ -346,7 +346,7 @@ static int compile_ldr_str(EmitBuf *e, uint32_t insn, uint32_t pc, VFlash *vf) {
         emit_store_arm_reg(e, Rd, RDX);
     } else {
         /* STR: protect RTOS code area (0xA00000-0xB10000) from writes */
-        emit_cmp_r32_imm32(e, RAX, 0xA00000);
+        emit_cmp_r32_imm32(e, RAX, 0x90000);
         uint32_t skip_store_pos = e->pos;
         emit_jcc_rel32(e, CC_AE, 0); /* if offset >= 0xA00000, maybe skip */
         /* offset < 0xA00000 → safe to write */
