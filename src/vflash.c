@@ -3551,16 +3551,28 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         for (int i = 0; i < 16; i++)
             *(uint32_t*)(vf2->ram + 0xB1D508 + i*4) = orig_vt[i];
         *(uint32_t*)(vf2->ram + 0xBE3CE0) = 0x10B1D508;
+        /* Patch render dispatch loops to always skip:
+         * 10AB6340: BEQ 10AB6358 → B 10AB6358 (always branch)
+         * This prevents the render dispatch from retrying registration. */
+        *(uint32_t*)(vf2->ram + 0xAB6340) = 0xEA000004; /* B +0x18 → always skip */
+        /* Also patch caller at 10ACBE00: BEQ → B (always exit dispatch) */
+        *(uint32_t*)(vf2->ram + 0xACBE00) = 0xEA000004; /* B 10ACBE18 always */
         static int ri_log = 0;
-        if (ri_log++ < 3) printf("[HLE-RENDER-INIT] Flags + vtable restored\n");
+        if (ri_log++ < 3) printf("[HLE-RENDER-INIT] Flags + vtable + dispatch patched\n");
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
-    /* Skip RTOS functions: dispatch, registration, task_notify, context loop */
+    /* Skip RTOS functions: dispatch, registration, task_notify, context loop.
+     * Also force render dispatch flags to 0 to prevent retry loops. */
     if ((addr == 0x10A8CDE4 || addr == 0x10A6FC60 ||
          addr == 0x10AB085C || addr == 0x10AB889C || addr == 0x10AB7A00 ||
          addr == 0x10AB6324 /* render context dispatch loop */) &&
         ((VFlash*)ctx)->boot_phase >= 900) {
+        VFlash *vf2 = (VFlash*)ctx;
+        /* Force dispatch flags to 0 to break ALL retry loops */
+        *(uint16_t*)(vf2->ram + 0xBE3EA0) = 0;
+        *(uint16_t*)(vf2->ram + 0xBE3C80) = 0;
+        *(uint16_t*)(vf2->ram + 0xBE3E20) = 0;
         cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
@@ -3595,7 +3607,7 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
                 vf2->ram[0xBE4BA0] = 1;
             }
         }
-        vf2->render_budget = 20000000; /* 20M budget — real rendering needs more */
+        vf2->render_budget = 5000000; /* 5M budget — trace where it goes */
         return 0;
     }
     /* (budget check moved to top of function) */
@@ -6121,7 +6133,45 @@ void vflash_run_frame(VFlash *vf) {
         uint32_t fb_off = vf->lcd.upbase - VFLASH_RAM_BASE;
         uint32_t bpp_code = (vf->lcd.control >> 1) & 7;
         /* BPP: 1=2bpp, 2=4bpp, 3=8bpp, 4=16bpp, 5=24bpp, 6=16bpp565 */
-        if (bpp_code == 4 || bpp_code == 6) {
+        /* Probe: check if ANY pixels are non-zero in the framebuffer */
+        {
+            static int fb_probe = 0;
+            if (fb_probe < 5) {
+                int nz = 0;
+                for (uint32_t pi = 0; pi < 320*240*4 && fb_off+pi < VFLASH_RAM_SIZE; pi += 4) {
+                    if (*(uint32_t*)(vf->ram+fb_off+pi)) { nz++; if (nz > 100) break; }
+                }
+                if (nz > 0) {
+                    printf("[LCD-PROBE] fb@0x%08X bpp=%d: %d non-zero dwords!\n",
+                           vf->lcd.upbase, 1<<bpp_code, nz);
+                    fb_probe = 5; /* stop probing */
+                } else if (vf->frame_count % 50 == 0) {
+                    printf("[LCD-PROBE] fb@0x%08X bpp=%d: empty (frame %d)\n",
+                           vf->lcd.upbase, 1<<bpp_code, vf->frame_count);
+                }
+                fb_probe++;
+            }
+        }
+        if (bpp_code == 5) {
+            /* 24-bit RGB framebuffer (3 bytes per pixel, packed) */
+            const uint8_t *src = vf->ram + fb_off;
+            int nz = 0;
+            for (int y = 0; y < VFLASH_SCREEN_H; y++) {
+                for (int x = 0; x < VFLASH_SCREEN_W; x++) {
+                    int off2 = (y * VFLASH_SCREEN_W + x) * 3;
+                    uint8_t b = src[off2], g = src[off2+1], r = src[off2+2];
+                    if (r || g || b) nz++;
+                    vf->framebuf[y * VFLASH_SCREEN_W + x] =
+                        0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+                }
+            }
+            if (nz > 0) {
+                vf->vid.fb_dirty = 1;
+                static int lcd24_log = 0;
+                if (lcd24_log++ < 3)
+                    printf("[LCD] 24bpp blit: %d non-zero pixels\n", nz);
+            }
+        } else if (bpp_code == 4 || bpp_code == 6) {
             /* 16-bit RGB565 framebuffer */
             const uint16_t *src = (const uint16_t*)(vf->ram + fb_off);
             for (int y = 0; y < VFLASH_SCREEN_H; y++) {
