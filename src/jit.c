@@ -359,7 +359,7 @@ static int compile_ldr_str(EmitBuf *e, uint32_t insn, uint32_t pc, VFlash *vf) {
         emit_jmp_rel32(e, 0); /* jump to end */
         /* Patch JAE to here: offset >= 0xA00000 */
         *(int32_t*)(e->buf + skip_store_pos + 2) = (int32_t)(e->pos - skip_store_pos - 6);
-        emit_cmp_r32_imm32(e, RAX, 0xB10000);
+        emit_cmp_r32_imm32(e, RAX, 0xBF0000);
         uint32_t not_code_pos = e->pos;
         emit_jcc_rel32(e, CC_AE, 0); /* if offset >= 0xB10000, safe area */
         /* 0xA00000 <= offset < 0xB10000 → RTOS code area → SKIP write */

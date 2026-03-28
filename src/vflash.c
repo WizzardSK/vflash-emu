@@ -1515,8 +1515,9 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
         if (roff == 0x3585E0 && val != 3) {
             val = 3;
         }
-        /* Protect ALL code areas (0x10090000-0x10B10000) from BSS zeroing */
-        if (val == 0 && roff >= 0x90000 && roff < 0xB10000 &&
+        /* Protect code+data (0x10090000-0x10BF0000) from BSS zeroing.
+         * BSS clear should only zero 0x10BF0000-0x10C00000 (actual BSS). */
+        if (val == 0 && roff >= 0x90000 && roff < 0xBF0000 &&
             vf->boot_phase >= 800) {
             return; /* silently block */
         }
@@ -5728,9 +5729,10 @@ void vflash_run_frame(VFlash *vf) {
             printf("[AUTO-LAUNCH] Game task: entry=%08X stack=%08X+%X\n", entry, sbase, ssz);
             /* Launch game task ENTRY — let init run with blocking skipped.
              * Only sleep/wait are skipped; mutex init runs normally. */
-            printf("[AUTO-LAUNCH] → Task entry at 0x%08X (init with skips)\n", entry);
+            /* Launch game task at service entry — let init run naturally.
+             * BSS clear is handled by write protection + code restore. */
+            printf("[AUTO-LAUNCH] → Task entry at 0x%08X (with code protection)\n", entry);
             vf->cpu.cpsr = 0x00000013;
-            vf->cpu.r[15] = entry;
             vf->cpu.r[13] = sbase + ssz - 4;
             vf->cpu.r[14] = 0x10FFF000;
             vf->timer.timer[0].load = 37500;
@@ -5758,42 +5760,11 @@ void vflash_run_frame(VFlash *vf) {
      * zeroing everything. When detected, restore code and skip ahead. */
     if (vf->rtos_backup && vf->boot_phase >= 800) {
         uint32_t pc = vf->cpu.r[15];
-        /* BSS clear: PC is in the range being cleared (code under PC = 0) */
-        if (pc >= 0x109D0000 && pc < 0x10A10000 &&
-            *(uint32_t*)(vf->ram + (pc - 0x10000000)) == 0) {
-            /* Restore FULL RAM from backup (all code+data structures) */
-            memcpy(vf->ram, vf->rtos_backup, VFLASH_RAM_SIZE);
-            /* Set critical flags AFTER restore (backup was before these were set) */
-            *(uint16_t*)(vf->ram + 0xBE49E0) = 1;  /* game_main start flag */
-            *(uint32_t*)(vf->ram + 0xB009C4) = 1;  /* game_state = active */
-            *(uint32_t*)(vf->ram + 0xB902C0) = 3;  /* game_mode = gameplay */
-            *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;  /* render_enable */
-            /* Jump to game_main (in BOOT.BIN area, always intact) */
-            vf->cpu.r[15] = 0x10CFAEA0;
-            vf->cpu.r[13] = 0x10B8D000;
-            vf->cpu.r[14] = 0x10FFF000;
-            vf->cpu.cpsr = 0x000000D3;
-            if (vf->boot_phase < 900) vf->boot_phase = 900;
-            static int bss_skip = 0;
-            if (bss_skip++ < 3)
-                printf("[BSS-SKIP] Full RAM restore → game_main\n");
+        /* Restore RTOS/engine code if BSS clear zeroed it */
+        if (*(uint32_t*)(vf->ram + 0xA8CDE4) == 0 ||
+            *(uint32_t*)(vf->ram + 0x9D1BD0) == 0) {
+            memcpy(vf->ram + 0x90000, vf->rtos_backup + 0x90000, 0xA80000);
         }
-        /* If landed in idle, restart game_main with full RAM state */
-        if (pc == 0x10FFF00C && vf->boot_phase >= 800) {
-            memcpy(vf->ram, vf->rtos_backup, VFLASH_RAM_SIZE);
-            *(uint16_t*)(vf->ram + 0xBE49E0) = 1;
-            *(uint32_t*)(vf->ram + 0xB009C4) = 1;
-            *(uint32_t*)(vf->ram + 0xB902C0) = 3;
-            *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;
-            vf->cpu.r[15] = 0x10CFAEA0;
-            vf->cpu.r[13] = 0x10B8D000;
-            vf->cpu.r[14] = 0x10FFF000;
-            vf->cpu.cpsr = 0x000000D3;
-            if (vf->boot_phase < 900) vf->boot_phase = 900;
-        }
-        /* Restore RTOS code silently if zeroed */
-        if (*(uint32_t*)(vf->ram + 0xA8CDE4) == 0)
-            memcpy(vf->ram, vf->rtos_backup, VFLASH_RAM_SIZE);
     }
 
     /* Force game pre-loop after init gets stuck.
