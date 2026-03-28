@@ -3530,104 +3530,32 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
-    /* render_init (10A881F0): let it run natively but skip RTOS calls
-     * that get stuck. The function has 3 registration BLs then 10
-     * init callbacks. Registration BLs and RTOS tree traversal are skipped. */
+    /* HLE render_init (10A881F0): set flags, restore vtable, return.
+     * Native run corrupts vtables with RTOS dispatch address. */
     if (addr == 0x10A881F0 && ((VFlash*)ctx)->boot_phase >= 900) {
         VFlash *vf2 = (VFlash*)ctx;
-        /* DON'T set ready flags — let the native registration set them.
-         * The BEQ loop at 10AB6340 checks [0x10BE3EA0] and loops while
-         * non-zero. Registration calls clear it to 0 when done. */
-        vf2->ram[0xBE3EC0] = 1;  /* render_enable only */
-        printf("[RENDER-INIT] Running natively with RTOS stubs\n");
-        /* Schedule vtable restoration for after render_init completes.
-         * render_init corrupts the vtable at 0x10B1D508 — restore from
-         * BOOT.BIN original data after the init callbacks finish. */
-        vf2->restore_vtable_pending = 1;
-        return 0; /* let native execution proceed */
-    }
-    /* Skip RTOS functions that get stuck during render_init.
-     * 10AB085C: callback registration — return success (non-zero) so
-     *   callers don't loop retrying. Writes result to [R0]+0 halfword.
-     * 10AB889C/7A00: other registrations
-     * 10A8CDE4: RTOS tree traversal
-     * 10A6FC60: task_notify */
-    /* Let 10AB085C (callback registration) run natively.
-     * It calls 10AAFF48 and 10AB0570 which set up render objects.
-     * The stuck function 10A8CDE4 is skipped separately below. */
-    if ((addr == 0x10AB889C || addr == 0x10AB7A00) &&
-        ((VFlash*)ctx)->boot_phase >= 900) {
-        static int rtos_skip = 0;
-        if (rtos_skip < 10)
-            printf("[RTOS-SKIP] %08X → return 0\n", addr);
-        rtos_skip++;
-        cpu->r[0] = 0;
-        cpu->r[15] = cpu->r[14] & ~3u;
-        return 1;
-    }
-    /* 10A8CDE4: RTOS tree traversal — called by render loop for dispatch.
-     * The function reads [R5+8] and traverses a task queue tree.
-     * Without proper RTOS queue state, it either loops or does nothing.
-     * Force return AND also set caller's done-flag to break retry loop. */
-    if (addr == 0x10A8CDE4 && ((VFlash*)ctx)->boot_phase >= 900) {
-        VFlash *vf2 = (VFlash*)ctx;
-        /* Force the queue to appear empty */
-        uint32_t queue_ptr = cpu->r[5];
-        if (queue_ptr >= 0x10000000 && queue_ptr + 16 <= 0x10000000 + VFLASH_RAM_SIZE) {
-            uint32_t q_off = queue_ptr - 0x10000000;
-            *(uint32_t*)(vf2->ram + q_off + 8) = 0;
-            *(uint32_t*)(vf2->ram + q_off + 0) = 0;
-        }
-        /* Also force render context completion flags to break caller loops */
         vf2->ram[0xBE3EA0] = 1;
         vf2->ram[0xBE3C80] = 1;
         vf2->ram[0xBE3E20] = 1;
-        *(uint32_t*)(vf2->ram + 0xBE3CA0) = 0x84; /* done state */
-        static int cde4_skip = 0;
-        if (cde4_skip < 5) {
-            /* Check if LR is self (recursive) — look at stack for real return */
-            uint32_t sp = cpu->r[13];
-            uint32_t ret = cpu->r[14];
-            if (ret == 0x10A8CDE4 && sp >= 0x10000000 && sp < 0x10000000 + VFLASH_RAM_SIZE) {
-                /* Pop return from stack */
-                uint32_t sp_off = sp - 0x10000000;
-                for (int si = 0; si < 32; si += 4) {
-                    uint32_t sv = *(uint32_t*)(vf2->ram + sp_off + si);
-                    if (sv >= 0x10A00000 && sv < 0x10D00000 && sv != 0x10A8CDE4) {
-                        ret = sv;
-                        cpu->r[13] = sp + si + 4; /* adjust SP */
-                        break;
-                    }
-                }
-            }
-            printf("[RTOS-TREE] %08X R5=%08X LR=%08X ret=%08X\n",
-                   addr, queue_ptr, cpu->r[14], ret);
-            cpu->r[15] = ret & ~3u;
-        } else {
-            /* Fast path: detect self-call and force return to game loop */
-            if (cpu->r[14] == 0x10A8CDE4) {
-                /* Find real return on stack */
-                uint32_t sp = cpu->r[13];
-                if (sp >= 0x10000000 && sp < 0x10000000 + VFLASH_RAM_SIZE - 64) {
-                    uint32_t sp_off = sp - 0x10000000;
-                    for (int si = 0; si < 64; si += 4) {
-                        uint32_t sv = *(uint32_t*)(vf2->ram + sp_off + si);
-                        if (sv >= 0x10A00000 && sv < 0x10D00000 && sv != 0x10A8CDE4) {
-                            cpu->r[15] = sv & ~3u;
-                            cpu->r[13] = sp + si + 4;
-                            break;
-                        }
-                    }
-                }
-            } else {
-                cpu->r[15] = cpu->r[14] & ~3u;
-            }
-        }
-        cde4_skip++;
-        cpu->r[0] = 0;
+        vf2->ram[0xBE3EC0] = 1;
+        vf2->ram[0xBE3CA0] = 1;
+        /* Restore original vtable from BOOT.BIN */
+        static const uint32_t orig_vt[] = {
+            0x10AB0B14, 0, 0, 0x10A77AC0, 0x10A77AC0, 0x10AB0D94,
+            0x10A77AC0, 0x10A77AC0, 0, 0, 0x10AB0E90, 0x10AB0E98,
+            0x10AB0EA8, 0x10AB0EE4, 0x10AB0EA0, 0x10AB0EF4,
+        };
+        for (int i = 0; i < 16; i++)
+            *(uint32_t*)(vf2->ram + 0xB1D508 + i*4) = orig_vt[i];
+        *(uint32_t*)(vf2->ram + 0xBE3CE0) = 0x10B1D508;
+        static int ri_log = 0;
+        if (ri_log++ < 3) printf("[HLE-RENDER-INIT] Flags + vtable restored\n");
+        cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
-    if (addr == 0x10A6FC60 && ((VFlash*)ctx)->boot_phase >= 900) {
+    /* Skip RTOS dispatch (10A8CDE4) and task_notify (10A6FC60) */
+    if ((addr == 0x10A8CDE4 || addr == 0x10A6FC60) &&
+        ((VFlash*)ctx)->boot_phase >= 900) {
         cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
@@ -5582,26 +5510,6 @@ void vflash_run_frame(VFlash *vf) {
                 }
             }
         }
-    }
-
-    /* Restore vtable corrupted by render_init RTOS registration.
-     * The vtable at 0x10B1D508 gets overwritten with 0x10A8CDE4 patterns.
-     * Restore original function pointers from BOOT.BIN block copy source. */
-    if (vf->restore_vtable_pending && vf->frame_count >= 95) {
-        vf->restore_vtable_pending = 0;
-        /* Original vtable at 0x10B1D508 from BOOT.BIN (offset 0x15851C): */
-        static const uint32_t orig_vt[] = {
-            0x10AB0B14, 0x00000000, 0x00000000, 0x10A77AC0,
-            0x10A77AC0, 0x10AB0D94, 0x10A77AC0, 0x10A77AC0,
-            0x00000000, 0x00000000, 0x10AB0E90, 0x10AB0E98,
-            0x10AB0EA8, 0x10AB0EE4, 0x10AB0EA0, 0x10AB0EF4,
-        };
-        for (int i = 0; i < 16; i++)
-            *(uint32_t*)(vf->ram + 0xB1D508 + i*4) = orig_vt[i];
-        /* Set render context object vtable pointer */
-        *(uint32_t*)(vf->ram + 0xBE3CE0) = 0x10B1D508;
-        printf("[VTABLE-RESTORE] Restored vtable at 0x10B1D508 (16 entries)\n");
-        printf("[VTABLE-RESTORE] Object 0x10BE3CE0 → vtable 0x10B1D508\n");
     }
 
     /* Scan for BOOT.BIN callback pointers in µMORE area */
