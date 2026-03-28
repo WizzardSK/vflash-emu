@@ -3534,11 +3534,14 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
      * Native run corrupts vtables with RTOS dispatch address. */
     if (addr == 0x10A881F0 && ((VFlash*)ctx)->boot_phase >= 900) {
         VFlash *vf2 = (VFlash*)ctx;
-        vf2->ram[0xBE3EA0] = 1;
-        vf2->ram[0xBE3C80] = 1;
-        vf2->ram[0xBE3E20] = 1;
-        vf2->ram[0xBE3EC0] = 1;
-        vf2->ram[0xBE3CA0] = 1;
+        /* These flags control render dispatch loops at 10AB6330.
+         * 0 = "registration done, skip dispatch" — prevents infinite loop.
+         * Only render_enable needs to be 1. */
+        vf2->ram[0xBE3EA0] = 0;  /* render_subsystem: 0=done */
+        vf2->ram[0xBE3C80] = 0;  /* render_queue: 0=done */
+        vf2->ram[0xBE3E20] = 0;  /* render_objects: 0=done */
+        vf2->ram[0xBE3EC0] = 1;  /* render_enable: must be 1 */
+        vf2->ram[0xBE3CA0] = 1;  /* GPU completion */
         /* Restore original vtable from BOOT.BIN */
         static const uint32_t orig_vt[] = {
             0x10AB0B14, 0, 0, 0x10A77AC0, 0x10A77AC0, 0x10AB0D94,
@@ -3553,8 +3556,10 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
-    /* Skip RTOS dispatch (10A8CDE4) and task_notify (10A6FC60) */
-    if ((addr == 0x10A8CDE4 || addr == 0x10A6FC60) &&
+    /* Skip RTOS functions: dispatch, registration, task_notify, context loop */
+    if ((addr == 0x10A8CDE4 || addr == 0x10A6FC60 ||
+         addr == 0x10AB085C || addr == 0x10AB889C || addr == 0x10AB7A00 ||
+         addr == 0x10AB6324 /* render context dispatch loop */) &&
         ((VFlash*)ctx)->boot_phase >= 900) {
         cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
@@ -3590,7 +3595,7 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
                 vf2->ram[0xBE4BA0] = 1;
             }
         }
-        vf2->render_budget = 2000000; /* 2M budget for real render pipeline */
+        vf2->render_budget = 20000000; /* 20M budget — real rendering needs more */
         return 0;
     }
     /* (budget check moved to top of function) */
