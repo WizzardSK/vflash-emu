@@ -3530,6 +3530,60 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
+    /* HLE software division — replace 82-instruction shift-subtract loop
+     * with native C division. ~40x speedup per call.
+     * ARM EABI: __aeabi_uidiv(R0, R1) → R0=quotient, R1=remainder
+     * Multiple entry points for signed/unsigned/modulo variants. */
+    if (addr >= 0x10A86E00 && addr <= 0x10A871C0 &&
+        ((VFlash*)ctx)->boot_phase >= 100) {
+        uint32_t dividend = cpu->r[0];
+        uint32_t divisor = cpu->r[1];
+        if (divisor == 0) {
+            cpu->r[0] = 0xFFFFFFFF; /* div by zero → max */
+            cpu->r[1] = dividend;
+        } else if (addr >= 0x10A86E30 && addr < 0x10A86EA0) {
+            /* Signed division */
+            int32_t sq = (int32_t)dividend / (int32_t)divisor;
+            int32_t sr = (int32_t)dividend % (int32_t)divisor;
+            cpu->r[0] = (uint32_t)sq;
+            cpu->r[1] = (uint32_t)sr;
+        } else {
+            /* Unsigned division (most common) */
+            cpu->r[0] = dividend / divisor;
+            cpu->r[1] = dividend % divisor;
+        }
+        cpu->r[2] = cpu->r[0]; /* some callers read R2 */
+        cpu->r[3] = dividend;  /* R3 = original dividend */
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+
+    /* HLE memcpy at 10A00840: R0=dst, R1=src, R2=len → R0=dst */
+    if (addr == 0x10A00840) {
+        VFlash *vf2 = (VFlash*)ctx;
+        uint32_t dst = cpu->r[0] - 0x10000000;
+        uint32_t src = cpu->r[1] - 0x10000000;
+        uint32_t len = cpu->r[2];
+        if (dst < VFLASH_RAM_SIZE && src < VFLASH_RAM_SIZE &&
+            dst + len <= VFLASH_RAM_SIZE && src + len <= VFLASH_RAM_SIZE && len < 0x100000) {
+            memmove(vf2->ram + dst, vf2->ram + src, len);
+            cpu->r[15] = cpu->r[14] & ~3u;
+            return 1;
+        }
+    }
+    /* HLE memset at 10A4D500: R0=dst, R1=val, R2=len → R0=dst */
+    if (addr == 0x10A4D500) {
+        VFlash *vf2 = (VFlash*)ctx;
+        uint32_t dst = cpu->r[0] - 0x10000000;
+        uint32_t val = cpu->r[1] & 0xFF;
+        uint32_t len = cpu->r[2];
+        if (dst < VFLASH_RAM_SIZE && dst + len <= VFLASH_RAM_SIZE && len < 0x100000) {
+            memset(vf2->ram + dst, (int)val, len);
+            cpu->r[15] = cpu->r[14] & ~3u;
+            return 1;
+        }
+    }
+
     /* HLE render_init (10A881F0): set flags and return.
      * Native run corrupts vtables — keep it HLE. */
     if (addr == 0x10A881F0 && ((VFlash*)ctx)->boot_phase >= 900) {
