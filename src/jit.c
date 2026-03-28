@@ -175,11 +175,15 @@ static int compile_data_processing(EmitBuf *e, uint32_t insn, uint32_t pc) {
     int Rn = (insn >> 16) & 0xF;
     int Rd = (insn >> 12) & 0xF;
 
-    if (Rd == 15 || Rn == 15) return 0; /* PC-relative — fallback */
+    if (Rd == 15) return 0; /* PC as destination — fallback */
 
-    /* Load Rn into EAX */
-    if (opcode != 13 && opcode != 15) /* MOV/MVN don't use Rn */
-        emit_load_arm_reg(e, RAX, Rn);
+    /* Load Rn into EAX (use PC+8 if Rn==15) */
+    if (opcode != 13 && opcode != 15) { /* MOV/MVN don't use Rn */
+        if (Rn == 15)
+            emit_mov_r32_imm32(e, RAX, pc + 8);
+        else
+            emit_load_arm_reg(e, RAX, Rn);
+    }
 
     /* Compute operand2 into ECX */
     if (I) {
@@ -187,23 +191,52 @@ static int compile_data_processing(EmitBuf *e, uint32_t insn, uint32_t pc) {
         emit_mov_r32_imm32(e, RCX, imm);
     } else {
         int Rm = insn & 0xF;
-        if (Rm == 15) return 0; /* PC-relative Rm — fallback */
         int shift_type = (insn >> 5) & 3;
         int shift_imm = (insn >> 7) & 0x1F;
         int shift_by_reg = (insn >> 4) & 1;
-        if (shift_by_reg) return 0; /* register shift — complex, fallback */
 
-        emit_load_arm_reg(e, RCX, Rm);
-        if (shift_imm > 0) {
+        if (Rm == 15)
+            emit_mov_r32_imm32(e, RCX, pc + 8);
+        else
+            emit_load_arm_reg(e, RCX, Rm);
+
+        if (shift_by_reg) {
+            /* Register-controlled shift: shift amount in Rs */
+            int Rs = (insn >> 8) & 0xF;
+            if (Rs == 15) return 0;
+            /* x86 shifts use CL for variable shift amount */
+            emit_push(e, RCX); /* save operand */
+            emit_load_arm_reg(e, RCX, Rs); /* CL = shift amount */
+            emit_and_r32_imm32(e, RCX, 0xFF); /* mask to byte */
+            emit_mov_r32_r32(e, RDX, RCX); /* save shift in EDX */
+            emit_pop(e, RCX); /* restore operand */
+            /* Now: ECX=value to shift, DL=shift amount. Need CL=amount. */
+            emit_push(e, RCX);
+            emit_mov_r32_r32(e, RCX, RDX); /* CL = shift amount */
+            emit_pop(e, RDX); /* EDX = value */
+            switch (shift_type) {
+                case 0: emit8(e, 0xD3); emit8(e, modrm(3, 4, RDX)); break; /* SHL EDX, CL */
+                case 1: emit8(e, 0xD3); emit8(e, modrm(3, 5, RDX)); break; /* SHR EDX, CL */
+                case 2: emit8(e, 0xD3); emit8(e, modrm(3, 7, RDX)); break; /* SAR EDX, CL */
+                case 3: emit8(e, 0xD3); emit8(e, modrm(3, 1, RDX)); break; /* ROR EDX, CL */
+            }
+            emit_mov_r32_r32(e, RCX, RDX); /* result back in ECX */
+        } else if (shift_imm > 0) {
             switch (shift_type) {
                 case 0: emit_shl_r32_imm(e, RCX, shift_imm); break;
-                case 1: emit_shr_r32_imm(e, RCX, shift_imm); break;
-                case 2: emit_sar_r32_imm(e, RCX, shift_imm); break;
-                case 3: /* ROR */
-                    emit_shr_r32_imm(e, RCX, shift_imm);
-                    /* TODO: proper ROR — for now, fallback */
-                    return 0;
+                case 1: emit_shr_r32_imm(e, RCX, shift_imm ? shift_imm : 32); break;
+                case 2: emit_sar_r32_imm(e, RCX, shift_imm ? shift_imm : 32); break;
+                case 3: /* ROR #imm */
+                    /* x86 ROR: C1 /1 ib */
+                    emit8(e, 0xC1); emit8(e, modrm(3, 1, RCX)); emit8(e, shift_imm);
+                    break;
             }
+        } else if (shift_type == 1) {
+            /* LSR #32 → result = 0 */
+            emit_mov_r32_imm32(e, RCX, 0);
+        } else if (shift_type == 2) {
+            /* ASR #32 → result = sign extension */
+            emit_sar_r32_imm(e, RCX, 31);
         }
     }
 
@@ -266,18 +299,21 @@ static int compile_ldr_str(EmitBuf *e, uint32_t insn, uint32_t pc, VFlash *vf) {
     int Rn = (insn >> 16) & 0xF;
     int Rd = (insn >> 12) & 0xF;
 
-    if (Rd == 15 || Rn == 15) return 0; /* PC-relative — fallback */
-    if (B) return 0; /* byte access — fallback for now */
+    if (Rd == 15) return 0; /* LDR PC — fallback (branch) */
     if (!P || W) return 0; /* post-indexed or writeback — complex */
     if (I) return 0; /* register offset — complex */
 
     int32_t offset = insn & 0xFFF;
     if (!U) offset = -offset;
 
-    /* Compute address: addr = Rn + offset */
-    emit_load_arm_reg(e, RDI, Rn); /* RDI = base address */
-    if (offset != 0)
-        emit_add_r32_imm32(e, RDI, offset);
+    /* Compute address: addr = Rn + offset (PC+8 if Rn==15) */
+    if (Rn == 15)
+        emit_mov_r32_imm32(e, RDI, (pc + 8) + offset);
+    else {
+        emit_load_arm_reg(e, RDI, Rn);
+        if (offset != 0)
+            emit_add_r32_imm32(e, RDI, offset);
+    }
 
     /* Inline RAM fast path:
      * if (addr >= 0x10000000 && addr < 0x11000000)
@@ -300,14 +336,23 @@ static int compile_ldr_str(EmitBuf *e, uint32_t insn, uint32_t pc, VFlash *vf) {
     emit8(e, 0x48); /* REX.W */ emit8(e, 0x63); emit8(e, modrm(3, RAX, RAX)); /* movsxd rax, eax — zero ext is fine since < 16MB */
 
     if (L) {
-        /* LDR: result = *(uint32_t*)(ram + offset) */
-        /* mov edx, [rsi + rax] */
-        emit8(e, 0x8B); emit8(e, 0x14); emit8(e, 0x06); /* mov edx, [rsi+rax] */
+        if (B) {
+            /* LDRB: result = *(uint8_t*)(ram + offset) */
+            emit8(e, 0x0F); emit8(e, 0xB6); emit8(e, 0x14); emit8(e, 0x06); /* movzx edx, byte [rsi+rax] */
+        } else {
+            /* LDR: result = *(uint32_t*)(ram + offset) */
+            emit8(e, 0x8B); emit8(e, 0x14); emit8(e, 0x06); /* mov edx, [rsi+rax] */
+        }
         emit_store_arm_reg(e, Rd, RDX);
     } else {
-        /* STR: *(uint32_t*)(ram + offset) = Rd */
         emit_load_arm_reg(e, RDX, Rd);
-        emit8(e, 0x89); emit8(e, 0x14); emit8(e, 0x06); /* mov [rsi+rax], edx */
+        if (B) {
+            /* STRB */
+            emit8(e, 0x88); emit8(e, 0x14); emit8(e, 0x06); /* mov [rsi+rax], dl */
+        } else {
+            /* STR */
+            emit8(e, 0x89); emit8(e, 0x14); emit8(e, 0x06); /* mov [rsi+rax], edx */
+        }
     }
     /* Jump past slow path */
     uint32_t jmp_pos = e->pos;
