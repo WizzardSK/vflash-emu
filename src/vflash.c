@@ -5258,8 +5258,9 @@ void vflash_run_frame(VFlash *vf) {
         }
     }
 
-    /* MJP video player — Z=next video, X=stop, auto-load on frame 1 */
-    if (vf->cd && vf->cd->is_open && vf->mjp_count > 0) {
+    /* MJP video player — Z=next video, X=stop, auto-load on frame 1.
+     * Disabled during game phase to prevent video flickering over game scene. */
+    if (vf->cd && vf->cd->is_open && vf->mjp_count > 0 && vf->boot_phase < 900) {
         uint32_t pressed = vf->input & ~vf->input_prev;
         int load_mjp = 0;
         if (pressed & VFLASH_BTN_RED) {
@@ -5340,7 +5341,12 @@ void vflash_run_frame(VFlash *vf) {
         }
     }
 
-    /* Decode next MJP frame if player is active */
+    /* Decode next MJP frame if player is active (stop during game phase) */
+    if (vf->mjp_player.playing && vf->boot_phase >= 900) {
+        vf->mjp_player.playing = 0;
+        free(vf->mjp_player.data); vf->mjp_player.data = NULL;
+        free(vf->mjp_player.hdr);  vf->mjp_player.hdr = NULL;
+    }
     if (vf->mjp_player.playing) {
         if (++vf->mjp_player.frame_skip >= vf->mjp_player.frame_rate) {
             vf->mjp_player.frame_skip = 0;
