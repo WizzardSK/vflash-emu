@@ -69,20 +69,21 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **NULL entity protection** | ✅ Dummy vtable + read trap for safe execution |
 | **Native render function** | ✅ Copied from BOOT.BIN (10D615FC→10B265E8) |
 | **HLE render_init** | ✅ 3-step state machine bypassed, all flags set |
-| **Render processing** | 🔧 Runs with 50K instruction budget (entity stubs) |
+| **VBlank toggle** | ✅ MMIO 0x900A0018 bit25 triggers entity draw path |
+| **Display list vector** | ✅ 100 entities, vtable[2] draw called 5000×/session |
+| **73 unrelocated functions** | ✅ 100KB code block copied from BOOT.BIN |
+| **Render processing** | 🔧 200K budget, entity draw calls work but stubs return 0 |
 | **PTX display** | ✅ Game artwork (XBGR1555 sprites) on screen |
 
 ### Remaining for gameplay
 
-Game engine runs natively with 320KB of allocated entity data. Native render
-function recovered from BOOT.BIN — bootstrap never relocated it to target
-address (10B265E8 had data, not code). Render_init is a 3-step state machine
-(subsystem_ready → queue_ready → objects_ready) that gets stuck in RTOS task
-queue tree traversal — HLE'd to set all flags instantly. Render processing
-(10A89100) enters the software render pipeline with 50K instruction budget per
-frame, but entity vtable draw methods are dummy stubs (return 0). VFF tile
-graphics are in proprietary compressed format requiring the game's ARM decoder
-(VFF sec[0]). PTX sprite artwork displayed as game scene fallback.
+Render pipeline works end-to-end: init(HLE) → processing(native) → VBlank
+check → display list iterate → vtable[2] draw called on entities. 73
+unrelocated functions (100KB) recovered from BOOT.BIN. Entity draw methods
+are dummy stubs — real vtable pointers needed from native alloc (10A775E0).
+VFF scene callback uses HLE alloc area as tile data scratchpad, not as
+entity objects. VFF sec[1] tiles (1772KB) are compressed, requiring the
+game's ARM decoder in VFF sec[0] (122KB at 104E2000).
 
 **Key HLE components**:
 - Game alloc (10A775E0, 10A77648): bump allocator with dummy vtable
