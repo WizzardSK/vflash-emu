@@ -3529,18 +3529,47 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
-    /* HLE render_init (10A881F0): native run still gets stuck on internal
-     * RTOS calls (task queue drain at 10A8CDE4), not just task_notify.
-     * Set ready flags and return. Display list populated in render_processing. */
+    /* render_init (10A881F0): let it run natively but skip RTOS calls
+     * that get stuck. The function has 3 registration BLs then 10
+     * init callbacks. Registration BLs and RTOS tree traversal are skipped. */
     if (addr == 0x10A881F0 && ((VFlash*)ctx)->boot_phase >= 900) {
         VFlash *vf2 = (VFlash*)ctx;
-        vf2->ram[0xBE3EA0] = 1;  /* render_subsystem_ready */
-        vf2->ram[0xBE3C80] = 1;  /* render_queue_ready */
-        vf2->ram[0xBE3E20] = 1;  /* render_objects_ready */
-        vf2->ram[0xBE3EC0] = 1;  /* render_enable */
-        vf2->ram[0xBE3CA0] = 1;  /* GPU completion */
-        static int ri_log = 0;
-        if (ri_log < 3) { printf("[HLE-RENDER-INIT] Flags set\n"); ri_log++; }
+        /* DON'T set ready flags — let the native registration set them.
+         * The BEQ loop at 10AB6340 checks [0x10BE3EA0] and loops while
+         * non-zero. Registration calls clear it to 0 when done. */
+        vf2->ram[0xBE3EC0] = 1;  /* render_enable only */
+        printf("[RENDER-INIT] Running natively with RTOS stubs\n");
+        return 0; /* let native execution proceed */
+    }
+    /* Skip RTOS functions that get stuck during render_init.
+     * 10AB085C: callback registration — return success (non-zero) so
+     *   callers don't loop retrying. Writes result to [R0]+0 halfword.
+     * 10AB889C/7A00: other registrations
+     * 10A8CDE4: RTOS tree traversal
+     * 10A6FC60: task_notify */
+    if (addr == 0x10AB085C && ((VFlash*)ctx)->boot_phase >= 900) {
+        VFlash *vf2 = (VFlash*)ctx;
+        static int reg_skip = 0;
+        /* Write success indicator: set halfword at [R0] to 1 */
+        uint32_t ctx_ptr = cpu->r[0];
+        if (ctx_ptr >= 0x10000000 && ctx_ptr < 0x10000000 + VFLASH_RAM_SIZE - 4) {
+            *(uint16_t*)(vf2->ram + (ctx_ptr - 0x10000000)) = 1;
+        }
+        if (reg_skip < 30)
+            printf("[RTOS-REG] %08X ctx=%08X → success\n", addr, ctx_ptr);
+        reg_skip++;
+        cpu->r[0] = 1; /* success */
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    if ((addr == 0x10AB889C || addr == 0x10AB7A00 ||
+         addr == 0x10A8CDE4 || addr == 0x10A6FC60) &&
+        ((VFlash*)ctx)->boot_phase >= 900) {
+        static int rtos_skip = 0;
+        if (rtos_skip < 10)
+            printf("[RTOS-SKIP] %08X → return 1\n", addr);
+        rtos_skip++;
+        cpu->r[0] = 1;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
@@ -3574,7 +3603,7 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
                 vf2->ram[0xBE4BA0] = 1;
             }
         }
-        vf2->render_budget = 200000;
+        vf2->render_budget = 2000000; /* 2M budget for real render pipeline */
         return 0;
     }
     /* (budget check moved to top of function) */
