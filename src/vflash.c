@@ -1491,8 +1491,12 @@ static uint8_t mem_read8(void *ctx, uint32_t addr) {
             return vf->ram[off];
         return 0;
     }
-    if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE)
-        return vf->ram[addr - VFLASH_RAM_BASE];
+    if (addr >= VFLASH_RAM_BASE && addr < VFLASH_RAM_BASE + VFLASH_RAM_SIZE) {
+        uint32_t roff8 = addr - VFLASH_RAM_BASE;
+        /* Force game_main start flag */
+        if (roff8 == 0xBE49E0 && vf->boot_phase >= 800) return 1;
+        return vf->ram[roff8];
+    }
     if (addr >= VFLASH_SRAM_BASE && addr < VFLASH_SRAM_BASE + VFLASH_SRAM_SIZE)
         return vf->sram[addr - VFLASH_SRAM_BASE];
     if (addr >= VFLASH_IO_BASE)
@@ -1556,6 +1560,10 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
          * Only protect THIS SPECIFIC BYTE, not the whole 256-byte range.
          * Previous wide range (0xBE3C40-0xBE3D40) prevented render_processing
          * from managing its own state fields (all zeros became 1). */
+        /* Force game_main start flag to 1 when read */
+        if (roff == 0xBE49E0 && vf->boot_phase >= 800) {
+            return 1;
+        }
         if (roff == 0xBE3CA0 && val == 0 && vf->boot_phase >= 900) {
             val = 1; /* keep GPU completion at "done" */
         }
@@ -4054,6 +4062,8 @@ void vflash_run_frame(VFlash *vf) {
         /* Use JIT when available and game is running, interpreter otherwise */
         if (vf->jit && vf->boot_phase >= 100 &&
             vf->cpu.r[15] >= 0x10000000 && vf->cpu.r[15] < 0x11000000) {
+            /* Force game flags in RAM before every JIT run */
+            vf->ram[0xBE49E0] = 1;
             int ran = jit_run(vf->jit, slice);
             vf->cpu.cycles += ran;
         } else {
@@ -5729,13 +5739,24 @@ void vflash_run_frame(VFlash *vf) {
             }
         }
         if (!entry) {
-            /* Hardcode game task entry from BOOT.BIN service setup.
-             * TCB scan fails because $QCB entry is 0 at this point.
-             * The real entry is populated by service init at 109D1BD0. */
-            entry = 0x109D1BD0;
+            /* Game task $QCB at 0x10358580 has entry=0 because
+             * RTOS never registered the game task in this boot flow.
+             * Set entry directly to game_main in BOOT.BIN. */
+            entry = 0x10CFAEA0; /* game_main in BOOT.BIN */
             sbase = 0x10B6DB28;
             ssz = 0x20000;
-            printf("[AUTO-LAUNCH] Using hardcoded game entry %08X\n", entry);
+            /* Also populate $QCB so kernel scheduler can find it */
+            *(uint32_t*)(vf->ram + 0x35858C) = entry; /* $QCB+0x2C = entry */
+            *(uint32_t*)(vf->ram + 0x3585B0) = sbase; /* $QCB+0x30 = stack base */
+            *(uint32_t*)(vf->ram + 0x3585B4) = ssz;   /* $QCB+0x34 = stack size */
+            /* Set game state flags */
+            *(uint16_t*)(vf->ram + 0xBE49E0) = 1;  /* game_main start flag */
+            *(uint32_t*)(vf->ram + 0xB009C4) = 1;
+            *(uint32_t*)(vf->ram + 0xB902C0) = 3;
+            *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;
+            *(uint32_t*)(vf->ram + 0xB05A18) = 8;
+            *(uint32_t*)(vf->ram + 0xB05A1C) = 8;
+            printf("[AUTO-LAUNCH] Set game_main 0x%08X in $QCB\n", entry);
         }
         {
             printf("[AUTO-LAUNCH] Game task: entry=%08X stack=%08X+%X\n", entry, sbase, ssz);
@@ -5784,11 +5805,11 @@ void vflash_run_frame(VFlash *vf) {
      * zeroing everything. When detected, restore code and skip ahead. */
     if (vf->rtos_backup && vf->boot_phase >= 800) {
         uint32_t pc = vf->cpu.r[15];
-        /* Restore RTOS/engine code if BSS clear zeroed it */
-        if (*(uint32_t*)(vf->ram + 0xA8CDE4) == 0 ||
-            *(uint32_t*)(vf->ram + 0x9D1BD0) == 0) {
-            memcpy(vf->ram + 0x90000, vf->rtos_backup + 0x90000, 0xA80000);
-        }
+        /* After any restore, re-set game flags (backup has them at 0) */
+        *(uint16_t*)(vf->ram + 0xBE49E0) = 1;
+        *(uint32_t*)(vf->ram + 0xB009C4) = 1;
+        *(uint32_t*)(vf->ram + 0xB902C0) = 3;
+        *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;
     }
 
     /* Force game pre-loop after init gets stuck.
