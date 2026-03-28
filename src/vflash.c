@@ -5738,13 +5738,13 @@ void vflash_run_frame(VFlash *vf) {
             vf->timer.timer[0].ctrl = 0xE2;
             vf->timer.irq.enable |= 0x01;
             vf->boot_phase = 800;
-            /* Backup ALL code areas — game BSS clear will zero everything.
-             * 0x10090000-0x10B10000 = kernel + RTOS + engine code (~10MB) */
+            /* Backup ENTIRE RAM — game BSS clear will zero code+data.
+             * We restore everything when BSS clear is detected. */
             if (!vf->rtos_backup) {
-                vf->rtos_backup = malloc(0xA80000); /* 0x90000 to 0xB10000 */
+                vf->rtos_backup = malloc(VFLASH_RAM_SIZE);
                 if (vf->rtos_backup) {
-                    memcpy(vf->rtos_backup, vf->ram + 0x90000, 0xA80000);
-                    printf("[CODE-BACKUP] Saved 0x10090000-0x10B10000 (10.5MB)\n");
+                    memcpy(vf->rtos_backup, vf->ram, VFLASH_RAM_SIZE);
+                    printf("[RAM-BACKUP] Saved full 16MB RAM state\n");
                 }
             }
         }
@@ -5758,21 +5758,12 @@ void vflash_run_frame(VFlash *vf) {
      * zeroing everything. When detected, restore code and skip ahead. */
     if (vf->rtos_backup && vf->boot_phase >= 800) {
         uint32_t pc = vf->cpu.r[15];
-        /* BSS clear: PC is in the range being cleared */
+        /* BSS clear: PC is in the range being cleared (code under PC = 0) */
         if (pc >= 0x109D0000 && pc < 0x10A10000 &&
             *(uint32_t*)(vf->ram + (pc - 0x10000000)) == 0) {
-            /* Code under PC is zero — BSS clear ate it. Restore and skip. */
-            memcpy(vf->ram + 0x90000, vf->rtos_backup, 0xA80000);
-            /* Restore game state variables wiped by BSS clear */
-            *(uint32_t*)(vf->ram + 0xB009C4) = 1;  /* game_state = active */
-            *(uint32_t*)(vf->ram + 0xB902C0) = 3;  /* game_mode = gameplay */
-            *(uint32_t*)(vf->ram + 0xBBD3C0) = 0x10CFAEA0; /* game callback */
-            *(uint32_t*)(vf->ram + 0xB05A18) = 8;  /* service counters */
-            *(uint32_t*)(vf->ram + 0xB05A1C) = 8;
-            *(uint16_t*)(vf->ram + 0xBE49E0) = 1;  /* game_main start flag */
-            *(uint32_t*)(vf->ram + 0xB668A0) = 0x10B66900; /* render context */
-            *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;  /* render_enable */
-            /* Jump to game_main (in BOOT.BIN, survives BSS clear) */
+            /* Restore FULL RAM from backup (all code+data structures) */
+            memcpy(vf->ram, vf->rtos_backup, VFLASH_RAM_SIZE);
+            /* Jump to game_main (in BOOT.BIN area, always intact) */
             vf->cpu.r[15] = 0x10CFAEA0;
             vf->cpu.r[13] = 0x10B8D000;
             vf->cpu.r[14] = 0x10FFF000;
@@ -5780,23 +5771,20 @@ void vflash_run_frame(VFlash *vf) {
             if (vf->boot_phase < 900) vf->boot_phase = 900;
             static int bss_skip = 0;
             if (bss_skip++ < 3)
-                printf("[BSS-SKIP] PC=%08X → game_main at 10CFAEA0\n", pc);
+                printf("[BSS-SKIP] Full RAM restore → game_main\n");
         }
-        /* Also: if PC landed in idle (0x10FFF00C), restart game_main */
+        /* If landed in idle, restart game_main with full RAM state */
         if (pc == 0x10FFF00C && vf->boot_phase >= 800) {
-            memcpy(vf->ram + 0x90000, vf->rtos_backup, 0xA80000);
-            *(uint32_t*)(vf->ram + 0xB009C4) = 1;
-            *(uint32_t*)(vf->ram + 0xB902C0) = 3;
+            memcpy(vf->ram, vf->rtos_backup, VFLASH_RAM_SIZE);
             vf->cpu.r[15] = 0x10CFAEA0;
             vf->cpu.r[13] = 0x10B8D000;
             vf->cpu.r[14] = 0x10FFF000;
             vf->cpu.cpsr = 0x000000D3;
             if (vf->boot_phase < 900) vf->boot_phase = 900;
         }
-        /* Also restore if RTOS code was zeroed */
-        if (*(uint32_t*)(vf->ram + 0xA8CDE4) == 0) {
-            memcpy(vf->ram + 0x90000, vf->rtos_backup, 0xA80000);
-        }
+        /* Restore RTOS code silently if zeroed */
+        if (*(uint32_t*)(vf->ram + 0xA8CDE4) == 0)
+            memcpy(vf->ram, vf->rtos_backup, VFLASH_RAM_SIZE);
     }
 
     /* Force game pre-loop after init gets stuck.
