@@ -5763,13 +5763,35 @@ void vflash_run_frame(VFlash *vf) {
             *(uint32_t*)(vf->ram + (pc - 0x10000000)) == 0) {
             /* Code under PC is zero — BSS clear ate it. Restore and skip. */
             memcpy(vf->ram + 0x90000, vf->rtos_backup, 0xA80000);
-            /* Jump to game init, skipping BSS clear */
-            vf->cpu.r[15] = 0x10C16CC0;
-            vf->cpu.r[13] = 0x10FFE000;
+            /* Restore game state variables wiped by BSS clear */
+            *(uint32_t*)(vf->ram + 0xB009C4) = 1;  /* game_state = active */
+            *(uint32_t*)(vf->ram + 0xB902C0) = 3;  /* game_mode = gameplay */
+            *(uint32_t*)(vf->ram + 0xBBD3C0) = 0x10CFAEA0; /* game callback */
+            *(uint32_t*)(vf->ram + 0xB05A18) = 8;  /* service counters */
+            *(uint32_t*)(vf->ram + 0xB05A1C) = 8;
+            *(uint16_t*)(vf->ram + 0xBE49E0) = 1;  /* game_main start flag */
+            *(uint32_t*)(vf->ram + 0xB668A0) = 0x10B66900; /* render context */
+            *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;  /* render_enable */
+            /* Jump to game_main (in BOOT.BIN, survives BSS clear) */
+            vf->cpu.r[15] = 0x10CFAEA0;
+            vf->cpu.r[13] = 0x10B8D000;
             vf->cpu.r[14] = 0x10FFF000;
+            vf->cpu.cpsr = 0x000000D3;
+            if (vf->boot_phase < 900) vf->boot_phase = 900;
             static int bss_skip = 0;
             if (bss_skip++ < 3)
-                printf("[BSS-SKIP] PC=%08X was in BSS clear, jumping to game init\n", pc);
+                printf("[BSS-SKIP] PC=%08X → game_main at 10CFAEA0\n", pc);
+        }
+        /* Also: if PC landed in idle (0x10FFF00C), restart game_main */
+        if (pc == 0x10FFF00C && vf->boot_phase >= 800) {
+            memcpy(vf->ram + 0x90000, vf->rtos_backup, 0xA80000);
+            *(uint32_t*)(vf->ram + 0xB009C4) = 1;
+            *(uint32_t*)(vf->ram + 0xB902C0) = 3;
+            vf->cpu.r[15] = 0x10CFAEA0;
+            vf->cpu.r[13] = 0x10B8D000;
+            vf->cpu.r[14] = 0x10FFF000;
+            vf->cpu.cpsr = 0x000000D3;
+            if (vf->boot_phase < 900) vf->boot_phase = 900;
         }
         /* Also restore if RTOS code was zeroed */
         if (*(uint32_t*)(vf->ram + 0xA8CDE4) == 0) {
