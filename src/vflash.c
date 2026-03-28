@@ -5753,16 +5753,14 @@ void vflash_run_frame(VFlash *vf) {
         }
     }
 
-    /* Restore RTOS code if game zeroed it */
+    /* Restore RTOS code if game zeroed it — do it silently without JIT flush.
+     * The game's BSS clear zeros the RTOS area every frame via STR loops.
+     * We restore it back but DON'T flush JIT — the JIT blocks are still valid
+     * since the code content is restored to the same values. */
     if (vf->rtos_backup && vf->boot_phase >= 800) {
-        /* Check if 10A8CDE4 is still intact */
         if (*(uint32_t*)(vf->ram + 0xA8CDE4) == 0) {
             memcpy(vf->ram + 0xA00000, vf->rtos_backup, 0x110000);
-            static int restore_log = 0;
-            if (restore_log++ < 5)
-                printf("[RTOS-RESTORE] Code area restored from backup\n");
-            /* Flush JIT cache since code changed */
-            if (vf->jit) jit_flush(vf->jit);
+            /* NO jit_flush — code is restored to original values */
         }
     }
 

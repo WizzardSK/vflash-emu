@@ -345,14 +345,36 @@ static int compile_ldr_str(EmitBuf *e, uint32_t insn, uint32_t pc, VFlash *vf) {
         }
         emit_store_arm_reg(e, Rd, RDX);
     } else {
+        /* STR: protect RTOS code area (0xA00000-0xB10000) from writes */
+        emit_cmp_r32_imm32(e, RAX, 0xA00000);
+        uint32_t skip_store_pos = e->pos;
+        emit_jcc_rel32(e, CC_AE, 0); /* if offset >= 0xA00000, maybe skip */
+        /* offset < 0xA00000 → safe to write */
         emit_load_arm_reg(e, RDX, Rd);
-        if (B) {
-            /* STRB */
-            emit8(e, 0x88); emit8(e, 0x14); emit8(e, 0x06); /* mov [rsi+rax], dl */
-        } else {
-            /* STR */
-            emit8(e, 0x89); emit8(e, 0x14); emit8(e, 0x06); /* mov [rsi+rax], edx */
-        }
+        if (B)
+            { emit8(e, 0x88); emit8(e, 0x14); emit8(e, 0x06); }
+        else
+            { emit8(e, 0x89); emit8(e, 0x14); emit8(e, 0x06); }
+        uint32_t done_pos = e->pos;
+        emit_jmp_rel32(e, 0); /* jump to end */
+        /* Patch JAE to here: offset >= 0xA00000 */
+        *(int32_t*)(e->buf + skip_store_pos + 2) = (int32_t)(e->pos - skip_store_pos - 6);
+        emit_cmp_r32_imm32(e, RAX, 0xB10000);
+        uint32_t not_code_pos = e->pos;
+        emit_jcc_rel32(e, CC_AE, 0); /* if offset >= 0xB10000, safe area */
+        /* 0xA00000 <= offset < 0xB10000 → RTOS code area → SKIP write */
+        uint32_t skip_end = e->pos;
+        emit_jmp_rel32(e, 0);
+        /* Patch: offset >= 0xB10000 → safe to write */
+        *(int32_t*)(e->buf + not_code_pos + 2) = (int32_t)(e->pos - not_code_pos - 6);
+        emit_load_arm_reg(e, RDX, Rd);
+        if (B)
+            { emit8(e, 0x88); emit8(e, 0x14); emit8(e, 0x06); }
+        else
+            { emit8(e, 0x89); emit8(e, 0x14); emit8(e, 0x06); }
+        /* Patch skip_end and done to here */
+        *(int32_t*)(e->buf + skip_end + 1) = (int32_t)(e->pos - skip_end - 5);
+        *(int32_t*)(e->buf + done_pos + 1) = (int32_t)(e->pos - done_pos - 5);
     }
     /* Jump past slow path */
     uint32_t jmp_pos = e->pos;
@@ -585,9 +607,30 @@ JitBlock *jit_compile_block(JitContext *jit, uint32_t arm_pc) {
                         emit8(&e, 0x8B); emit8(&e, 0x14); emit8(&e, 0x06);
                         emit_store_arm_reg(&e, ri, RDX);
                     } else {
-                        /* STM: store register to memory */
+                        /* STM: store register to memory — protect RTOS area */
+                        emit_cmp_r32_imm32(&e, RAX, 0xA00000);
+                        uint32_t stm_skip = e.pos;
+                        emit_jcc_rel32(&e, CC_AE, 0); /* skip if in code area */
                         emit_load_arm_reg(&e, RDX, ri);
                         emit8(&e, 0x89); emit8(&e, 0x14); emit8(&e, 0x06);
+                        uint32_t stm_done = e.pos;
+                        emit_jmp_rel32(&e, 0);
+                        *(int32_t*)(e.buf + stm_skip + 2) = (int32_t)(e.pos - stm_skip - 6);
+                        /* Check upper bound */
+                        emit_cmp_r32_imm32(&e, RAX, 0xB10000);
+                        uint32_t stm_ok = e.pos;
+                        emit_jcc_rel32(&e, CC_AE, 0);
+                        /* In code area → skip write */
+                        *(int32_t*)(e.buf + stm_done + 1) = (int32_t)(e.pos - stm_done - 5);
+                        /* patch stm_ok: >=B10000 → do write */
+                        /* Actually just fall through to next reg */
+                        *(int32_t*)(e.buf + stm_ok + 2) = 0; /* jump to next instruction */
+                        /* Re-emit the store for >=B10000 case */
+                        *(int32_t*)(e.buf + stm_ok + 2) = (int32_t)(e.pos - stm_ok - 6);
+                        emit_load_arm_reg(&e, RDX, ri);
+                        emit8(&e, 0x89); emit8(&e, 0x14); emit8(&e, 0x06);
+                        /* Patch done jump */
+                        *(int32_t*)(e.buf + stm_done + 1) = (int32_t)(e.pos - stm_done - 5);
                     }
                     /* Patch JAE */
                     *(int32_t*)(e.buf + jae_pos + 2) = (int32_t)(e.pos - jae_pos - 6);
