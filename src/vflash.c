@@ -1,5 +1,6 @@
 #include "vflash.h"
 #include "arm9.h"
+#include "jit.h"
 #include "cdrom.h"
 #include "mjp.h"
 #include "audio.h"
@@ -252,6 +253,7 @@ struct VFlash {
     int      boot_phase; /* Boot flow phase tracking */
     int      render_budget; /* Instructions remaining in render pipeline (0=unlimited) */
     int      restore_vtable_pending; /* Restore vtable after render_init */
+    JitContext *jit;                 /* JIT compiler context */
     uint32_t native_alloc_lr; /* Track native alloc return address for logging */
     uint32_t flash_last_write; /* Last value written to NOR flash (for status polling) */
     /* Saved game task info from BOOT TCB scan (before service entry may overwrite) */
@@ -3230,6 +3232,9 @@ VFlash* vflash_create(const char *disc_path) {
     vf->cpu.hle_intercept  = hle_service_intercept;
     vf->cpu.hle_ctx        = vf;
 
+    /* Initialize JIT compiler */
+    vf->jit = jit_create(vf);
+
     /* Try to load boot ROM (70004.bin) — enables real boot instead of HLE */
     {
         const char *rom_paths[] = {
@@ -4028,7 +4033,14 @@ void vflash_run_frame(VFlash *vf) {
         int slice = (TOTAL - done < SLICE) ? (TOTAL - done) : SLICE;
 
         uint64_t cyc_before = vf->cpu.cycles;
-        arm9_run(&vf->cpu, slice);
+        /* Use JIT when available and game is running, interpreter otherwise */
+        if (vf->jit && vf->boot_phase >= 100 &&
+            vf->cpu.r[15] >= 0x10000000 && vf->cpu.r[15] < 0x11000000) {
+            int ran = jit_run(vf->jit, slice);
+            vf->cpu.cycles += ran;
+        } else {
+            arm9_run(&vf->cpu, slice);
+        }
         uint32_t actual = (uint32_t)(vf->cpu.cycles - cyc_before);
 
         /* Trace boot flow: log when PC enters key regions */
@@ -6496,6 +6508,8 @@ void vflash_run_frame(VFlash *vf) {
 }
 
 void     vflash_set_input(VFlash *vf, uint32_t buttons) { vf->input = buttons; }
+void    *vflash_get_cpu(VFlash *vf) { return &vf->cpu; }
+uint8_t *vflash_get_ram(VFlash *vf) { return vf->ram; }
 uint32_t* vflash_get_framebuffer(VFlash *vf) { return vf->framebuf; }
 
 /* ============================================================
