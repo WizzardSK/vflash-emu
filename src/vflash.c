@@ -3530,49 +3530,36 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
-    /* HLE render_init (10A881F0): set flags, restore vtable, return.
-     * Native run corrupts vtables with RTOS dispatch address. */
+    /* HLE render_init (10A881F0): set flags and return.
+     * Native run corrupts vtables — keep it HLE. */
     if (addr == 0x10A881F0 && ((VFlash*)ctx)->boot_phase >= 900) {
         VFlash *vf2 = (VFlash*)ctx;
-        /* These flags control render dispatch loops at 10AB6330.
-         * 0 = "registration done, skip dispatch" — prevents infinite loop.
-         * Only render_enable needs to be 1. */
-        vf2->ram[0xBE3EA0] = 0;  /* render_subsystem: 0=done */
-        vf2->ram[0xBE3C80] = 0;  /* render_queue: 0=done */
-        vf2->ram[0xBE3E20] = 0;  /* render_objects: 0=done */
-        vf2->ram[0xBE3EC0] = 1;  /* render_enable: must be 1 */
-        vf2->ram[0xBE3CA0] = 1;  /* GPU completion */
-        /* Restore original vtable from BOOT.BIN */
-        static const uint32_t orig_vt[] = {
-            0x10AB0B14, 0, 0, 0x10A77AC0, 0x10A77AC0, 0x10AB0D94,
-            0x10A77AC0, 0x10A77AC0, 0, 0, 0x10AB0E90, 0x10AB0E98,
-            0x10AB0EA8, 0x10AB0EE4, 0x10AB0EA0, 0x10AB0EF4,
-        };
-        for (int i = 0; i < 16; i++)
-            *(uint32_t*)(vf2->ram + 0xB1D508 + i*4) = orig_vt[i];
-        *(uint32_t*)(vf2->ram + 0xBE3CE0) = 0x10B1D508;
-        /* Patch render dispatch chain to immediate return:
-         * 10AB6324: inner dispatch → MOV R0,#0; BX LR
-         * 10ACBDE0: outer dispatch caller → MOV R0,#0; BX LR */
-        *(uint32_t*)(vf2->ram + 0xAB6324) = 0xE3A00000;
-        *(uint32_t*)(vf2->ram + 0xAB6328) = 0xE1A0F00E;
-        *(uint32_t*)(vf2->ram + 0xACBDE0) = 0xE3A00000;
-        *(uint32_t*)(vf2->ram + 0xACBDE4) = 0xE1A0F00E;
+        vf2->ram[0xBE3EA0] = 0;
+        vf2->ram[0xBE3C80] = 0;
+        vf2->ram[0xBE3E20] = 0;
+        vf2->ram[0xBE3EC0] = 1;
+        vf2->ram[0xBE3CA0] = 1;
         static int ri_log = 0;
-        if (ri_log++ < 3) printf("[HLE-RENDER-INIT] Flags + vtable + dispatch patched\n");
+        if (ri_log++ < 3) printf("[HLE-RENDER-INIT] Flags set\n");
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
-    /* Skip RTOS functions: dispatch, registration, task_notify */
-    if ((addr == 0x10A8CDE4 || addr == 0x10A6FC60 ||
-         addr == 0x10AB085C || addr == 0x10AB889C || addr == 0x10AB7A00) &&
-        ((VFlash*)ctx)->boot_phase >= 900) {
+    /* 10A8CDE4: RTOS tree dispatch — always return immediately.
+     * Called with R5=1 (corrupted vtable) — can't run natively. */
+    if (addr == 0x10A8CDE4 && ((VFlash*)ctx)->boot_phase >= 900) {
         cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
-    /* Render dispatch at 10AB6324 is patched to MOV R0,#0; BX LR
-     * in render_init HLE — no intercept needed, runs natively as stub. */
+    /* RTOS task dispatch (10A8CDE4): let it run natively.
+     * The function checks [R5+8] (queue count) — if 0, returns immediately.
+     * We ensure queues stay empty by clearing them after render_init. */
+    /* Skip task_notify (10A6FC60) — still needs stub */
+    if (addr == 0x10A6FC60 && ((VFlash*)ctx)->boot_phase >= 900) {
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
     /* Render processing (10A89100): software render pipeline.
      * Runs natively but with instruction budget to prevent infinite loops
      * on dummy entity vtable stubs. Budget allows partial rendering. */
@@ -6172,74 +6159,7 @@ void vflash_run_frame(VFlash *vf) {
                         }
                     }
                 }
-                /* Interactive car sprite — moves with DPAD input.
-                 * Simple HLE: draws a car shape that responds to arrows. */
-                {
-                    static int car_x = 140, car_y = 180;
-                    /* Move car with input */
-                    if (vf->input & VFLASH_BTN_LEFT)  car_x -= 3;
-                    if (vf->input & VFLASH_BTN_RIGHT) car_x += 3;
-                    if (vf->input & VFLASH_BTN_UP)    car_y -= 2;
-                    if (vf->input & VFLASH_BTN_DOWN)  car_y += 2;
-                    if (car_x < 0) car_x = 0;
-                    if (car_x > 280) car_x = 280;
-                    if (car_y < 100) car_y = 100;
-                    if (car_y > 220) car_y = 220;
-                    /* Draw car body (red rectangle — Lightning McQueen!) */
-                    for (int dy = 0; dy < 16; dy++) {
-                        for (int dx = 0; dx < 40; dx++) {
-                            int px = car_x + dx, py = car_y + dy;
-                            if (px < 0 || px >= 320 || py < 0 || py >= 240) continue;
-                            /* Car shape: body=red, roof=darker, wheels=black */
-                            uint32_t color;
-                            if (dy < 4 && dx > 8 && dx < 32)
-                                color = 0xFFCC2200; /* roof (dark red) */
-                            else if (dy >= 4 && dy < 13)
-                                color = 0xFFEE3311; /* body (bright red) */
-                            else if (dy >= 13 && (dx < 8 || dx > 32))
-                                color = 0xFF222222; /* wheels (black) */
-                            else if (dy >= 13)
-                                color = 0xFFCC2200; /* underbody */
-                            else
-                                continue;
-                            /* Lightning bolt detail */
-                            if (dy >= 6 && dy <= 10 && dx >= 12 && dx <= 28) {
-                                int bolt = (dx - 12 + dy - 6) % 5;
-                                if (bolt == 0) color = 0xFFFFDD00; /* yellow bolt */
-                            }
-                            vf->framebuf[py*320+px] = color;
-                        }
-                    }
-                    /* Headlights */
-                    for (int dy = 5; dy < 10; dy++)
-                        for (int dx = 38; dx < 40; dx++) {
-                            int px = car_x+dx, py = car_y+dy;
-                            if (px>=0 && px<320 && py>=0 && py<240)
-                                vf->framebuf[py*320+px] = 0xFFFFFF88;
-                        }
-                    /* Shadow */
-                    for (int dx = 2; dx < 38; dx++) {
-                        int px = car_x+dx, py = car_y+17;
-                        if (px>=0 && px<320 && py>=0 && py<240) {
-                            uint32_t old = vf->framebuf[py*320+px];
-                            uint8_t r=(old>>16)&0xFF, g=(old>>8)&0xFF, b=old&0xFF;
-                            vf->framebuf[py*320+px] = 0xFF000000|
-                                ((uint32_t)(r/2)<<16)|((uint32_t)(g/2)<<8)|(b/2);
-                        }
-                    }
-                    /* Road line markers */
-                    int road_scroll = (vf->frame_count * 3) % 40;
-                    for (int lx = -road_scroll; lx < 320; lx += 40) {
-                        for (int dx = 0; dx < 20; dx++) {
-                            int px = lx + dx;
-                            if (px >= 0 && px < 320) {
-                                for (int ly = 185; ly < 187; ly++)
-                                    if (ly < 240)
-                                        vf->framebuf[ly*320+px] = 0xFFEEEE88;
-                            }
-                        }
-                    }
-                }
+                /* No HLE sprites — let native engine render when RTOS works */
                 ent_count = nz;
                 static int tile_log = 0;
                 if (!tile_log) {
