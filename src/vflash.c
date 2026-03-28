@@ -5718,12 +5718,13 @@ void vflash_run_frame(VFlash *vf) {
             }
         }
         if (!entry) {
-            entry = *(uint32_t*)(vf->ram + 0xFFD0);
-            if (entry < 0x10090000 || entry >= 0x10E00000)
-                entry = *(uint32_t*)(vf->ram + 0xFFCC);
+            /* Hardcode game task entry from BOOT.BIN service setup.
+             * TCB scan fails because $QCB entry is 0 at this point.
+             * The real entry is populated by service init at 109D1BD0. */
+            entry = 0x109D1BD0;
             sbase = 0x10B6DB28;
             ssz = 0x20000;
-            printf("[AUTO-LAUNCH] No TCB, using service entry %08X\n", entry);
+            printf("[AUTO-LAUNCH] Using hardcoded game entry %08X\n", entry);
         }
         {
             printf("[AUTO-LAUNCH] Game task: entry=%08X stack=%08X+%X\n", entry, sbase, ssz);
@@ -5747,6 +5748,12 @@ void vflash_run_frame(VFlash *vf) {
                 if (vf->rtos_backup) {
                     memcpy(vf->rtos_backup, vf->ram, VFLASH_RAM_SIZE);
                     printf("[RAM-BACKUP] Saved full 16MB RAM state\n");
+                }
+                /* Flush JIT cache so all blocks get recompiled with
+                 * write protection enabled (boot_phase >= 800) */
+                if (vf->jit) {
+                    jit_flush(vf->jit);
+                    printf("[JIT] Flushed cache for write protection\n");
                 }
             }
         }
