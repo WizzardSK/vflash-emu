@@ -3482,26 +3482,18 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
-    /* HLE render_init (10A881F0): 3-step state machine that sets up render
-     * subsystems. Gets stuck in RTOS task queue tree traversal (10A6AC60).
-     * Set all ready flags and return — lets caller set render_enable=1. */
+    /* HLE render_init (10A881F0): native run still gets stuck on internal
+     * RTOS calls (task queue drain at 10A8CDE4), not just task_notify.
+     * Set ready flags and return. Display list populated in render_processing. */
     if (addr == 0x10A881F0 && ((VFlash*)ctx)->boot_phase >= 900) {
         VFlash *vf2 = (VFlash*)ctx;
-        /* Set ONLY the 3 render ready flags + render_enable.
-         * Do NOT memset the render context — 0x01010101 in data fields
-         * causes render_processing to loop on garbage item lists. */
-        vf2->ram[0xBE3EA0] = 1;  /* +0x260: render_subsystem_ready */
-        vf2->ram[0xBE3C80] = 1;  /* +0x40: render_queue_ready */
-        vf2->ram[0xBE3E20] = 1;  /* +0x1E0: render_objects_ready */
-        vf2->ram[0xBE3EC0] = 1;  /* +0x280: render_enable */
-        /* GPU completion flag */
-        vf2->ram[0xBE3CA0] = 1;  /* +0x60: gpu_completion */
+        vf2->ram[0xBE3EA0] = 1;  /* render_subsystem_ready */
+        vf2->ram[0xBE3C80] = 1;  /* render_queue_ready */
+        vf2->ram[0xBE3E20] = 1;  /* render_objects_ready */
+        vf2->ram[0xBE3EC0] = 1;  /* render_enable */
+        vf2->ram[0xBE3CA0] = 1;  /* GPU completion */
         static int ri_log = 0;
-        if (ri_log < 3) {
-            printf("[HLE-RENDER-INIT] Set all ready flags, returning\n");
-            ri_log++;
-        }
-        cpu->r[0] = cpu->r[0]; /* preserve R0 (render_ctx) */
+        if (ri_log < 3) { printf("[HLE-RENDER-INIT] Flags set\n"); ri_log++; }
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
@@ -3512,52 +3504,27 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         static int r_log = 0;
         VFlash *vf2 = (VFlash*)ctx;
         if (r_log < 3) r_log++;
-        /* Set dirty flag so render_processing attempts to draw */
-        *(uint32_t*)(vf2->ram + 0xBE3C40) = 1;      /* ctx[0] = dirty */
-        *(uint32_t*)(vf2->ram + 0xBE3C4C) = 3;      /* ctx[3] = flags */
-        /* Populate display list vector at ctx+0xE0 (sub-object at 10BE3D20).
-         * Structure: begin_ptr, max_cap, grow_hint, field_0C, element_size, end_ptr.
-         * The vector contains pointers to entity structs from HLE alloc area. */
+        /* Set dirty flag and populate display list */
+        *(uint32_t*)(vf2->ram + 0xBE3C40) = 1;
+        *(uint32_t*)(vf2->ram + 0xBE3C4C) = 3;
+        /* Build display list from HLE alloc entities */
         if (*(uint32_t*)(vf2->ram + 0xBE3D24) == 0) {
-            /* Build entity pointer array at 0x10B90000 */
-            uint32_t arr_base = 0xB90000;
-            int n_ent = 0;
-            /* Scan HLE alloc area for entities with dummy vtable */
-            for (uint32_t ea = 0x320000; ea < 0x370000; ea += 64) {
-                uint32_t vt = *(uint32_t*)(vf2->ram + ea);
-                if (vt == 0x10310800 && n_ent < 100) {
-                    *(uint32_t*)(vf2->ram + arr_base + n_ent * 4) = 0x10000000 + ea;
-                    n_ent++;
+            uint32_t arr = 0xB90000;
+            int n = 0;
+            for (uint32_t ea = 0x320000; ea < 0x390000 && n < 100; ea += 64) {
+                if (*(uint32_t*)(vf2->ram+ea) == 0x10310800) {
+                    *(uint32_t*)(vf2->ram+arr+n*4) = 0x10000000+ea;
+                    n++;
                 }
             }
-            if (n_ent > 0) {
-                /* Set up vector structure */
-                *(uint32_t*)(vf2->ram + 0xBE3D20) = 0;          /* +00: mutex */
-                *(uint32_t*)(vf2->ram + 0xBE3D24) = 0x10000000 + arr_base;  /* +04: begin */
-                *(uint32_t*)(vf2->ram + 0xBE3D28) = 100;        /* +08: max_cap */
-                *(uint32_t*)(vf2->ram + 0xBE3D2C) = 120;        /* +0C: grow */
-                *(uint32_t*)(vf2->ram + 0xBE3D30) = 0;          /* +10: unused */
-                *(uint32_t*)(vf2->ram + 0xBE3D34) = 4;          /* +14: element_size */
-                *(uint32_t*)(vf2->ram + 0xBE3D38) = 0x10000000 + arr_base + n_ent * 4; /* +18: end */
-                *(uint32_t*)(vf2->ram + 0xBE3D40) = 0;          /* +20: prev_vblank=0 */
-                /* Ready flag at [10BE4BA0] */
+            if (n > 0) {
+                *(uint32_t*)(vf2->ram+0xBE3D24) = 0x10000000+arr;
+                *(uint32_t*)(vf2->ram+0xBE3D28) = 100;
+                *(uint32_t*)(vf2->ram+0xBE3D2C) = 120;
+                *(uint32_t*)(vf2->ram+0xBE3D34) = 4;
+                *(uint32_t*)(vf2->ram+0xBE3D38) = 0x10000000+arr+n*4;
+                *(uint32_t*)(vf2->ram+0xBE3D40) = 0;
                 vf2->ram[0xBE4BA0] = 1;
-                static int dl_log = 0;
-                if (!dl_log) {
-                    printf("[DISPLAY-LIST] Populated vector with %d entities at %08X\n",
-                           n_ent, 0x10000000 + arr_base);
-                    printf("[DISPLAY-LIST] First 5: %08X %08X %08X %08X %08X\n",
-                        *(uint32_t*)(vf2->ram + arr_base),
-                        *(uint32_t*)(vf2->ram + arr_base + 4),
-                        *(uint32_t*)(vf2->ram + arr_base + 8),
-                        *(uint32_t*)(vf2->ram + arr_base + 12),
-                        *(uint32_t*)(vf2->ram + arr_base + 16));
-                    printf("[DISPLAY-LIST] begin=%08X end=%08X esz=%d\n",
-                        *(uint32_t*)(vf2->ram + 0xBE3D24),
-                        *(uint32_t*)(vf2->ram + 0xBE3D38),
-                        *(uint32_t*)(vf2->ram + 0xBE3D34));
-                    dl_log = 1;
-                }
             }
         }
         vf2->render_budget = 200000;
