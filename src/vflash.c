@@ -3551,32 +3551,28 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         for (int i = 0; i < 16; i++)
             *(uint32_t*)(vf2->ram + 0xB1D508 + i*4) = orig_vt[i];
         *(uint32_t*)(vf2->ram + 0xBE3CE0) = 0x10B1D508;
-        /* Patch render dispatch loops to always skip:
-         * 10AB6340: BEQ 10AB6358 → B 10AB6358 (always branch)
-         * This prevents the render dispatch from retrying registration. */
-        *(uint32_t*)(vf2->ram + 0xAB6340) = 0xEA000004; /* B +0x18 → always skip */
-        /* Also patch caller at 10ACBE00: BEQ → B (always exit dispatch) */
-        *(uint32_t*)(vf2->ram + 0xACBE00) = 0xEA000004; /* B 10ACBE18 always */
+        /* Patch render dispatch chain to immediate return:
+         * 10AB6324: inner dispatch → MOV R0,#0; BX LR
+         * 10ACBDE0: outer dispatch caller → MOV R0,#0; BX LR */
+        *(uint32_t*)(vf2->ram + 0xAB6324) = 0xE3A00000;
+        *(uint32_t*)(vf2->ram + 0xAB6328) = 0xE1A0F00E;
+        *(uint32_t*)(vf2->ram + 0xACBDE0) = 0xE3A00000;
+        *(uint32_t*)(vf2->ram + 0xACBDE4) = 0xE1A0F00E;
         static int ri_log = 0;
         if (ri_log++ < 3) printf("[HLE-RENDER-INIT] Flags + vtable + dispatch patched\n");
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
-    /* Skip RTOS functions: dispatch, registration, task_notify, context loop.
-     * Also force render dispatch flags to 0 to prevent retry loops. */
+    /* Skip RTOS functions: dispatch, registration, task_notify */
     if ((addr == 0x10A8CDE4 || addr == 0x10A6FC60 ||
-         addr == 0x10AB085C || addr == 0x10AB889C || addr == 0x10AB7A00 ||
-         addr == 0x10AB6324 /* render context dispatch loop */) &&
+         addr == 0x10AB085C || addr == 0x10AB889C || addr == 0x10AB7A00) &&
         ((VFlash*)ctx)->boot_phase >= 900) {
-        VFlash *vf2 = (VFlash*)ctx;
-        /* Force dispatch flags to 0 to break ALL retry loops */
-        *(uint16_t*)(vf2->ram + 0xBE3EA0) = 0;
-        *(uint16_t*)(vf2->ram + 0xBE3C80) = 0;
-        *(uint16_t*)(vf2->ram + 0xBE3E20) = 0;
         cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
+    /* Render dispatch at 10AB6324 is patched to MOV R0,#0; BX LR
+     * in render_init HLE — no intercept needed, runs natively as stub. */
     /* Render processing (10A89100): software render pipeline.
      * Runs natively but with instruction budget to prevent infinite loops
      * on dummy entity vtable stubs. Budget allows partial rendering. */
@@ -3607,7 +3603,7 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
                 vf2->ram[0xBE4BA0] = 1;
             }
         }
-        vf2->render_budget = 5000000; /* 5M budget — trace where it goes */
+        vf2->render_budget = 200000; /* 200K — just enough for one render pass */
         return 0;
     }
     /* (budget check moved to top of function) */
