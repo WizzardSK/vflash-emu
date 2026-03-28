@@ -5841,24 +5841,65 @@ void vflash_run_frame(VFlash *vf) {
                         0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
                 }
             }
-            /* Draw entity markers ON TOP of PTX */
+            /* Dump entity data to understand structure */
+            static int ent_dump = 0;
             int ent_markers = 0;
             for (uint32_t ea = 0x320000; ea < 0x370000; ea += 64) {
                 uint32_t vt = *(uint32_t*)(vf->ram + ea);
-                if (vt != 0x10310800) continue; /* not an entity */
+                if (vt != 0x10310800) continue;
                 int idx = (ea - 0x320000) / 64;
-                int ex = (idx * 37) % 300 + 10;
-                int ey = (idx * 23) % 220 + 10;
+                /* Dump first 5 entities to find position fields */
+                if (!ent_dump && idx < 5) {
+                    printf("[ENTITY-%d] @%08X:", idx, 0x10000000+ea);
+                    for (int w = 0; w < 16; w++)
+                        printf(" %08X", *(uint32_t*)(vf->ram + ea + w*4));
+                    printf("\n");
+                }
+                /* Look for plausible X,Y values in entity data.
+                 * Screen is 320x240. Check fields for small positive integers
+                 * or fixed-point values (e.g., 16.16 format where >>16 gives pixel pos) */
+                int32_t *ent = (int32_t*)(vf->ram + ea);
+                /* Try offset +0x10,+0x14 as X,Y (common in game engines) */
+                int ex = ent[4] >> 16;  /* +0x10: X as 16.16 fixed */
+                int ey = ent[5] >> 16;  /* +0x14: Y as 16.16 fixed */
+                /* Fallback: try raw values if fixed-point gives nonsense */
+                if (ex < 0 || ex >= 320 || ey < 0 || ey >= 240) {
+                    ex = ent[4] & 0xFFFF; /* try lower 16 bits */
+                    ey = ent[5] & 0xFFFF;
+                }
+                if (ex < 0 || ex >= 320 || ey < 0 || ey >= 240) {
+                    /* Use hash position as fallback */
+                    ex = (idx * 37) % 300 + 10;
+                    ey = (idx * 23) % 220 + 10;
+                }
                 uint32_t color = 0xFFFF0000 | ((idx*17)&0xFF)<<8 | (idx*7&0xFF);
                 for (int dy = 0; dy < 8 && ey+dy < 240; dy++)
                     for (int dx = 0; dx < 8 && ex+dx < 320; dx++)
                         vf->framebuf[(ey+dy)*320 + (ex+dx)] = color;
                 ent_markers++;
             }
+            ent_dump = 1;
             vf->vid.fb_dirty = 1;
             static int ptx_log = 0;
             if (!ptx_log) {
-                printf("[GAME-DISPLAY] PTX + %d entity markers\n", ent_markers);
+                printf("[GAME-DISPLAY] PTX + %d entity markers on screen\n", ent_markers);
+                /* Save screenshot */
+                FILE *sf = fopen("/tmp/vflash_game.bmp", "wb");
+                if (sf) {
+                    int w=320,h=240,rs=w*3,pad=(4-rs%4)%4,isz=(rs+pad)*h;
+                    uint8_t hd[54]={0}; hd[0]='B';hd[1]='M';
+                    *(uint32_t*)(hd+2)=54+isz; *(uint32_t*)(hd+10)=54;
+                    *(uint32_t*)(hd+14)=40; *(int32_t*)(hd+18)=w;
+                    *(int32_t*)(hd+22)=-h; *(uint16_t*)(hd+26)=1;
+                    *(uint16_t*)(hd+28)=24; *(uint32_t*)(hd+34)=isz;
+                    fwrite(hd,1,54,sf);
+                    for(int y2=0;y2<h;y2++){for(int x2=0;x2<w;x2++){
+                        uint32_t px=vf->framebuf[y2*w+x2];
+                        uint8_t rgb[3]={px&0xFF,(px>>8)&0xFF,(px>>16)&0xFF};
+                        fwrite(rgb,1,3,sf);}
+                        uint8_t z[4]={0};if(pad)fwrite(z,1,pad,sf);}
+                    fclose(sf);
+                }
                 ptx_log = 1;
             }
         }
