@@ -3647,7 +3647,7 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     }
 
     /* HLE render_init (10A881F0): set flags and return.
-     * Native run corrupts vtables — keep it HLE. */
+     * Native run triggers game BSS clear that zeros ALL code. */
     if (addr == 0x10A881F0 && ((VFlash*)ctx)->boot_phase >= 900) {
         VFlash *vf2 = (VFlash*)ctx;
         vf2->ram[0xBE3EA0] = 0;
@@ -3660,8 +3660,7 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
-    /* 10A8CDE4: RTOS tree dispatch — always return immediately.
-     * Called with R5=1 (corrupted vtable) — can't run natively. */
+    /* 10A8CDE4: RTOS tree dispatch — skip (no valid queue state) */
     if (addr == 0x10A8CDE4 && ((VFlash*)ctx)->boot_phase >= 900) {
         cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
