@@ -3590,7 +3590,7 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
                 vf2->ram[0xBE4BA0] = 1;
             }
         }
-        vf2->render_budget = 200000; /* 200K — just enough for one render pass */
+        vf2->render_budget = 2000000; /* 2M per frame for native render */
         return 0;
     }
     /* (budget check moved to top of function) */
