@@ -5677,23 +5677,26 @@ void vflash_run_frame(VFlash *vf) {
         vf->timer.timer[0].ctrl = 0;
         vf->timer.irq.enable = 0;
         vf->timer.irq.status = 0;
-        /* Copy render function from BOOT.BIN location to relocation target.
-         * BOOT.BIN code at 10D615FC (render_frame) was never copied to 10B265E8.
-         * The game loop at 109D1CC0 does BL 10B265E8 (PC-relative), expecting
-         * code there. Copy 192 bytes (code + literal pool) from BOOT.BIN area. */
+        /* Copy 73 unrelocated functions from BOOT.BIN area to relocation targets.
+         * BOOT.BIN bootstrap copies game code from 10C0xxxx to 109Dxxxx but never
+         * relocates the 10B0xxxx-10B2xxxx range. BL targets in this range hit data
+         * instead of code. Copy the entire block (~100KB) from BOOT.BIN locations. */
         {
-            uint32_t src = 0xD615FC;  /* 10D615FC in RAM (BOOT.BIN area) */
-            uint32_t dst = 0xB265E8;  /* 10B265E8 in RAM (relocation target) */
-            uint32_t sz  = 192;       /* function + literal pool */
+            uint32_t src = 0xD48B20;  /* 10D48B20: first unrelocated function */
+            uint32_t dst = 0xB0DB0C;  /* 10B0DB0C: relocation target */
+            uint32_t sz  = 0x18DE0;   /* 101,856 bytes covering all 73 functions */
             if (src + sz <= VFLASH_RAM_SIZE && dst + sz <= VFLASH_RAM_SIZE) {
-                uint32_t first_src = *(uint32_t*)(vf->ram + src);
-                if (first_src == 0xE92D40F0) {  /* verify PUSH {R4-R7,LR} */
+                /* Verify source has ARM code (first function should start with PUSH) */
+                uint32_t first = *(uint32_t*)(vf->ram + src);
+                if ((first & 0xFFFF0000) == 0xE92D0000 || /* PUSH */
+                    (first & 0xFFFFF000) == 0xE24DD000 || /* SUB SP */
+                    (first & 0xFFFF0000) == 0xE52D0000) { /* STR ..,[SP] */
                     memcpy(vf->ram + dst, vf->ram + src, sz);
-                    printf("[RENDER-FIX] Copied render function: %08X→%08X (%d bytes)\n",
-                           0x10000000+src, 0x10000000+dst, sz);
+                    printf("[RELOC-FIX] Copied %d bytes: %08X→%08X (73 functions)\n",
+                           sz, 0x10000000+src, 0x10000000+dst);
                 } else {
-                    printf("[RENDER-FIX] Source at %08X has %08X (expected E92D40F0)\n",
-                           0x10000000+src, first_src);
+                    printf("[RELOC-FIX] Source %08X has %08X (not a function prologue)\n",
+                           0x10000000+src, first);
                 }
             }
         }
