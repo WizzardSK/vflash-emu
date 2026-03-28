@@ -5640,8 +5640,24 @@ void vflash_run_frame(VFlash *vf) {
                     if (pc == 0x10FFF000 || (pc > 0x11000000 && pc < 0x80000000)) break;
                 }
                 printf("[VFF-SCENE] Entity callback: %d steps\n", si);
+                /* Log entity data BEFORE vtable restore to find real vtable ptrs */
+                printf("[VFF-SCENE] Entity data before restore:\n");
+                int real_vt = 0;
+                for (uint32_t ea = 0x320000; ea < 0x370000; ea += 64) {
+                    uint32_t v = *(uint32_t*)(vf->ram + ea);
+                    if (v != 0 && v != 0x10310800 && real_vt < 10) {
+                        printf("  [%08X]+0 = %08X", 0x10000000+ea, v);
+                        /* Check if it's a plausible vtable pointer (in code range) */
+                        if (v >= 0x10A00000 && v < 0x10E00000)
+                            printf(" ← VTABLE in code range!");
+                        else if (v == 0xBDBDBDBD)
+                            printf(" ← debug fill");
+                        printf("\n");
+                        real_vt++;
+                    }
+                }
                 /* Re-set dummy vtable on ALL allocated entities.
-                 * Scene callback overwrites [entity+0] with data (0xBDBDBDBD).
+                 * Scene callback overwrites [entity+0] with data.
                  * Restore vtable pointer so virtual method calls go to stubs. */
                 for (uint32_t ea = 0x320000; ea < 0x380000; ea += 0x10) {
                     uint32_t v = *(uint32_t*)(vf->ram + ea);
@@ -5841,48 +5857,32 @@ void vflash_run_frame(VFlash *vf) {
                         0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
                 }
             }
-            /* Dump entity data to understand structure */
-            static int ent_dump = 0;
-            int ent_markers = 0;
-            for (uint32_t ea = 0x320000; ea < 0x370000; ea += 64) {
-                uint32_t vt = *(uint32_t*)(vf->ram + ea);
-                if (vt != 0x10310800) continue;
-                int idx = (ea - 0x320000) / 64;
-                /* Dump first 5 entities to find position fields */
-                if (!ent_dump && idx < 5) {
-                    printf("[ENTITY-%d] @%08X:", idx, 0x10000000+ea);
-                    for (int w = 0; w < 16; w++)
-                        printf(" %08X", *(uint32_t*)(vf->ram + ea + w*4));
-                    printf("\n");
+            /* Render VFF sec[1] tile graphics directly from loaded area.
+             * VFF sec[1] was loaded from disc to RAM during init.
+             * Find it via VFF scene descriptor at [10500808]. */
+            int ent_count = 0;
+            /* VFF sec[1] loaded at 10501800 (1772KB) from disc */
+            uint32_t vff_gfx = 0x501800;
+            uint32_t vff_gfx_sz = 1772 * 1024;
+            /* Render VFF sec[1] as 8bpp grayscale at 256px stride */
+            if (vff_gfx && vff_gfx_sz > 0) {
+                memset(vf->framebuf, 0, 320*240*4);
+                uint8_t *gfx = vf->ram + vff_gfx;
+                int stride = 256; /* try 256px stride */
+                for (int y = 0; y < 240; y++) {
+                    for (int x = 0; x < 320 && (y*stride+x) < (int)vff_gfx_sz; x++) {
+                        uint8_t v = gfx[y * stride + x];
+                        vf->framebuf[y*320+x] = 0xFF000000|(v<<16)|(v<<8)|v;
+                    }
                 }
-                /* Look for plausible X,Y values in entity data.
-                 * Screen is 320x240. Check fields for small positive integers
-                 * or fixed-point values (e.g., 16.16 format where >>16 gives pixel pos) */
-                int32_t *ent = (int32_t*)(vf->ram + ea);
-                /* Try offset +0x10,+0x14 as X,Y (common in game engines) */
-                int ex = ent[4] >> 16;  /* +0x10: X as 16.16 fixed */
-                int ey = ent[5] >> 16;  /* +0x14: Y as 16.16 fixed */
-                /* Fallback: try raw values if fixed-point gives nonsense */
-                if (ex < 0 || ex >= 320 || ey < 0 || ey >= 240) {
-                    ex = ent[4] & 0xFFFF; /* try lower 16 bits */
-                    ey = ent[5] & 0xFFFF;
-                }
-                if (ex < 0 || ex >= 320 || ey < 0 || ey >= 240) {
-                    /* Use hash position as fallback */
-                    ex = (idx * 37) % 300 + 10;
-                    ey = (idx * 23) % 220 + 10;
-                }
-                uint32_t color = 0xFFFF0000 | ((idx*17)&0xFF)<<8 | (idx*7&0xFF);
-                for (int dy = 0; dy < 8 && ey+dy < 240; dy++)
-                    for (int dx = 0; dx < 8 && ex+dx < 320; dx++)
-                        vf->framebuf[(ey+dy)*320 + (ex+dx)] = color;
-                ent_markers++;
+                ent_count = vff_gfx_sz / 64;
+            } else {
+                ent_count = 0;
             }
-            ent_dump = 1;
             vf->vid.fb_dirty = 1;
             static int ptx_log = 0;
             if (!ptx_log) {
-                printf("[GAME-DISPLAY] PTX + %d entity markers on screen\n", ent_markers);
+                printf("[GAME-DISPLAY] PTX + %d entity tiles on screen\n", ent_count);
                 /* Save screenshot */
                 FILE *sf = fopen("/tmp/vflash_game.bmp", "wb");
                 if (sf) {
