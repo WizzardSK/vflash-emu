@@ -3514,11 +3514,52 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         /* Set dirty flag so render_processing attempts to draw */
         *(uint32_t*)(vf2->ram + 0xBE3C40) = 1;      /* ctx[0] = dirty */
         *(uint32_t*)(vf2->ram + 0xBE3C4C) = 3;      /* ctx[3] = flags */
-        /* TODO: Display list at ctx+0xE4 needs proper structure from render_init.
-         * Entity list head at [10B92BE0] also needs initialization.
-         * VBlank toggle (0x900A0018 bit25) now works — render enters draw path
-         * but display list is empty so no entity draw calls happen yet. */
-        vf2->render_budget = 50000;
+        /* Populate display list vector at ctx+0xE0 (sub-object at 10BE3D20).
+         * Structure: begin_ptr, max_cap, grow_hint, field_0C, element_size, end_ptr.
+         * The vector contains pointers to entity structs from HLE alloc area. */
+        if (*(uint32_t*)(vf2->ram + 0xBE3D24) == 0) {
+            /* Build entity pointer array at 0x10B90000 */
+            uint32_t arr_base = 0xB90000;
+            int n_ent = 0;
+            /* Scan HLE alloc area for entities with dummy vtable */
+            for (uint32_t ea = 0x320000; ea < 0x370000; ea += 64) {
+                uint32_t vt = *(uint32_t*)(vf2->ram + ea);
+                if (vt == 0x10310800 && n_ent < 100) {
+                    *(uint32_t*)(vf2->ram + arr_base + n_ent * 4) = 0x10000000 + ea;
+                    n_ent++;
+                }
+            }
+            if (n_ent > 0) {
+                /* Set up vector structure */
+                *(uint32_t*)(vf2->ram + 0xBE3D20) = 0;          /* +00: mutex */
+                *(uint32_t*)(vf2->ram + 0xBE3D24) = 0x10000000 + arr_base;  /* +04: begin */
+                *(uint32_t*)(vf2->ram + 0xBE3D28) = 100;        /* +08: max_cap */
+                *(uint32_t*)(vf2->ram + 0xBE3D2C) = 120;        /* +0C: grow */
+                *(uint32_t*)(vf2->ram + 0xBE3D30) = 0;          /* +10: unused */
+                *(uint32_t*)(vf2->ram + 0xBE3D34) = 4;          /* +14: element_size */
+                *(uint32_t*)(vf2->ram + 0xBE3D38) = 0x10000000 + arr_base + n_ent * 4; /* +18: end */
+                *(uint32_t*)(vf2->ram + 0xBE3D40) = 0;          /* +20: prev_vblank=0 */
+                /* Ready flag at [10BE4BA0] */
+                vf2->ram[0xBE4BA0] = 1;
+                static int dl_log = 0;
+                if (!dl_log) {
+                    printf("[DISPLAY-LIST] Populated vector with %d entities at %08X\n",
+                           n_ent, 0x10000000 + arr_base);
+                    printf("[DISPLAY-LIST] First 5: %08X %08X %08X %08X %08X\n",
+                        *(uint32_t*)(vf2->ram + arr_base),
+                        *(uint32_t*)(vf2->ram + arr_base + 4),
+                        *(uint32_t*)(vf2->ram + arr_base + 8),
+                        *(uint32_t*)(vf2->ram + arr_base + 12),
+                        *(uint32_t*)(vf2->ram + arr_base + 16));
+                    printf("[DISPLAY-LIST] begin=%08X end=%08X esz=%d\n",
+                        *(uint32_t*)(vf2->ram + 0xBE3D24),
+                        *(uint32_t*)(vf2->ram + 0xBE3D38),
+                        *(uint32_t*)(vf2->ram + 0xBE3D34));
+                    dl_log = 1;
+                }
+            }
+        }
+        vf2->render_budget = 200000;
         return 0;
     }
     /* (budget check moved to top of function) */
@@ -3573,9 +3614,9 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         static int total_stubs = 0;
         stub_count[slot]++;
         total_stubs++;
-        if (stub_count[slot] <= 2) {
-            printf("[VSTUB] slot[%d] R0=%08X R1=%08X LR=%08X (total=%d)\n",
-                   slot, cpu->r[0], cpu->r[1], cpu->r[14], total_stubs);
+        if (total_stubs <= 5 || (total_stubs % 1000 == 0)) {
+            printf("[VSTUB] slot[%d] R0=%08X LR=%08X (total=%d)\n",
+                   slot, cpu->r[0], cpu->r[14], total_stubs);
         }
         return 0; /* let stub execute */
     }
