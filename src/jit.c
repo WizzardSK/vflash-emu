@@ -60,6 +60,7 @@ JitContext *jit_create(VFlash *vf) {
 
     printf("[JIT] Created: %dMB code cache, %d block slots\n",
            JIT_CACHE_SIZE / (1024*1024), JIT_MAX_BLOCKS);
+    /* Stats logged periodically from jit_run */
     return jit;
 }
 
@@ -383,16 +384,89 @@ JitBlock *jit_compile_block(JitContext *jit, uint32_t arm_pc) {
         uint32_t arm_insn = *(uint32_t*)(ram + (cur_pc - 0x10000000));
         int cond = (arm_insn >> 28) & 0xF;
 
-        /* Only handle unconditional (AL) for now */
-        if (cond != 0xE && cond != 0xF) {
-            compiled_all = 0;
+        /* Check if this modifies PC (end of block) */
+        if (arm_modifies_pc(arm_insn)) {
+            /* For B/BL we can still compile the branch */
+            if ((arm_insn & 0x0E000000) == 0x0A000000 && cond == 0xE) {
+                /* Unconditional B/BL — set next PC and end block */
+                int L = (arm_insn >> 24) & 1;
+                int32_t imm24 = arm_insn & 0x00FFFFFF;
+                if (imm24 & 0x800000) imm24 -= 0x1000000;
+                uint32_t target = cur_pc + 8 + imm24 * 4;
+                if (L) {
+                    /* BL: store return address in LR */
+                    emit_mov_r32_imm32(&e, RAX, cur_pc + 4);
+                    emit_store_arm_reg(&e, 14, RAX);
+                }
+                insn_count++;
+                cur_pc = target; /* block exits to branch target */
+            }
             break;
         }
 
-        /* Check if this modifies PC (end of block) */
-        if (arm_modifies_pc(arm_insn)) {
-            compiled_all = 0;
-            break;
+        /* Emit conditional execution wrapper.
+         * Load CPSR, test condition, skip instruction if not met. */
+        uint32_t skip_pos = 0;
+        int has_cond = (cond != 0xE && cond != 0xF);
+        if (has_cond) {
+            /* Load CPSR flags into EAX */
+            emit_ldr_disp32(&e, RAX, REG_CPU, ARM_CPSR);
+            /* Map ARM condition to a test:
+             * N=bit31, Z=bit30, C=bit29, V=bit28 */
+            uint8_t x86_cc = CC_E; /* default: skip if not met */
+            switch (cond) {
+                case 0x0: /* EQ: Z==1 */
+                    emit_test_r32_r32(&e, RAX, RAX);
+                    emit_and_r32_imm32(&e, RAX, 0x40000000);
+                    x86_cc = CC_E; /* skip if Z bit clear */
+                    break;
+                case 0x1: /* NE: Z==0 */
+                    emit_and_r32_imm32(&e, RAX, 0x40000000);
+                    x86_cc = CC_NE; /* skip if Z bit set */
+                    break;
+                case 0x2: /* CS/HS: C==1 */
+                    emit_and_r32_imm32(&e, RAX, 0x20000000);
+                    x86_cc = CC_E;
+                    break;
+                case 0x3: /* CC/LO: C==0 */
+                    emit_and_r32_imm32(&e, RAX, 0x20000000);
+                    x86_cc = CC_NE;
+                    break;
+                case 0x4: /* MI: N==1 */
+                    emit_and_r32_imm32(&e, RAX, 0x80000000);
+                    x86_cc = CC_E;
+                    break;
+                case 0x5: /* PL: N==0 */
+                    emit_and_r32_imm32(&e, RAX, 0x80000000);
+                    x86_cc = CC_NE;
+                    break;
+                case 0xA: /* GE: N==V */
+                    emit_mov_r32_r32(&e, RCX, RAX);
+                    emit_shr_r32_imm(&e, RAX, 3); /* N(bit31)→bit28 */
+                    emit_xor_r32_r32(&e, RAX, RCX); /* N^V */
+                    emit_and_r32_imm32(&e, RAX, 0x10000000);
+                    x86_cc = CC_NE; /* skip if N!=V */
+                    break;
+                case 0xB: /* LT: N!=V */
+                    emit_mov_r32_r32(&e, RCX, RAX);
+                    emit_shr_r32_imm(&e, RAX, 3);
+                    emit_xor_r32_r32(&e, RAX, RCX);
+                    emit_and_r32_imm32(&e, RAX, 0x10000000);
+                    x86_cc = CC_E; /* skip if N==V */
+                    break;
+                case 0xC: /* GT: Z==0 && N==V */
+                case 0xD: /* LE: Z==1 || N!=V */
+                default:
+                    /* Complex condition — end block, fall to interpreter */
+                    break;
+            }
+            if (cond >= 0xC && cond != 0xE) {
+                compiled_all = 0;
+                break; /* too complex */
+            }
+            /* Emit conditional jump to skip this instruction */
+            skip_pos = e.pos;
+            emit_jcc_rel32(&e, x86_cc, 0); /* placeholder — patch after */
         }
 
         /* Try to compile this instruction */
@@ -400,17 +474,102 @@ JitBlock *jit_compile_block(JitContext *jit, uint32_t arm_pc) {
         uint32_t op = (arm_insn >> 25) & 7;
 
         if (op == 0 || op == 1) {
-            /* Data processing */
-            ok = compile_data_processing(&e, arm_insn, cur_pc);
+            /* Check for MUL/MLA (op=0, bits[7:4]=1001) */
+            if (op == 0 && (arm_insn & 0x0FC000F0) == 0x00000090) {
+                /* MUL: Rd = Rm * Rs */
+                int Rd = (arm_insn >> 16) & 0xF;
+                int Rm = arm_insn & 0xF;
+                int Rs = (arm_insn >> 8) & 0xF;
+                if (Rd < 15 && Rm < 15 && Rs < 15) {
+                    emit_load_arm_reg(&e, RAX, Rm);
+                    emit_load_arm_reg(&e, RCX, Rs);
+                    emit_imul_r32_r32(&e, RAX, RCX);
+                    if (arm_insn & (1<<21)) { /* MLA: += Rn */
+                        int Rn = (arm_insn >> 12) & 0xF;
+                        emit_load_arm_reg(&e, RCX, Rn);
+                        emit_add_r32_r32(&e, RAX, RCX);
+                    }
+                    emit_store_arm_reg(&e, Rd, RAX);
+                    ok = 1;
+                }
+            } else {
+                ok = compile_data_processing(&e, arm_insn, cur_pc);
+            }
         } else if (op == 2 || op == 3) {
-            /* LDR/STR */
-            if (!((arm_insn >> 25) & 1)) /* immediate offset only */
+            if (!((arm_insn >> 25) & 1))
                 ok = compile_ldr_str(&e, arm_insn, cur_pc, vf);
+        } else if (op == 4) {
+            /* LDM/STM — compile PUSH/POP for common cases */
+            int P = (arm_insn >> 24) & 1;
+            int U = (arm_insn >> 23) & 1;
+            int S = (arm_insn >> 22) & 1;
+            int W = (arm_insn >> 21) & 1;
+            int L = (arm_insn >> 20) & 1;
+            int Rn = (arm_insn >> 16) & 0xF;
+            uint16_t rlist = arm_insn & 0xFFFF;
+            if (S || Rn == 15 || (rlist & (1<<15))) {
+                ok = 0; /* complex: S bit, PC in list — fallback */
+            } else {
+                int reg_count = __builtin_popcount(rlist);
+                /* Load base address into EDI */
+                emit_load_arm_reg(&e, RDI, Rn);
+                /* For STMDB (PUSH): pre-decrement */
+                if (!U && P) emit_sub_r32_imm32(&e, RDI, reg_count * 4);
+                /* For LDMIA (POP): address starts at Rn */
+                int offset = 0;
+                if (U && !P) offset = 0; /* IA: start at Rn */
+                else if (U && P) offset = 4; /* IB: start at Rn+4 */
+                else if (!U && !P) offset = -(reg_count-1)*4; /* DA */
+                /* Process each register */
+                emit_mov_r64_imm64(&e, RSI, (uint64_t)(uintptr_t)vflash_get_ram(vf));
+                int cur_off = offset;
+                for (int ri = 0; ri < 15; ri++) {
+                    if (!(rlist & (1 << ri))) continue;
+                    /* addr = RDI + cur_off, inline RAM fast path */
+                    emit_mov_r32_r32(&e, RAX, RDI);
+                    if (cur_off) emit_add_r32_imm32(&e, RAX, cur_off);
+                    emit_sub_r32_imm32(&e, RAX, 0x10000000);
+                    /* Bounds check — skip if outside RAM */
+                    emit_cmp_r32_imm32(&e, RAX, 0x01000000);
+                    uint32_t jae_pos = e.pos;
+                    emit_jcc_rel32(&e, CC_AE, 0);
+                    /* Zero-extend RAX for 64-bit addressing */
+                    emit8(&e, 0x48); emit8(&e, 0x63); emit8(&e, modrm(3, RAX, RAX));
+                    if (L) {
+                        /* LDM: load from memory to register */
+                        emit8(&e, 0x8B); emit8(&e, 0x14); emit8(&e, 0x06);
+                        emit_store_arm_reg(&e, ri, RDX);
+                    } else {
+                        /* STM: store register to memory */
+                        emit_load_arm_reg(&e, RDX, ri);
+                        emit8(&e, 0x89); emit8(&e, 0x14); emit8(&e, 0x06);
+                    }
+                    /* Patch JAE */
+                    *(int32_t*)(e.buf + jae_pos + 2) = (int32_t)(e.pos - jae_pos - 6);
+                    cur_off += 4;
+                }
+                /* Writeback */
+                if (W) {
+                    if (U) emit_add_r32_imm32(&e, RDI, reg_count * 4);
+                    else   emit_sub_r32_imm32(&e, RDI, reg_count * 4);
+                    emit_store_arm_reg(&e, Rn, RDI);
+                }
+                ok = 1;
+            }
         }
 
         if (!ok) {
+            if (has_cond) {
+                /* Undo the conditional jump we emitted */
+                e.pos = skip_pos;
+            }
             compiled_all = 0;
-            break; /* can't compile — end block here */
+            break;
+        }
+
+        /* Patch the conditional skip jump to here */
+        if (has_cond && skip_pos) {
+            *(int32_t*)(e.buf + skip_pos + 2) = (int32_t)(e.pos - skip_pos - 6);
         }
 
         insn_count++;
@@ -487,6 +646,14 @@ int jit_run(JitContext *jit, int cycles) {
             arm9_step(cpu);
             executed++;
         }
+    }
+    /* Periodic stats */
+    static uint64_t last_log = 0;
+    if (jit->blocks_executed - last_log > 10000) {
+        printf("[JIT] blocks=%lu exec=%lu insns=%lu cache=%uKB/%uKB\n",
+               jit->blocks_compiled, jit->blocks_executed,
+               jit->insns_executed, jit->cache_used/1024, jit->cache_size/1024);
+        last_log = jit->blocks_executed;
     }
     return executed;
 }
