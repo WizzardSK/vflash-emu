@@ -6337,6 +6337,30 @@ void vflash_run_frame(VFlash *vf) {
                 *(uint32_t*)(vf->ram+0xBE3CB8) = 0x10FFE2F4; /* end */
                 printf("[HLE-ENTITY] Test draw entity installed\n");
             }
+            /* Early PTX palette extraction for render FB blit */
+            if (!vf->ptx_has_pal && vf->ptx_count > 0 && vf->cd) {
+                CDEntry *pe = &vf->ptx_list[0];
+                uint8_t hdr[16];
+                cdrom_read_file(vf->cd, pe, hdr, 0, 16);
+                uint32_t bpp = *(uint32_t*)(hdr + 0x0C);
+                if (bpp == 8) {
+                    uint32_t pw = *(uint16_t*)(hdr + 0x08);
+                    uint32_t ph = *(uint16_t*)(hdr + 0x0A);
+                    vf->ptx_stride = pw;
+                    uint32_t pal_off = *(uint32_t*)hdr + pw * ph;
+                    uint8_t pal_buf[512];
+                    if (cdrom_read_file(vf->cd, pe, pal_buf, pal_off, 512) == 512) {
+                        for (int i = 0; i < 256; i++) {
+                            uint16_t p = *(uint16_t*)(pal_buf + i*2);
+                            uint8_t r5=p&0x1F,g5=(p>>5)&0x1F,b5=(p>>10)&0x1F;
+                            vf->ptx_pal[i]=0xFF000000|((r5<<3|r5>>2)<<16)|
+                                ((g5<<3|g5>>2)<<8)|(b5<<3|b5>>2);
+                        }
+                        vf->ptx_has_pal = 1;
+                        printf("[PTX-PAL] Early palette extracted (%dx%d)\n", pw, ph);
+                    }
+                }
+            }
             /* Set framebuffer bank addresses in DC registers 0x140-0x14C.
              * Ghidra: fb_resolver reads [0xB8000140 + bank*4] to get FB address.
              * Game video init normally writes these via switch function. */
