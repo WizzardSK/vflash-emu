@@ -6592,6 +6592,9 @@ void vflash_run_frame(VFlash *vf) {
              * 10BE49E0: another render struct polled in loops.
              * Set all bytes in render_ctx to non-zero "ready" state. */
             memset(vf->ram + 0xBE3C40, 0, 0x100);
+            /* Set frame-ready flag so render_processing enters draw path.
+             * [+0x00]=0 (no error), [+0x04]=1 (frame ready) */
+            *(uint32_t*)(vf->ram + 0xBE3C44) = 1;
             /* Also clear the second render struct area */
             memset(vf->ram + 0xBE49E0, 0, 0x100);
             /* Restore specific ctx values (memset fills all with 0x01010101).
