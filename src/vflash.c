@@ -6280,8 +6280,8 @@ void vflash_run_frame(VFlash *vf) {
             /* Initialize render device struct at 0x10BBD500 (DAT_10ae9674).
              * Ghidra: FUN_10ab9650 reads [+0xC]=fb_base, [+0x14]=format,
              * [+0x18]=width, [+0x1C]=height. Without this, render has no target. */
-            *(uint32_t*)(vf->ram + 0xBBD500 + 0x0C) = 0x10BBEAE0; /* framebuffer */
-            *(uint16_t*)(vf->ram + 0xBBD500 + 0x14) = 0x8010;     /* RGB565 format */
+            *(uint32_t*)(vf->ram + 0xBBD500 + 0x0C) = 0;          /* FB bank index (0-3) */
+            *(uint16_t*)(vf->ram + 0xBBD500 + 0x14) = 0x0000;     /* pixel format */
             *(uint32_t*)(vf->ram + 0xBBD500 + 0x18) = 320;        /* width */
             *(uint32_t*)(vf->ram + 0xBBD500 + 0x1C) = 240;        /* height */
         } else {
@@ -6574,10 +6574,7 @@ void vflash_run_frame(VFlash *vf) {
                                 fb[dy * 320 + dx] = (r << 11) | (g << 6) | b;
                             }
                         }
-                        /* Also copy to render pipeline's framebuffer */
-                        uint16_t *fb2 = (uint16_t*)(vf->ram + 0xBBEAE0);
-                        memcpy(fb2, fb, 320*240*2);
-                        printf("[PTX-FB] Loaded %s to render buffer + 0x10BBEAE0\n", pe->name);
+                        /* Don't copy to render FB — leave it clean for native engine */
                     }
                 }
                 free(ptx_buf);
