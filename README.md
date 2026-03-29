@@ -41,10 +41,11 @@ VFF tile decompression: 29 tiles (1.2MB) decompressed from disc. RTOS code area
 protected from BSS clear (write protection 0x109D0000-0x10BF0000). HLE hot functions:
 software division (~40x speedup), memcpy, memset, byte copy, strcmp, event pump skip.
 
-BOOT.BIN 5A5A5A5A relocation: ROM fills literal pool placeholders during CD load;
-emulator patches code-area entries and lets init code fill data tables natively.
-BOOT.BIN games (Incredibles) run from 0x10C0xxxx with native game loop, per-frame
-forced IRQ delivery, and display controller register emulation at 0xB80001xx.
+BOOT.BIN 5A5A5A5A relocation reverse-engineered: ROM generates a 4096-entry lookup
+table with `value = (idx << 20) | 0x0DF2`, indices sequential from +0x4000 with
+wrap to +0x0260. Post-init data section matches 100% with runtime dump from working
+session. BOOT.BIN games (Incredibles) run from 0x10C0xxxx with native init flow,
+JIT IRQ yield on MSR CPSR, LCD DMA status at 0xC0000084, and DC register emulation.
 
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spider-Man.
 
@@ -82,8 +83,10 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **Display controller MMIO** | ✅ 0xB80007xx registers intercepted (VBlank, framebuffer) |
 | **Event pump HLE** | ✅ 0x10138000 data table skip (was crashing as code) |
 | **Per-frame PC recovery** | ✅ Redirect escaped PCs per-frame (not per-slice) |
-| **BOOT.BIN 5A relocation** | ✅ Code literal pools patched, data filled by init |
-| **BOOT.BIN game support** | ✅ Incredibles runs native loop at 0x10C5586C |
+| **BOOT.BIN 5A relocation** | ✅ 4097 entries: `(idx<<20)\|0xDF2` from +0x4000 wrap +0x0260 |
+| **BOOT.BIN game support** | ✅ Incredibles init completes, switch case 5 executed |
+| **LCD DMA status (0x84)** | ✅ ZEVIO extension: transfer complete flag unblocks init |
+| **JIT IRQ yield** | ✅ Break from JIT on MSR CPSR enabling IRQ with timer pending |
 | **Display controller 0x1xx** | ✅ Video mode registers read-back at 0xB80001xx |
 | **Per-frame forced IRQ** | ✅ Timer IRQ delivery for BOOT.BIN games (JIT bypass) |
 | **Per-slice IRQ delivery** | ✅ Check IRQ after each JIT slice for CPSR windows |
@@ -260,8 +263,9 @@ ROM[0x00] → flash copy → flash remap (0x118)
 | PTX flicker every other frame | `frame_count % 2` skipped odd frames | Render PTX every frame |
 | BOOT.BIN 5A5A5A5A unpatched | Init crashed on 0x5A5A5A5A literals | Zero data section, patch code literal pool |
 | Per-frame state corrupted BOOT.BIN | Forced game flags broke Incredibles | Skip state manipulation for BOOT.BIN games |
-| JIT blocked IRQ delivery | CPSR I-bit window invisible to JIT | Per-slice + per-frame forced IRQ delivery |
+| JIT blocked IRQ delivery | CPSR I-bit window invisible to JIT | JIT yield after MSR CPSR enables IRQ |
 | Timer load zeroed after bp900 | Per-frame re-enable failed (load=0) | Restore load=37500 if zeroed |
+| LCD 0x84 DMA spin-wait | Incredibles BEQ self at 0x10C5D3B4 | Return bit 4 set (transfer complete) |
 | VFF entry hardcoded | Only one scene worked | Dynamic entry scan (LDR+PUSH pattern) |
 | VFF section offset | Data shifted by 0x3A0 | Header is 0x60 bytes, loader uses 0x400 padded |
 | Scene callbacks stub | Tiles not decompressed | Call all 65 dispatch table callbacks |
