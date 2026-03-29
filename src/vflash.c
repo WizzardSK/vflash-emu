@@ -6269,7 +6269,14 @@ void vflash_run_frame(VFlash *vf) {
             *(uint32_t*)(vf->ram + 0xB009C4) = 1;
             *(uint32_t*)(vf->ram + 0xB902C0) = 3;
             *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;
-            *(uint32_t*)(vf->ram + 0xB00A2C) = 1; /* render init flag (checked by 10AAFC54) */
+            *(uint32_t*)(vf->ram + 0xB00A2C) = 1; /* render init flag */
+            /* Initialize render device struct at 0x10BBD500 (DAT_10ae9674).
+             * Ghidra: FUN_10ab9650 reads [+0xC]=fb_base, [+0x14]=format,
+             * [+0x18]=width, [+0x1C]=height. Without this, render has no target. */
+            *(uint32_t*)(vf->ram + 0xBBD500 + 0x0C) = 0x10BBEAE0; /* framebuffer */
+            *(uint16_t*)(vf->ram + 0xBBD500 + 0x14) = 0x8010;     /* RGB565 format */
+            *(uint32_t*)(vf->ram + 0xBBD500 + 0x18) = 320;        /* width */
+            *(uint32_t*)(vf->ram + 0xBBD500 + 0x1C) = 240;        /* height */
         } else {
             /* BOOT.BIN game: call per-frame display setup from relocated code.
              * 0x109D1648 writes VIC (0xDC000xxx) and DC (0xB80007xx) registers
