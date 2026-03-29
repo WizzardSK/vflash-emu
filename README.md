@@ -73,7 +73,7 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **VFF scene init** | ✅ 58-entry dispatch table (graphics/audio/render layers) |
 | **VFF scene builder** | ✅ 65 callbacks decompress 1.2MB tile data (29 tiles) |
 | **VFF tile decompression** | ✅ 8bpp tiles decompressed, rendered to framebuffer |
-| **VFF tile display** | ✅ 29 tiles decompressed, 16-layer scene compositing |
+| **VFF tile display** | ✅ HLE multi-layer scene + PTX artwork via native render FB |
 | **Game loop** | ✅ tick→sync→render at 37 FPS via JIT |
 | **JIT compiler** | ✅ ARM→x86_64, 9000+ blocks, 1B+ instructions JIT'd |
 | **HLE hot functions** | ✅ Division, memcpy, memset, strcmp — native C |
@@ -268,6 +268,11 @@ ROM[0x00] → flash copy → flash remap (0x118)
 | LCD 0x84 DMA spin-wait | Incredibles BEQ self at 0x10C5D3B4 | Return bit 4 set (transfer complete) |
 | PTX decoded as 16bpp | 8bpp indexed shown as psychedelic colors | Detect bpp from header +0x0C, use LCD palette |
 | PTX stride hardcoded 512 | Horizontal banding on 1024-wide images | Read width from header +0x08 |
+| dc_regs index overflow | uint32_t[64] indexed by byte offset | Divide offset by 4 |
+| Render device bank vs addr | device[+0xC] was FB addr, needs index 0-3 | Ghidra: fb_resolver uses bank lookup |
+| VBlank toggle per-read | Debounce rejected unstable signal | Toggle per-frame in misc_regs |
+| Render ctx[3]==ctx[4] | render_processing skipped draw path | Ghidra: advance frame counter each frame |
+| Render ctx[0]=1 | Forced error path (debug text only) | Set ctx[0]=0, ctx[1]=1 for normal draw |
 | VFF entry hardcoded | Only one scene worked | Dynamic entry scan (LDR+PUSH pattern) |
 | VFF section offset | Data shifted by 0x3A0 | Header is 0x60 bytes, loader uses 0x400 padded |
 | Scene callbacks stub | Tiles not decompressed | Call all 65 dispatch table callbacks |
