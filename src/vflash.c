@@ -4260,8 +4260,8 @@ void vflash_run_frame(VFlash *vf) {
         done += (int)actual;
 
         /* Per-slice PC escape check: redirect if PC leaves valid code areas.
-         * Active from boot_phase 800+ (game init can also escape). */
-        if (vf->boot_phase >= 800) {
+         * Active from boot_phase 900+ (game loop only, not during init). */
+        if (vf->boot_phase >= 900) {
             uint32_t esc_pc = vf->cpu.r[15];
             int escaped = (esc_pc >= 0xB8000000u) ||
                           (esc_pc < 0x10000000u && esc_pc > 0x1000u) ||
