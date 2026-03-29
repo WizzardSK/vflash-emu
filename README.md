@@ -91,7 +91,7 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **Per-frame forced IRQ** | ✅ Timer IRQ delivery for BOOT.BIN games (JIT bypass) |
 | **Per-slice IRQ delivery** | ✅ Check IRQ after each JIT slice for CPSR windows |
 | **Render processing** | ✅ VFF tile layers rendering (sky/ground/road visible) |
-| **PTX display** | ✅ Game artwork (XBGR1555 sprites) on screen, no flicker |
+| **PTX display** | ✅ 8bpp with palette via native render FB pipeline (RGB565) |
 
 ### Remaining for gameplay
 
