@@ -6482,12 +6482,11 @@ void vflash_run_frame(VFlash *vf) {
             *(uint32_t*)(vf->ram + 0xBBEAE0) = 0;  /* clear sentinel */
             printf("[ENTITY] Created 8 dummy entities at %08X\n", ent_addr);
         }
-        /* Relocate game code from BACKUP (post-init BOOT.BIN) to 0x109D0000.
-         * CRITICAL: use rtos_backup, NOT CD — BOOT.BIN init relocates BL targets
-         * internally, so the backup has correct PC-relative offsets while the
-         * raw CD data has pre-relocation offsets that target wrong addresses.
-         * Backup source: 0x10CB0014 (BOOT.BIN+0xB0014 in RAM at init time). */
-        if (vf->rtos_backup) {
+        /* Relocate game code — ONLY if game runs from relocated area (0x109Dxxxx).
+         * Some games (Incredibles) run directly from BOOT.BIN (0x10C0xxxx).
+         * Skip relocation for those — it would overwrite their running code! */
+        int game_in_bootbin = (vf->cpu.r[15] >= 0x10C00000 && vf->cpu.r[15] < 0x10E00000);
+        if (vf->rtos_backup && !game_in_bootbin) {
             uint32_t dst = 0x9D0000;
             uint32_t src = 0xC0B014; /* BOOT.BIN in RAM: 0x10C00000+0xB0014 */
             uint32_t sz = 0xA80000 - 0x9D0000; /* 704KB */
@@ -6499,16 +6498,18 @@ void vflash_run_frame(VFlash *vf) {
                        sz, 0x10000000+src, 0x10000000+dst, gl_first);
             }
         }
-        vf->cpu.r[15] = 0x109D1CE0;
-        vf->cpu.cpsr = 0x000000D3;  /* SVC mode, IRQ+FIQ disabled */
-        vf->timer.timer[0].ctrl = 0;
-        vf->timer.irq.enable = 0;
-        vf->timer.irq.status = 0;
-        /* Relocate render/engine code from BACKUP to BSS area.
-         * Source: backup 0x10CBB014 → dest 0x10A80000 (566KB).
-         * Use backup (post-init) for correct BL targets.
-         * Fallback to CD if backup area is zeroed. */
-        {
+        if (!game_in_bootbin) {
+            vf->cpu.r[15] = 0x109D1CE0;
+            vf->cpu.cpsr = 0x000000D3;
+            vf->timer.timer[0].ctrl = 0;
+            vf->timer.irq.enable = 0;
+            vf->timer.irq.status = 0;
+        } else {
+            printf("[GAME] Running from BOOT.BIN at PC=0x%08X — skipping relocation\n",
+                   vf->cpu.r[15]);
+        }
+        /* Relocate render/engine code — only for relocated-code games */
+        if (!game_in_bootbin) {
             uint32_t src = 0xCBB014;
             uint32_t dst = 0xA80000;
             uint32_t sz  = 0x8DB0C;
@@ -6534,11 +6535,8 @@ void vflash_run_frame(VFlash *vf) {
                    " (render_processing[0]=%08X)\n",
                    sz, src_name, 0x10000000+src, 0x10000000+dst, first);
         }
-        /* Copy 73 unrelocated functions from BOOT.BIN area to relocation targets.
-         * BOOT.BIN bootstrap copies game code from 10C0xxxx to 109Dxxxx but never
-         * relocates the 10B0xxxx-10B2xxxx range. BL targets in this range hit data
-         * instead of code. Copy the entire block (~100KB) from BOOT.BIN locations. */
-        {
+        /* Copy 73 unrelocated functions — only for relocated-code games */
+        if (!game_in_bootbin) {
             uint32_t src = 0xD48B20;  /* 10D48B20: first unrelocated function */
             uint32_t dst = 0xB0DB0C;  /* 10B0DB0C: relocation target */
             uint32_t sz  = 0x18DE0;   /* 101,856 bytes covering all 73 functions */
