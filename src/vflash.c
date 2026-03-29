@@ -6235,9 +6235,29 @@ void vflash_run_frame(VFlash *vf) {
             *(uint32_t*)(vf->ram + 0xB902C0) = 3;
             *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;
         } else {
-            /* Force IRQ delivery per-frame for BOOT.BIN games.
-             * ROM vector ROM[0xD44] is patched at bp900 to point to 0x10FFF040
-             * (timer handler in high SDRAM, safe from calibration test). */
+            /* BOOT.BIN game: call per-frame display setup from relocated code.
+             * 0x109D1648 writes VIC (0xDC000xxx) and DC (0xB80007xx) registers
+             * to configure display controller for the current frame. */
+            if (vf->boot_phase >= 900 &&
+                *(uint32_t*)(vf->ram + 0x9D1648) != 0) {
+                uint32_t save_regs[16];
+                memcpy(save_regs, vf->cpu.r, sizeof(save_regs));
+                uint32_t save_cpsr = vf->cpu.cpsr;
+                vf->cpu.r[15] = 0x109D1648;
+                vf->cpu.r[14] = 0x10FFF000;
+                vf->cpu.cpsr = 0x000000D3;
+                int budget = 50000;
+                while (budget > 0 && vf->cpu.r[15] != 0x10FFF000) {
+                    arm9_step(&vf->cpu);
+                    budget--;
+                    uint32_t vpc = vf->cpu.r[15];
+                    if (vpc >= 0xB8000000u || (vpc < 0x10000000u && vpc > 0x1000u))
+                        break;
+                }
+                memcpy(vf->cpu.r, save_regs, sizeof(save_regs));
+                vf->cpu.cpsr = save_cpsr;
+            }
+            /* Force IRQ delivery per-frame for BOOT.BIN games. */
             if (vf->boot_phase >= 900 && ztimer_irq_pending(&vf->timer)) {
                 uint32_t save_cpsr = vf->cpu.cpsr;
                 vf->cpu.cpsr &= ~0x80; /* unmask IRQ */
