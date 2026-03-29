@@ -1060,14 +1060,30 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
-        /* Unknown peripheral at 0x900D0000 (off = 0x100D0000).
+        /* V.Flash input controller at 0x900D0000 (off = 0x100D0000).
          * Init task reads 0x18 — possibly interrupt status or clock/power.
          * During game loop, return 0 to avoid confusing IRQ handler. */
+        /* V.Flash input controller at 0x900D0000.
+         * Register 0x00: button state (active-low: 0 = pressed).
+         * Register 0x18: input IRQ status / ready flag.
+         * Button mapping: bit0=Up, bit1=Down, bit2=Left, bit3=Right,
+         * bit4=Red(Z), bit5=Yellow(X), bit6=Green(C), bit7=Blue(V),
+         * bit8=Enter. Directly maps to SDL input bitmask. */
         if (off >= 0x100D0000u && off < 0x100D1000u) {
             uint32_t preg = off - 0x100D0000u;
-            if (preg == 0x18 && vf->boot_phase >= 800)
-                return 0;  /* no interrupt from this source */
-            return 0x01; /* generic "ready" status during init */
+            switch (preg) {
+            case 0x00:
+                /* Active-low GPIO: 0 = pressed, 1 = released */
+                return (~vf->input) & 0x1FF;
+            case 0x04:
+                /* Edge detect: 1 if button state changed */
+                return (vf->input != vf->input_prev) ? 0x1FF : 0;
+            case 0x18:
+                /* Input IRQ status (0 = no pending input IRQ) */
+                return (vf->boot_phase >= 800) ? 0 : 0x01;
+            default:
+                return 0x01;
+            }
         }
 
         /* Interrupt controller at 0xDC000000 (Firebird: interrupt.c).
