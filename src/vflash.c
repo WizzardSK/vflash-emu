@@ -1539,8 +1539,11 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
             val = 3;
         }
         /* Protect code+data (0x10090000-0x10BF0000) from BSS zeroing.
-         * BSS clear should only zero 0x10BF0000-0x10C00000 (actual BSS). */
+         * BSS clear should only zero 0x10BF0000-0x10C00000 (actual BSS).
+         * Exception: allow writes to framebuffer area (0x10BBEAE0-0x10BE3C40)
+         * so render pipeline can write black pixels (val=0). */
         if (val == 0 && roff >= 0x90000 && roff < 0xBF0000 &&
+            !(roff >= 0xBBEAE0 && roff < 0xBE3C40) &&
             vf->boot_phase >= 800) {
             return; /* silently block */
         }
@@ -6006,7 +6009,13 @@ void vflash_run_frame(VFlash *vf) {
              * µMORE service dependencies are in BSS (unpopulated).
              * HLE timer tick (per-frame) handles re-scheduling. */
             entry = 0x10C16CC0;
-            printf("[AUTO-LAUNCH] → Game entry at 0x%08X (direct, scheduler HLE)\n", entry);
+            /* Set game state flags:
+             * [0x10B00A64] bit1: per-tick poll advances (µMORE services set this)
+             * [0x10BBAE40] = 5: game ready (poll returns 1, enters game loop) */
+            *(uint32_t*)(vf->ram + 0xB00A64) |= 2;
+            *(uint32_t*)(vf->ram + 0xBBAE40) = 5;
+            printf("[AUTO-LAUNCH] → Game entry at 0x%08X (direct, flag[B00A64]=%08X)\n",
+                   entry, *(uint32_t*)(vf->ram + 0xB00A64));
             vf->cpu.r[15] = entry;
             vf->cpu.cpsr = 0x00000013; /* SVC, IRQ enabled */
             vf->cpu.r[13] = sbase + ssz - 4;
@@ -6090,10 +6099,17 @@ void vflash_run_frame(VFlash *vf) {
          * ctx[3] must differ from ctx[4] each frame (frame counter vs last processed). */
         *(uint32_t*)(vf->ram + 0xBE3C40) = 0;  /* ctx[0] = 0 (no error) */
         *(uint32_t*)(vf->ram + 0xBE3C44) = 1;  /* ctx[1] = 1 (frame ready) */
-        /* ctx[3] == ctx[4]: render_processing skips draw path.
-         * With ctx[3] != ctx[4]: draw path entered, runs at 10 FPS,
-         * but entity/display list data empty → no pixels rendered.
-         * Need to populate display list + entity vtables first. */
+        /* Advance render frame counter so render_processing enters draw path.
+         * ctx[3] must differ from ctx[4] (frame counter vs last processed).
+         * Also set render state flag at 0x10BE3C60 (checked via LDRSB). */
+        *(uint32_t*)(vf->ram + 0xBE3C4C) = (uint32_t)vf->frame_count;
+        *(uint32_t*)(vf->ram + 0xBE3C50) = (uint32_t)vf->frame_count - 1;
+        vf->ram[0xBE3C60] = 1; /* render state flag (LDRSB check) */
+        /* Ensure framebuffer at 0x10BBEAE0 is addressable (render writes RGB565 here) */
+        if (*(uint32_t*)(vf->ram + 0xBBEAE0) == 0)
+            *(uint32_t*)(vf->ram + 0xBBEAE0) = 0x00010001; /* non-zero sentinel */
+        /* Set lcd.upbase to render pipeline's framebuffer */
+        vf->lcd.upbase = 0x10BBEAE0;
         *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;  /* render enable flag */
         *(uint16_t*)(vf->ram + 0xBE49E0) = 1;
         *(uint32_t*)(vf->ram + 0xB009C4) = 1;
@@ -6106,7 +6122,7 @@ void vflash_run_frame(VFlash *vf) {
      * directly to game loop. This lets the game set up its own
      * framebuffer and render state before entering the main loop. */
     if (vf->has_rom && vf->boot_phase == 800 &&
-        vf->frame_count >= 80 && vf->frame_count <= 200) {
+        vf->frame_count >= 100 && vf->frame_count <= 200) {
         /* Set asset loading counters to > 7 (game waits for this) */
         *(uint32_t*)(vf->ram + 0xB05A18) = 8;  /* counter1 */
         *(uint32_t*)(vf->ram + 0xB05A1C) = 8;  /* counter2 */
