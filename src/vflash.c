@@ -6270,6 +6270,13 @@ void vflash_run_frame(VFlash *vf) {
             *(uint32_t*)(vf->ram + 0xB902C0) = 3;
             *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;
             *(uint32_t*)(vf->ram + 0xB00A2C) = 1; /* render init flag */
+            /* Set framebuffer bank addresses in DC registers 0x140-0x14C.
+             * Ghidra: fb_resolver reads [0xB8000140 + bank*4] to get FB address.
+             * Game video init normally writes these via switch function. */
+            vf->dc_regs[0x40] = 0x10BBEAE0; /* bank 0: main render FB */
+            vf->dc_regs[0x44] = 0x10BBEAE0; /* bank 1: same (double-buffer) */
+            vf->dc_regs[0x48] = 0x10BBEAE0; /* bank 2 */
+            vf->dc_regs[0x4C] = 0x10BBEAE0; /* bank 3 */
             /* Initialize render device struct at 0x10BBD500 (DAT_10ae9674).
              * Ghidra: FUN_10ab9650 reads [+0xC]=fb_base, [+0x14]=format,
              * [+0x18]=width, [+0x1C]=height. Without this, render has no target. */
