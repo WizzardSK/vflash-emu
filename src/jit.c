@@ -267,40 +267,7 @@ flags_only:
         /* Update CPSR N, Z flags from result/comparison.
          * Original code: compute from EDX result for data processing with S.
          * FIX: also handle CMP/TST/CMN which jump here via goto. */
-        if (opcode == 8 || opcode == 10 || opcode == 11) {
-            /* CMP/TST/CMN: x86 flags set by cmp/test/add.
-             * Capture via LAHF before any flag-clobbering ops. */
-            emit8(e, 0x9F); /* LAHF → AH = SF:ZF:0:AF:0:PF:1:CF */
-            emit_mov_r32_r32(e, RCX, RAX);
-            emit_shr_r32_imm(e, RCX, 8); /* CL = flags byte */
-
-            emit_ldr_disp32(e, RAX, REG_CPU, ARM_CPSR);
-            emit_and_r32_imm32(e, RAX, 0x0FFFFFFF);
-
-            /* Z: CL bit 6 → CPSR bit 30 */
-            emit_mov_r32_r32(e, RDX, RCX);
-            emit_and_r32_imm32(e, RDX, 0x40);
-            emit_shl_r32_imm(e, RDX, 24);
-            emit_or_r32_r32(e, RAX, RDX);
-            /* N: CL bit 7 → CPSR bit 31 */
-            emit_mov_r32_r32(e, RDX, RCX);
-            emit_and_r32_imm32(e, RDX, 0x80);
-            emit_shl_r32_imm(e, RDX, 24);
-            emit_or_r32_r32(e, RAX, RDX);
-            /* C: CL bit 0. CMP: ARM C = !CF (inverted) */
-            emit_mov_r32_r32(e, RDX, RCX);
-            emit_and_r32_imm32(e, RDX, 1);
-            if (opcode == 10) {
-                /* Invert: C = 1 - CF */
-                emit_mov_r32_imm32(e, RSI, 1);
-                emit_sub_r32_r32(e, RSI, RDX);
-                emit_mov_r32_r32(e, RDX, RSI);
-            }
-            emit_shl_r32_imm(e, RDX, 29);
-            emit_or_r32_r32(e, RAX, RDX);
-
-            emit_str_disp32(e, REG_CPU, RAX, ARM_CPSR);
-        } else {
+        if (opcode != 8 && opcode != 10 && opcode != 11) {
             /* Non-comparison S-bit ops: N and Z from result in EDX.
              * Original code preserved — only added CMP path above. */
             emit_load_arm_reg(e, RAX, -1); /* load CPSR */
@@ -761,6 +728,20 @@ int jit_run(JitContext *jit, int cycles) {
         }
 
 
+
+        /* BOOT.BIN code: use interpreter (JIT CMP doesn't update CPSR flags).
+         * This is slower but correct — CMP/TST/CMN flags are critical for
+         * switch dispatch and conditional branches in game code. */
+        if (pc >= 0x10C00000 && pc < 0x10E00000) {
+            arm9_step(cpu);
+            executed++;
+            if (!(cpu->cpsr & 0x80) &&
+                (cpu->cpsr & 0x1F) != 0x12 &&
+                ztimer_irq_pending(vflash_get_timer(vf))) {
+                break;
+            }
+            continue;
+        }
 
         /* Check specific HLE intercept addresses — only these need interpreter */
         if (pc == 0x10A881F0 || pc == 0x10A8CDE4 || pc == 0x10A6FC60 ||
