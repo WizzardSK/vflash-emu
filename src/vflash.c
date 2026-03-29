@@ -3773,6 +3773,9 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
             *(uint32_t*)(vf2->ram + 0xBE3C4C) = (fc << 8) | flags; /* ctx[3] */
             *(uint32_t*)(vf2->ram + 0xBE3C50) = ((fc-1) << 8) | flags; /* ctx[4] different */
         }
+        /* Toggle VBlank bit RIGHT BEFORE native render runs */
+        *(uint32_t*)(vf2->ram + 0xB65A00) ^= 0x02000000;
+        vf2->ram[0xBE3C60] = 1; /* render state byte */
         /* Build display list from HLE alloc entities */
         if (*(uint32_t*)(vf2->ram + 0xBE3D24) == 0) {
             uint32_t arr = 0xB90000;
