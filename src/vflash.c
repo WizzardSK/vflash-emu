@@ -1343,13 +1343,10 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                     return v;
                 }
                 case 0x18: {
-                    /* Display status: bit25 = VBlank toggle.
-                     * Render processing checks this to know when to draw.
-                     * Toggle bit25 on each read to simulate VBlank. */
-                    uint32_t v = vf->misc_regs[0x18 >> 2];
-                    v ^= 0x02000000;
-                    vf->misc_regs[0x18 >> 2] = v;
-                    return v;
+                    /* System status register. Bit 25 is checked by render
+                     * pipeline (through debounce at 0x10A59000) to trigger
+                     * entity draw. Set bit 25 permanently. */
+                    return vf->misc_regs[0x18 >> 2] | 0x02000000;
                 }
                 case 0x28: return 0x00000000; /* ASIC ID low */
                 case 0x2C: return 0x00000000; /* ASIC ID high */
