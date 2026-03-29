@@ -6227,6 +6227,8 @@ void vflash_run_frame(VFlash *vf) {
              * Also reset render context so render_processing doesn't skip. */
             *(uint32_t*)(vf->ram + 0xBE3C40) = 0;
             *(uint32_t*)(vf->ram + 0xBE3C44) = 1;
+            /* Toggle VBlank bit 25 each frame so entity draw triggers */
+            *(uint32_t*)(vf->ram + 0xB65A00) ^= 0x02000000;
             *(uint32_t*)(vf->ram + 0xBE3C4C) = (uint32_t)vf->frame_count;
             *(uint32_t*)(vf->ram + 0xBE3C50) = (uint32_t)vf->frame_count - 1;
             vf->ram[0xBE3C60] = 1;
@@ -6270,6 +6272,10 @@ void vflash_run_frame(VFlash *vf) {
             *(uint32_t*)(vf->ram + 0xB902C0) = 3;
             *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;
             *(uint32_t*)(vf->ram + 0xB00A2C) = 1; /* render init flag */
+            /* VBlank status at 0x10B65A00: bit 25 toggles each frame.
+             * FUN_10AB1950 (entity draw) only renders when bit 25 changes.
+             * Without this, tile rendering is skipped entirely. */
+            *(uint32_t*)(vf->ram + 0xB65A00) = 0x02000000;
             /* Set framebuffer bank addresses in DC registers 0x140-0x14C.
              * Ghidra: fb_resolver reads [0xB8000140 + bank*4] to get FB address.
              * Game video init normally writes these via switch function. */
