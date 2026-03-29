@@ -6121,12 +6121,39 @@ void vflash_run_frame(VFlash *vf) {
         /* Ensure framebuffer at 0x10BBEAE0 is addressable (render writes RGB565 here) */
         if (*(uint32_t*)(vf->ram + 0xBBEAE0) == 0)
             *(uint32_t*)(vf->ram + 0xBBEAE0) = 0x00010001; /* non-zero sentinel */
-        /* Write button state to game input variable at 0x10AFDE50.
-         * Found via TST pattern search: game checks button bitmask here.
-         * Refs: LDR R0/R1,=0x10AFDE50 at 0x109D17A8 and 0x109D19DC.
-         * Bitmask: bit0=Up, bit1=Down, bit2=Left, bit3=Right,
-         * bit4=Red, bit5=Yellow, bit6=Green, bit7=Blue, bit8=Enter */
+        /* Write button state to game input variable at 0x10AFDE50 AND
+         * call the button handler function at 0x109D17A4 per-frame.
+         * This function is an event callback (no direct callers —
+         * registered via µMORE event system which isn't initialized). */
         *(uint32_t*)(vf->ram + 0xAFDE50) = vf->input;
+        if (vf->boot_phase >= 900 && vf->input != vf->input_prev) {
+            /* Call button handler: save CPU, run function, restore */
+            uint32_t spc = vf->cpu.r[15], slr = vf->cpu.r[14];
+            uint32_t scpsr = vf->cpu.cpsr, sr0 = vf->cpu.r[0];
+            vf->cpu.r[15] = 0x109D17A4;
+            vf->cpu.r[14] = 0x10FFF000; /* return to idle */
+            vf->cpu.cpsr = 0x000000D3;
+            vf->cpu.r[0] = vf->input; /* button state as arg */
+            int budget = 10000;
+            while (budget > 0 && vf->cpu.r[15] != 0x10FFF000 &&
+                   vf->cpu.r[15] != 0x10FFF00C) {
+                uint64_t cb = vf->cpu.cycles;
+                arm9_step(&vf->cpu);
+                budget -= (int)(vf->cpu.cycles - cb);
+                uint32_t vpc = vf->cpu.r[15];
+                if (vpc >= 0xB8000000u || (vpc < 0x10000000u && vpc > 0x1000u)) {
+                    vf->cpu.r[15] = 0x10FFF000; break;
+                }
+            }
+            vf->cpu.r[15] = spc; vf->cpu.r[14] = slr;
+            vf->cpu.cpsr = scpsr; vf->cpu.r[0] = sr0;
+            static int btn_log = 0;
+            if (btn_log < 10) {
+                printf("[INPUT-CB] Called 0x109D17A4 btn=%03X (budget left=%d)\n",
+                       vf->input, budget);
+                btn_log++;
+            }
+        }
         /* Set lcd.upbase to render pipeline's framebuffer.
          * Also set dc_vblank_cb so LCD blit is enabled. */
         vf->lcd.upbase = 0x10BBEAE0;
