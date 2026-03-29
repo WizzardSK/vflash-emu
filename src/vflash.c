@@ -6262,6 +6262,7 @@ void vflash_run_frame(VFlash *vf) {
             *(uint32_t*)(vf->ram + 0xB009C4) = 1;
             *(uint32_t*)(vf->ram + 0xB902C0) = 3;
             *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;
+            *(uint32_t*)(vf->ram + 0xB00A2C) = 1; /* render init flag (checked by 10AAFC54) */
         } else {
             /* BOOT.BIN game: call per-frame display setup from relocated code.
              * 0x109D1648 writes VIC (0xDC000xxx) and DC (0xB80007xx) registers
