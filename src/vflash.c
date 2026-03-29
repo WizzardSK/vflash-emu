@@ -264,6 +264,7 @@ struct VFlash {
     uint32_t fiq_saved_r8_12[5]; /* r[8]-r[12] saved before FIQ mode switch */
     uint32_t dc_vblank_cb;       /* Display controller VBlank callback (from 0xB80007C0) */
     uint32_t dc_irq_handler;     /* Display controller IRQ handler (from 0xB8000784) */
+    uint32_t dc_regs[64];        /* Display controller regs 0xB8000100-0xB80001FF */
 
     uint32_t  framebuf[VFLASH_SCREEN_W * VFLASH_SCREEN_H];
 };
@@ -1166,9 +1167,12 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
         if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
             uint32_t foff = off - 0x38000000u;
 
-            /* Display controller registers at 0xB8000700-0xB80007FF (reads).
-             * Return safe defaults so render code doesn't branch to ROM.
-             * Only during game phase — early boot uses this range for flash polling. */
+            /* Display controller regs 0x100-0x1FF: read-back stored values */
+            if (foff >= 0x100 && foff < 0x200 && vf->boot_phase >= 800) {
+                uint32_t rv = vf->dc_regs[foff - 0x100];
+                return rv;
+            }
+            /* Display controller registers at 0xB8000700-0xB80007FF (reads). */
             if (foff >= 0x700 && foff < 0x800 && vf->boot_phase >= 800) {
                 switch (foff) {
                 case 0x770: return 1;    /* status: ready */
@@ -1857,10 +1861,15 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
         if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
             uint32_t foff = off - 0x38000000u;
 
-            /* Display controller registers at 0xB8000700-0xB80007FF.
-             * Render code writes VBlank callback, framebuffer pointer, etc.
-             * These are NOT flash commands — intercept before flash handler.
+            /* Display controller registers at 0xB8000100-0xB80007FF.
+             * 0x100-0x1FF: video mode/timing registers (Incredibles uses these)
+             * 0x700-0x7FF: VBlank callback, framebuffer, IRQ handler
              * Only during game phase to avoid breaking ROM flash polling. */
+            if (foff >= 0x100 && foff < 0x200 && vf->boot_phase >= 800) {
+                /* Store in a register array for read-back */
+                vf->dc_regs[foff - 0x100] = val;
+                return;
+            }
             if (foff >= 0x700 && foff < 0x800 && vf->boot_phase >= 800) {
                 static int dc_log = 0;
                 if (dc_log < 20) {
@@ -4227,11 +4236,14 @@ void vflash_run_frame(VFlash *vf) {
 
     /* Re-enable timer at frame start if it was disabled.
      * µMORE services may disable the timer; re-enable for IRQ delivery. */
-    if (vf->has_rom && vf->timer.timer[0].load > 0 &&
+    if (vf->has_rom &&
         (vf->timer.timer[0].ctrl & 0x80) == 0 && /* not enabled */
         vf->boot_phase >= 300) { /* only after game launch */
+        if (vf->timer.timer[0].load == 0)
+            vf->timer.timer[0].load = 37500; /* 150MHz / 37500 = 4KHz */
         vf->timer.timer[0].ctrl = 0xE2; /* enabled, periodic, 32-bit, IRQ */
         vf->timer.timer[0].count = vf->timer.timer[0].load;
+        vf->timer.irq.enable |= 0x01;
     }
 
     int done = 0;
@@ -4239,7 +4251,7 @@ void vflash_run_frame(VFlash *vf) {
         int slice = (TOTAL - done < SLICE) ? (TOTAL - done) : SLICE;
 
         uint64_t cyc_before = vf->cpu.cycles;
-        /* Use JIT when available and game is running, interpreter otherwise */
+        /* Use JIT when available and game is running, interpreter otherwise. */
         if (vf->jit && vf->boot_phase >= 100 &&
             vf->cpu.r[15] >= 0x10000000 && vf->cpu.r[15] < 0x11000000) {
             /* Force game flags in RAM before every JIT run */
@@ -4259,19 +4271,21 @@ void vflash_run_frame(VFlash *vf) {
         ztimer_tick(&vf->timer, actual);
         done += (int)actual;
 
-        /* Per-slice PC escape check: redirect if PC leaves valid code areas.
-         * Active from boot_phase 900+ (game loop only, not during init). */
-        if (vf->boot_phase >= 900) {
-            uint32_t esc_pc = vf->cpu.r[15];
-            int escaped = (esc_pc >= 0xB8000000u) ||
-                          (esc_pc < 0x10000000u && esc_pc > 0x1000u) ||
-                          (esc_pc >= 0x11000000u && esc_pc < 0xB8000000u);
-            if (escaped) {
-                /* Redirect to idle (game-agnostic, works for all games) */
-                vf->cpu.r[15] = 0x10FFF000;
-                vf->cpu.cpsr = 0x000000D3;
-            }
+        /* Per-slice IRQ delivery: JIT doesn't check IRQ between instructions.
+         * If timer IRQ is pending and CPSR allows, deliver it now.
+         * This is critical for BOOT.BIN games where game code briefly enables
+         * IRQ in kernel sleep then disables it — JIT misses the window. */
+        if (vf->boot_phase >= 300 &&
+            ztimer_irq_pending(&vf->timer) &&
+            !(vf->cpu.cpsr & 0x80)) { /* IRQ not masked */
+            if (vf->cpu.r13_irq < 0x10000000u || vf->cpu.r13_irq > 0x10FFFFFFu)
+                vf->cpu.r13_irq = 0x10800000;
+            arm9_irq(&vf->cpu);
         }
+
+        /* PC escape check moved to per-frame RECOVER (not per-slice).
+         * Per-slice was too aggressive — SpongeBob/Scooby crash at boot_phase 800
+         * when valid init PCs get caught by escape heuristic mid-slice. */
 
         /* Detect kernel loop and enable timer + IRQ */
         if (vf->has_rom && vf->frame_count > 5) {
@@ -4661,36 +4675,6 @@ void vflash_run_frame(VFlash *vf) {
                 }
             }
 
-            /* Track init task — log boot_phase at specific frames */
-            if (vf->frame_count == 110 || vf->frame_count == 200) {
-                static int bp_log = 0;
-                if (bp_log < 5) {
-                    printf("[BP-CHECK] frame=%llu boot_phase=%d PC=%08X\n",
-                           vf->frame_count, vf->boot_phase, pc);
-                    if (pc >= 0x10000000 && pc < 0x11000000) {
-                        uint32_t roff = pc - 0x10000000;
-                        /* Dump 128 bytes around stuck PC */
-                        uint32_t base = (roff > 64) ? roff - 64 : 0;
-                        for (uint32_t d = 0; d < 256; d += 4) {
-                            uint32_t a = base + d;
-                            if (a < VFLASH_RAM_SIZE)
-                                printf("[BP-DUMP] %08X: %08X%s\n",
-                                       0x10000000 + a,
-                                       *(uint32_t*)(vf->ram + a),
-                                       (0x10000000 + a == pc) ? " <<<" : "");
-                        }
-                        /* Also dump registers */
-                        printf("[BP-REGS] R0=%08X R1=%08X R2=%08X R3=%08X R4=%08X R5=%08X R6=%08X R7=%08X\n",
-                               vf->cpu.r[0], vf->cpu.r[1], vf->cpu.r[2], vf->cpu.r[3],
-                               vf->cpu.r[4], vf->cpu.r[5], vf->cpu.r[6], vf->cpu.r[7]);
-                        printf("[BP-REGS] R8=%08X R9=%08X R10=%08X R11=%08X R12=%08X SP=%08X LR=%08X\n",
-                               vf->cpu.r[8], vf->cpu.r[9], vf->cpu.r[10], vf->cpu.r[11],
-                               vf->cpu.r[12], vf->cpu.r[13], vf->cpu.r[14]);
-                    }
-                    bp_log++;
-                }
-            }
-
             /* Flash operation completion: µMORE loop at 0x10A1C5xx polls
              * [0x10BBCFF4] bit 0. Set it periodically to simulate flash
              * write/erase completion. This flag is normally set by a flash
@@ -4869,6 +4853,32 @@ void vflash_run_frame(VFlash *vf) {
                 /* Run BOOT.BIN init to register µMORE services.
                  * Entry at 0x10C0011C does init functions then calls
                  * callback → idle at 0x10FFF000. */
+                {
+                    int n5a = 0;
+                    for (uint32_t a = 0xC00000; a < 0xE00000 && a + 4 <= VFLASH_RAM_SIZE; a += 4)
+                        if (*(uint32_t*)(vf->ram + a) == 0x5A5A5A5A) n5a++;
+                    /* If 5A5A5A5A still present, ROM relocation was bypassed.
+                     * Apply it ourselves: scan BOOT.BIN for 5A5A5A5A literal pool
+                     * entries and patch them with base+offset (0x10C00000 + file_offset).
+                     * This is what the ROM's loader does during CD read. */
+                    if (n5a > 100) {
+                        /* Zero ALL 5A5A5A5A entries. The init code at 0x10C0011C
+                         * writes correct values to data sections. Code literal
+                         * pools need valid writable addresses — zero is safe
+                         * (NULL writes trapped by null_trap). Only the entry at
+                         * +0x476C needs a real address (STR target). */
+                        int patched = 0;
+                        for (uint32_t a = 0x24; a < 0xC000; a += 4) {
+                            if (*(uint32_t*)(vf->ram + 0xC00000 + a) == 0x5A5A5A5A) {
+                                *(uint32_t*)(vf->ram + 0xC00000 + a) = 0;
+                                patched++;
+                            }
+                        }
+                        /* Patch +0x476C to safe scratch addr (init writes here) */
+                        *(uint32_t*)(vf->ram + 0xC0476C) = 0x10FFE080;
+                        printf("[BOOT-RELOC] Zeroed %d 5A5A5A5A entries (+0x476C→scratch)\n", patched);
+                    }
+                }
                 vf->cpu.null_trap_enabled = 1;
                 vf->cpu.cpsr = 0x000000D3; /* SVC, IRQ+FIQ disabled */
                 vf->cpu.r[15] = 0x10C0011C;
@@ -4892,9 +4902,6 @@ void vflash_run_frame(VFlash *vf) {
                     if (!vf->rtos_backup) vf->rtos_backup = malloc(VFLASH_RAM_SIZE);
                     if (vf->rtos_backup) {
                         memcpy(vf->rtos_backup, vf->ram, VFLASH_RAM_SIZE);
-                        printf("[EARLY-BACKUP] [109D1BD0]=%08X [A8CDE4]=%08X\n",
-                               *(uint32_t*)(vf->ram+0x9D1BD0),
-                               *(uint32_t*)(vf->ram+0xA8CDE4));
                     }
                 }
                 /* Check if BSS service table got populated */
@@ -6088,87 +6095,111 @@ void vflash_run_frame(VFlash *vf) {
             }
         }
 
-        /* Per-frame recovery: if PC wandered into BX LR stub area
-         * (low RAM below game code, or above BOOT.BIN), redirect to game loop. */
-        if (vf->boot_phase >= 900 &&
-            (pc < 0x10090000 || pc > 0x10F00000) &&
-            pc != 0x10FFF00C && pc != 0x10FFF000) {
-            static int recover_log = 0;
-            if (recover_log < 5) {
-                printf("[RECOVER] PC=0x%08X wandered → redirect to game loop\n", pc);
-                recover_log++;
-            }
-            vf->cpu.r[15] = 0x109D1CE0;
-            vf->cpu.cpsr = 0x000000D3;
-        }
-
-        /* Ensure game loop code is intact (BSS clear may zero it).
-         * Restore from backup (post-init BOOT.BIN with correct BL targets). */
-        if (vf->boot_phase >= 900 &&
-            *(uint32_t*)(vf->ram + 0x9D1CE0) == 0 && vf->rtos_backup) {
-            memcpy(vf->ram + 0x9D0000, vf->rtos_backup + 0xC0B014,
-                   0xA80000 - 0x9D0000);
-        }
-
-        /* After any restore, re-set game flags (backup has them at 0).
-         * Also reset render context so render_processing doesn't skip.
-         * ctx[3] must differ from ctx[4] each frame (frame counter vs last processed). */
-        *(uint32_t*)(vf->ram + 0xBE3C40) = 0;  /* ctx[0] = 0 (no error) */
-        *(uint32_t*)(vf->ram + 0xBE3C44) = 1;  /* ctx[1] = 1 (frame ready) */
-        /* Advance render frame counter so render_processing enters draw path.
-         * ctx[3] must differ from ctx[4] (frame counter vs last processed).
-         * Also set render state flag at 0x10BE3C60 (checked via LDRSB). */
-        *(uint32_t*)(vf->ram + 0xBE3C4C) = (uint32_t)vf->frame_count;
-        *(uint32_t*)(vf->ram + 0xBE3C50) = (uint32_t)vf->frame_count - 1;
-        vf->ram[0xBE3C60] = 1; /* render state flag (LDRSB check) */
-        /* Ensure framebuffer at 0x10BBEAE0 is addressable (render writes RGB565 here) */
-        if (*(uint32_t*)(vf->ram + 0xBBEAE0) == 0)
-            *(uint32_t*)(vf->ram + 0xBBEAE0) = 0x00010001; /* non-zero sentinel */
-        /* Write button state to game input variable at 0x10AFDE50 AND
-         * call the button handler function at 0x109D17A4 per-frame.
-         * This function is an event callback (no direct callers —
-         * registered via µMORE event system which isn't initialized). */
-        *(uint32_t*)(vf->ram + 0xAFDE50) = vf->input;
-        /* Call ALL 6 button handler callbacks per-frame.
-         * These are event callbacks normally dispatched by µMORE event system.
-         * Chain: UP/DOWN handler → YELLOW/GREEN handler → setup functions. */
+        /* Per-frame RECOVER: redirect escaped PC to game loop.
+         * Replaces the old per-slice escape check which was too aggressive
+         * (SpongeBob/Scooby crashed at boot_phase 800 during init).
+         * Per-frame gives init code a full frame to settle before checking. */
         if (vf->boot_phase >= 900) {
-            static const uint32_t btn_handlers[] = {
-                0x109D17A4, 0x109D18A8, 0x109D19D0,
-                0x109D1A20, 0x109D1A9C, 0x109D1B34, 0
-            };
-            uint32_t save_regs[16];
-            memcpy(save_regs, vf->cpu.r, sizeof(save_regs));
-            uint32_t save_cpsr = vf->cpu.cpsr;
-            for (int hi = 0; btn_handlers[hi]; hi++) {
-                vf->cpu.r[15] = btn_handlers[hi];
-                vf->cpu.r[14] = 0x10FFF000;
-                vf->cpu.cpsr = 0x000000D3;
-                vf->cpu.r[0] = vf->input;
-                int budget = 5000;
-                while (budget > 0 && vf->cpu.r[15] != 0x10FFF000) {
-                    uint64_t cb = vf->cpu.cycles;
-                    arm9_step(&vf->cpu);
-                    budget -= (int)(vf->cpu.cycles - cb);
-                    if (budget < 0) break;
-                    uint32_t vpc = vf->cpu.r[15];
-                    if (vpc >= 0xB8000000u || (vpc < 0x10000000u && vpc > 0x1000u))
-                        break;
+            int escaped = (pc >= 0xB8000000u) ||
+                          (pc < 0x10000000u && pc > 0x1000u) ||
+                          (pc >= 0x11000000u && pc < 0xB8000000u) ||
+                          (pc < 0x10090000 && pc >= 0x10000000) ||
+                          (pc > 0x10F00000 && pc < 0x11000000 &&
+                           pc != 0x10FFF00C && pc != 0x10FFF000);
+            if (escaped) {
+                static int recover_log = 0;
+                if (recover_log < 10) {
+                    printf("[RECOVER] PC=0x%08X escaped → redirect to game loop\n", pc);
+                    recover_log++;
                 }
+                /* For BOOT.BIN games, redirect to idle (game loop is in BOOT.BIN area).
+                 * For relocated games, redirect to 0x109D1CE0 (game loop entry). */
+                int bootbin_game = (vf->saved_game_entry >= 0x10C00000 && vf->saved_game_entry < 0x10E00000);
+                if (bootbin_game) {
+                    vf->cpu.r[15] = 0x10FFF000; /* idle — game will resume via timer */
+                } else {
+                    vf->cpu.r[15] = 0x109D1CE0;
+                }
+                vf->cpu.cpsr = 0x000000D3;
             }
-            memcpy(vf->cpu.r, save_regs, sizeof(save_regs));
-            vf->cpu.cpsr = save_cpsr;
         }
-        /* Set lcd.upbase to render pipeline's framebuffer.
-         * Also set dc_vblank_cb so LCD blit is enabled. */
-        vf->lcd.upbase = 0x10BBEAE0;
-        if (!vf->dc_vblank_cb)
-            vf->dc_vblank_cb = 0x109D1CE0; /* game loop as placeholder */
-        *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;  /* render enable flag */
-        *(uint16_t*)(vf->ram + 0xBE49E0) = 1;
-        *(uint32_t*)(vf->ram + 0xB009C4) = 1;
-        *(uint32_t*)(vf->ram + 0xB902C0) = 3;
-        *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;
+
+        /* BOOT.BIN games manage their own state — skip forced game flags,
+         * render context, and button handler calls that would corrupt them.
+         * Only apply per-frame state manipulation for relocated games. */
+        int is_bootbin = (vf->saved_game_entry >= 0x10C00000 &&
+                          vf->saved_game_entry < 0x10E00000);
+
+        if (!is_bootbin) {
+            /* Ensure game loop code is intact (BSS clear may zero it).
+             * Restore from backup (post-init BOOT.BIN with correct BL targets). */
+            if (vf->boot_phase >= 900 &&
+                *(uint32_t*)(vf->ram + 0x9D1CE0) == 0 && vf->rtos_backup) {
+                memcpy(vf->ram + 0x9D0000, vf->rtos_backup + 0xC0B014,
+                       0xA80000 - 0x9D0000);
+            }
+
+            /* After any restore, re-set game flags (backup has them at 0).
+             * Also reset render context so render_processing doesn't skip. */
+            *(uint32_t*)(vf->ram + 0xBE3C40) = 0;
+            *(uint32_t*)(vf->ram + 0xBE3C44) = 1;
+            *(uint32_t*)(vf->ram + 0xBE3C4C) = (uint32_t)vf->frame_count;
+            *(uint32_t*)(vf->ram + 0xBE3C50) = (uint32_t)vf->frame_count - 1;
+            vf->ram[0xBE3C60] = 1;
+            if (*(uint32_t*)(vf->ram + 0xBBEAE0) == 0)
+                *(uint32_t*)(vf->ram + 0xBBEAE0) = 0x00010001;
+            *(uint32_t*)(vf->ram + 0xAFDE50) = vf->input;
+            /* Call ALL 6 button handler callbacks per-frame. */
+            if (vf->boot_phase >= 900) {
+                static const uint32_t btn_handlers[] = {
+                    0x109D17A4, 0x109D18A8, 0x109D19D0,
+                    0x109D1A20, 0x109D1A9C, 0x109D1B34, 0
+                };
+                uint32_t save_regs[16];
+                memcpy(save_regs, vf->cpu.r, sizeof(save_regs));
+                uint32_t save_cpsr = vf->cpu.cpsr;
+                for (int hi = 0; btn_handlers[hi]; hi++) {
+                    vf->cpu.r[15] = btn_handlers[hi];
+                    vf->cpu.r[14] = 0x10FFF000;
+                    vf->cpu.cpsr = 0x000000D3;
+                    vf->cpu.r[0] = vf->input;
+                    int budget = 5000;
+                    while (budget > 0 && vf->cpu.r[15] != 0x10FFF000) {
+                        uint64_t cb = vf->cpu.cycles;
+                        arm9_step(&vf->cpu);
+                        budget -= (int)(vf->cpu.cycles - cb);
+                        if (budget < 0) break;
+                        uint32_t vpc = vf->cpu.r[15];
+                        if (vpc >= 0xB8000000u || (vpc < 0x10000000u && vpc > 0x1000u))
+                            break;
+                    }
+                }
+                memcpy(vf->cpu.r, save_regs, sizeof(save_regs));
+                vf->cpu.cpsr = save_cpsr;
+            }
+            vf->lcd.upbase = 0x10BBEAE0;
+            if (!vf->dc_vblank_cb)
+                vf->dc_vblank_cb = 0x109D1CE0;
+            *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;
+            *(uint16_t*)(vf->ram + 0xBE49E0) = 1;
+            *(uint32_t*)(vf->ram + 0xB009C4) = 1;
+            *(uint32_t*)(vf->ram + 0xB902C0) = 3;
+            *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;
+        } else {
+            /* BOOT.BIN game: force IRQ delivery per-frame.
+             * JIT runs game code atomically — kernel sleep's brief IRQ enable
+             * window is invisible to the IRQ delivery check. Force-deliver
+             * the timer IRQ by temporarily unmasking and calling arm9_irq. */
+            if (vf->boot_phase >= 900 && ztimer_irq_pending(&vf->timer)) {
+                uint32_t save_cpsr = vf->cpu.cpsr;
+                vf->cpu.cpsr &= ~0x80; /* unmask IRQ */
+                if (vf->cpu.r13_irq < 0x10000000u || vf->cpu.r13_irq > 0x10FFFFFFu)
+                    vf->cpu.r13_irq = 0x10800000;
+                arm9_irq(&vf->cpu);
+                /* Don't restore CPSR — IRQ handler will do SUBS PC,LR,#4
+                 * which restores SPSR (which has the original CPSR saved). */
+            }
+        }
     }
 
     /* Force game pre-loop after init gets stuck.
@@ -6489,7 +6520,10 @@ void vflash_run_frame(VFlash *vf) {
          * Some games (Incredibles) run directly from BOOT.BIN (0x10C0xxxx).
          * Skip relocation for those — it would overwrite their running code! */
         int game_in_bootbin = (vf->cpu.r[15] >= 0x10C00000 && vf->cpu.r[15] < 0x10E00000);
-        if (vf->rtos_backup && !game_in_bootbin) {
+        /* RELOC-GAMELOOP: restore utility code for ALL games (including BOOT.BIN).
+         * BOOT.BIN games (Incredibles) still need utility functions at 0x109Dxxxx
+         * because their switch case handlers BL into this area. */
+        if (vf->rtos_backup) {
             uint32_t dst = 0x9D0000;
             uint32_t src = 0xC0B014; /* BOOT.BIN in RAM: 0x10C00000+0xB0014 */
             uint32_t sz = 0xA80000 - 0x9D0000; /* 704KB */
@@ -6508,11 +6542,13 @@ void vflash_run_frame(VFlash *vf) {
             vf->timer.irq.enable = 0;
             vf->timer.irq.status = 0;
         } else {
-            printf("[GAME] Running from BOOT.BIN at PC=0x%08X — skipping relocation\n",
+            /* BOOT.BIN games: keep PC as-is, preserve timer for scheduler */
+            printf("[GAME] Running from BOOT.BIN at PC=0x%08X — PC+timer preserved\n",
                    vf->cpu.r[15]);
         }
-        /* Relocate render/engine code — only for relocated-code games */
-        if (!game_in_bootbin) {
+        /* RELOC-RENDER: restore render/engine code for ALL games.
+         * BOOT.BIN games also call render functions in this area. */
+        {
             uint32_t src = 0xCBB014;
             uint32_t dst = 0xA80000;
             uint32_t sz  = 0x8DB0C;
@@ -6538,8 +6574,8 @@ void vflash_run_frame(VFlash *vf) {
                    " (render_processing[0]=%08X)\n",
                    sz, src_name, 0x10000000+src, 0x10000000+dst, first);
         }
-        /* Copy 73 unrelocated functions — only for relocated-code games */
-        if (!game_in_bootbin) {
+        /* RELOC-FIX: copy 73 unrelocated functions for ALL games. */
+        {
             uint32_t src = 0xD48B20;  /* 10D48B20: first unrelocated function */
             uint32_t dst = 0xB0DB0C;  /* 10B0DB0C: relocation target */
             uint32_t sz  = 0x18DE0;   /* 101,856 bytes covering all 73 functions */
@@ -6568,7 +6604,7 @@ void vflash_run_frame(VFlash *vf) {
     /* Game display: show PTX artwork from disc while game loop runs.
      * The native render pipeline needs entity system (TODO).
      * For now, display PTX sprite sheets as game scene visuals. */
-    if (vf->boot_phase >= 900 && (vf->frame_count % 2) == 0) {
+    if (vf->boot_phase >= 900) {
         static uint16_t *ptx_data = NULL;
         static int ptx_w = 0, ptx_h = 0;
         static int ptx_idx = 0;

@@ -41,6 +41,11 @@ VFF tile decompression: 29 tiles (1.2MB) decompressed from disc. RTOS code area
 protected from BSS clear (write protection 0x109D0000-0x10BF0000). HLE hot functions:
 software division (~40x speedup), memcpy, memset, byte copy, strcmp, event pump skip.
 
+BOOT.BIN 5A5A5A5A relocation: ROM fills literal pool placeholders during CD load;
+emulator patches code-area entries and lets init code fill data tables natively.
+BOOT.BIN games (Incredibles) run from 0x10C0xxxx with native game loop, per-frame
+forced IRQ delivery, and display controller register emulation at 0xB80001xx.
+
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spider-Man.
 
 ### Boot Flow
@@ -76,9 +81,14 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **BOOT.BIN code relocation** | ✅ 1.4MB: game loop + render + engine from CD |
 | **Display controller MMIO** | ✅ 0xB80007xx registers intercepted (VBlank, framebuffer) |
 | **Event pump HLE** | ✅ 0x10138000 data table skip (was crashing as code) |
-| **Per-slice PC escape** | ✅ Instant redirect from flash ROM / low memory |
+| **Per-frame PC recovery** | ✅ Redirect escaped PCs per-frame (not per-slice) |
+| **BOOT.BIN 5A relocation** | ✅ Code literal pools patched, data filled by init |
+| **BOOT.BIN game support** | ✅ Incredibles runs native loop at 0x10C5586C |
+| **Display controller 0x1xx** | ✅ Video mode registers read-back at 0xB80001xx |
+| **Per-frame forced IRQ** | ✅ Timer IRQ delivery for BOOT.BIN games (JIT bypass) |
+| **Per-slice IRQ delivery** | ✅ Check IRQ after each JIT slice for CPSR windows |
 | **Render processing** | 🔧 Called but draw path not yet entered (flag analysis needed) |
-| **PTX display** | ✅ Game artwork (XBGR1555 sprites) on screen |
+| **PTX display** | ✅ Game artwork (XBGR1555 sprites) on screen, no flicker |
 
 ### Remaining for gameplay
 
@@ -111,7 +121,10 @@ separate bump area at 0x390000. 10A77648 (variant) HLE'd at 0x320000.
 - Game task TCB at 0x10F00100: entry 0x10C16CC0, ready list at 0x100AC030
 - Display controller MMIO (0xB80007xx): VBlank callback, framebuffer, IRQ handler
 - Event pump HLE (0x10138000-0x10139000): skip data-as-code table
-- Per-slice PC escape: redirect from 0xB8000000+ / low ROM to game loop
+- Per-frame PC recovery: redirect escaped PCs to game loop (relocated) or idle (BOOT.BIN)
+- BOOT.BIN 5A relocation: zero data tables, patch code literal pools for init
+- Display controller 0xB80001xx: video mode register read-back for BOOT.BIN games
+- Per-slice + per-frame IRQ delivery: JIT-safe timer interrupt dispatch
 - HLE render_init (10A881F0): sets 5 ready flags, skips RTOS callbacks
 - VBlank toggle: MMIO 0x900A0018 bit25 flips on each read
 - Display list vector: 100 entity pointers at 0x10B90000
@@ -242,6 +255,13 @@ ROM[0x00] → flash copy → flash remap (0x118)
 | task_notify stuck | RTOS priority tree traversal | Skip 10A6FC60 during game phase |
 | GPU write intercept wide | All ctx writes forced to 1 | Narrow to single byte [10BE3CA0] |
 | Native alloc stuck | Game heap not initialized | HLE bump alloc at 0x390000 |
+| RELOC skipped BOOT.BIN games | Incredibles had no utility code | Apply RELOC-GAMELOOP/RENDER/FIX for all games |
+| Per-slice escape too aggressive | SpongeBob/Scooby crashed at bp800 | Moved to per-frame RECOVER |
+| PTX flicker every other frame | `frame_count % 2` skipped odd frames | Render PTX every frame |
+| BOOT.BIN 5A5A5A5A unpatched | Init crashed on 0x5A5A5A5A literals | Zero data section, patch code literal pool |
+| Per-frame state corrupted BOOT.BIN | Forced game flags broke Incredibles | Skip state manipulation for BOOT.BIN games |
+| JIT blocked IRQ delivery | CPSR I-bit window invisible to JIT | Per-slice + per-frame forced IRQ delivery |
+| Timer load zeroed after bp900 | Per-frame re-enable failed (load=0) | Restore load=37500 if zeroed |
 | VFF entry hardcoded | Only one scene worked | Dynamic entry scan (LDR+PUSH pattern) |
 | VFF section offset | Data shifted by 0x3A0 | Header is 0x60 bytes, loader uses 0x400 padded |
 | Scene callbacks stub | Tiles not decompressed | Call all 65 dispatch table callbacks |
