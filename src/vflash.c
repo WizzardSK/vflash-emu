@@ -3767,19 +3767,38 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
             *(uint32_t*)(vf2->ram + 0xBE3C50) = ((fc-1) << 8) | flags; /* ctx[4] different */
         }
         vf2->ram[0xBE3C60] = 1; /* render state byte */
-        /* Directly call HLE draw function to fill FB with test color */
-        if (*(uint32_t*)(vf2->ram + 0xFFE100) == 0xE92D4030) {
-            uint32_t sr[16]; memcpy(sr, vf2->cpu.r, sizeof(sr));
-            uint32_t sc = vf2->cpu.cpsr;
-            vf2->cpu.r[15] = 0x10FFE100;
-            vf2->cpu.r[14] = 0x10FFF000;
-            vf2->cpu.cpsr = 0x000000D3;
-            for (int i = 0; i < 200000; i++) {
-                arm9_step(&vf2->cpu);
-                if (vf2->cpu.r[15] == 0x10FFF000) break;
+        /* HLE: blit PTX artwork (8bpp with palette) to render FB as RGB565.
+         * This gives proper game scene display while tile decompression
+         * is still being reverse-engineered. */
+        if (vf2->ptx_has_pal && vf2->ptx_stride > 0) {
+            CDEntry *pe = &vf2->ptx_list[0]; /* first large PTX */
+            static uint8_t *ptx_px = NULL;
+            static int ptx_h_cached = 0;
+            if (!ptx_px && pe->size > 44) {
+                ptx_px = malloc(pe->size);
+                if (ptx_px) {
+                    cdrom_read_file(vf2->cd, pe, ptx_px, 0, pe->size);
+                    uint32_t hs = *(uint32_t*)ptx_px;
+                    ptx_h_cached = *(uint16_t*)(ptx_px + 0x0A);
+                    memmove(ptx_px, ptx_px + hs, pe->size - hs);
+                }
             }
-            memcpy(vf2->cpu.r, sr, sizeof(sr));
-            vf2->cpu.cpsr = sc;
+            if (ptx_px && ptx_h_cached > 0) {
+                uint16_t *fb = (uint16_t*)(vf2->ram + 0xBBEAE0);
+                int pw = vf2->ptx_stride;
+                for (int y = 0; y < 240; y++) {
+                    int sy = y * ptx_h_cached / 240;
+                    for (int x = 0; x < 320; x++) {
+                        int sx = x * pw / 320;
+                        uint8_t idx = ptx_px[sy * pw + sx];
+                        /* Use embedded PTX palette (ARGB32 → RGB565) */
+                        uint32_t argb = vf2->ptx_pal[idx];
+                        if (!argb && idx == 0) { fb[y*320+x] = 0; continue; }
+                        uint8_t r=(argb>>16)&0xFF, g=(argb>>8)&0xFF, b=argb&0xFF;
+                        fb[y*320+x] = ((r>>3)<<11)|((g>>2)<<5)|(b>>3);
+                    }
+                }
+            }
         }
         /* Build display list from HLE alloc entities */
         if (*(uint32_t*)(vf2->ram + 0xBE3D24) == 0) {
