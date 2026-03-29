@@ -3766,9 +3766,21 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
             *(uint32_t*)(vf2->ram + 0xBE3C4C) = (fc << 8) | flags; /* ctx[3] */
             *(uint32_t*)(vf2->ram + 0xBE3C50) = ((fc-1) << 8) | flags; /* ctx[4] different */
         }
-        /* Toggle VBlank bit RIGHT BEFORE native render runs */
-        *(uint32_t*)(vf2->ram + 0xB65A00) ^= 0x02000000;
         vf2->ram[0xBE3C60] = 1; /* render state byte */
+        /* Directly call HLE draw function to fill FB with test color */
+        if (*(uint32_t*)(vf2->ram + 0xFFE100) == 0xE92D4030) {
+            uint32_t sr[16]; memcpy(sr, vf2->cpu.r, sizeof(sr));
+            uint32_t sc = vf2->cpu.cpsr;
+            vf2->cpu.r[15] = 0x10FFE100;
+            vf2->cpu.r[14] = 0x10FFF000;
+            vf2->cpu.cpsr = 0x000000D3;
+            for (int i = 0; i < 200000; i++) {
+                arm9_step(&vf2->cpu);
+                if (vf2->cpu.r[15] == 0x10FFF000) break;
+            }
+            memcpy(vf2->cpu.r, sr, sizeof(sr));
+            vf2->cpu.cpsr = sc;
+        }
         /* Build display list from HLE alloc entities */
         if (*(uint32_t*)(vf2->ram + 0xBE3D24) == 0) {
             uint32_t arr = 0xB90000;
