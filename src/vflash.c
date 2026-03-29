@@ -6589,9 +6589,9 @@ void vflash_run_frame(VFlash *vf) {
              * 10BE3CA0 (render_ctx+0x60): polled by 10A73924.
              * 10BE49E0: another render struct polled in loops.
              * Set all bytes in render_ctx to non-zero "ready" state. */
-            memset(vf->ram + 0xBE3C40, 1, 0x100);
-            /* Also set the second render struct area */
-            memset(vf->ram + 0xBE49E0, 1, 0x100);
+            memset(vf->ram + 0xBE3C40, 0, 0x100);
+            /* Also clear the second render struct area */
+            memset(vf->ram + 0xBE49E0, 0, 0x100);
             /* Restore specific ctx values (memset fills all with 0x01010101).
              * Pointer fields MUST be set to valid addresses or 0 (NULL). */
             *(uint32_t*)(vf->ram + 0xBE3C40) = 0;  /* ctx[0] = no crash */
