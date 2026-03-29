@@ -1146,6 +1146,7 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                 case 0x1C: return vf->lcd.imsc;
                 case 0x20: return vf->lcd.ris;
                 case 0x24: return vf->lcd.ris & vf->lcd.imsc; /* MIS */
+                case 0x84: return 0x10; /* ZEVIO LCD DMA status: transfer complete (bit 4) */
                 default: return 0;
             }
         }
