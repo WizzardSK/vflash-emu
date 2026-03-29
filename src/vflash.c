@@ -6720,14 +6720,11 @@ void vflash_run_frame(VFlash *vf) {
     /* Game display: blit render framebuffer (RGB565) if game has written
      * pixels. Fall back to PTX artwork if render FB is empty. */
     if (vf->boot_phase >= 900) {
-        /* Check if render FB has game-produced pixels (not our PTX) */
-        uint32_t rfb_off = vf->lcd.upbase - VFLASH_RAM_BASE;
-        if (rfb_off < VFLASH_RAM_SIZE - 320*240*2) {
-            int nz = 0;
-            for (uint32_t pi = 0; pi < 1000 && rfb_off + pi*2 + 2 <= VFLASH_RAM_SIZE; pi++)
-                if (*(uint16_t*)(vf->ram + rfb_off + pi*2)) nz++;
-            if (nz > 100) {
-                /* Render FB has content — blit RGB565 to screen */
+        /* Check if game has written to render FB via DC registers.
+         * Only blit if dc_vblank_cb was set by game code (not our default). */
+        if (vf->dc_vblank_cb && vf->dc_vblank_cb != 0x109D1CE0) {
+            uint32_t rfb_off = vf->lcd.upbase - VFLASH_RAM_BASE;
+            if (rfb_off < VFLASH_RAM_SIZE - 320*240*2) {
                 for (int y = 0; y < VFLASH_SCREEN_H; y++)
                     for (int x = 0; x < VFLASH_SCREEN_W; x++) {
                         uint16_t p = *(uint16_t*)(vf->ram + rfb_off + (y*320+x)*2);
