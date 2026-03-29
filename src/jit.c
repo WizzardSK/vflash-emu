@@ -10,6 +10,7 @@
 #include "jit_emit.h"
 #include "arm9.h"
 #include "vflash.h"
+#include "ztimer.h"
 
 /* Block cache size */
 #define JIT_CACHE_SIZE  (16 * 1024 * 1024)  /* 16MB code cache */
@@ -754,9 +755,18 @@ int jit_run(JitContext *jit, int cycles) {
             jit->blocks_executed++;
             jit->insns_executed += count;
         } else {
-            /* Fallback: interpreter for one instruction */
+            /* Fallback: interpreter for one instruction (MSR, SWI, etc.) */
             arm9_step(cpu);
             executed++;
+            /* If this instruction enabled IRQ (e.g. MSR CPSR clearing I-bit),
+             * yield back to main loop so it can deliver pending timer IRQ.
+             * Without this, JIT runs the next block immediately and the game
+             * re-disables IRQ before the main loop gets a chance to check. */
+            if (!(cpu->cpsr & 0x80) && /* IRQ enabled */
+                (cpu->cpsr & 0x1F) != 0x12 && /* not already in IRQ mode */
+                ztimer_irq_pending(vflash_get_timer(vf))) {
+                break; /* yield to main loop for IRQ delivery */
+            }
         }
     }
     /* Periodic stats */

@@ -45,6 +45,7 @@ typedef struct VFlash    VFlash;
 
 /* JIT accessors — allows jit.c to access VFlash internals */
 void    *vflash_get_cpu(VFlash *vf);   /* returns ARM9* */
+void    *vflash_get_timer(VFlash *vf); /* returns ZevioTimer* */
 uint8_t *vflash_get_ram(VFlash *vf);
 typedef struct ARM9      ARM9;
 typedef struct CDROM     CDROM;

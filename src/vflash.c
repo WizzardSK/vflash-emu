@@ -3964,9 +3964,9 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
      * Some of these functions do useful work (CD-ROM loading) before blocking.
      * Strategy: skip ONLY the pure sleep/wait, let the others run. */
     if (((VFlash*)ctx)->boot_phase >= 800) {
-        /* Sleep/wait — return after incrementing a timeout counter.
-         * On real HW, sleep yields to scheduler which runs CD-ROM task.
-         * We return immediately but let any pending DMA complete first. */
+        /* Sleep/wait — return immediately (HLE).
+         * On real HW, sleep yields to scheduler which runs other tasks.
+         * We can't enable IRQ here — it breaks Cars' boot flow. */
         if (addr == 0x10007304 ||  /* kernel sleep wrapper */
             addr == 0x100086F0 ||  /* kernel polling sleep loop */
             addr == 0x109D1F28) {  /* peripheral wait */
@@ -7104,6 +7104,7 @@ void vflash_run_frame(VFlash *vf) {
 
 void     vflash_set_input(VFlash *vf, uint32_t buttons) { vf->input = buttons; }
 void    *vflash_get_cpu(VFlash *vf) { return &vf->cpu; }
+void    *vflash_get_timer(VFlash *vf) { return &vf->timer; }
 uint8_t *vflash_get_ram(VFlash *vf) { return vf->ram; }
 uint32_t* vflash_get_framebuffer(VFlash *vf) { return vf->framebuf; }
 
