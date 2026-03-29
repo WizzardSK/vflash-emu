@@ -234,6 +234,7 @@ struct VFlash {
     CDEntry  *ptx_list;    /* array of PTX entries on disc */
     int       ptx_count;
     int       ptx_index;   /* current displayed index */
+    int       ptx_stride;  /* pixel stride from PTX header */
     int       ptx_loaded;  /* 1 after gallery scanned */
 
     /* WAV sound list */
@@ -5497,13 +5498,14 @@ void vflash_run_frame(VFlash *vf) {
                 if (rd > 44) {
                     uint32_t hdr_sz = *(uint32_t*)ptx_buf;
                     if (hdr_sz >= 12 && hdr_sz <= 256 && hdr_sz < (uint32_t)rd) {
-                        /* Detect bpp from header +0x0C */
+                        /* Detect bpp and width from header */
                         uint32_t bpp = (hdr_sz >= 16) ? *(uint32_t*)(ptx_buf + 0x0C) : 16;
-                        uint32_t pw = 512;
+                        uint32_t pw = (hdr_sz >= 12) ? *(uint16_t*)(ptx_buf + 0x08) : 512;
+                        if (pw == 0 || pw > 2048) pw = 512;
                         const uint8_t *pdata = ptx_buf + hdr_sz;
                         uint32_t data_bytes = (uint32_t)rd - hdr_sz;
                         if (bpp == 8) {
-                            /* 8bpp indexed: 1 byte per pixel, stride 512 */
+                            /* 8bpp indexed: 1 byte per pixel */
                             uint32_t rows = data_bytes / pw;
                             uint32_t src_h = rows;
                             if (src_h > 480) src_h = 480;
@@ -5634,8 +5636,9 @@ void vflash_run_frame(VFlash *vf) {
                 if (rd > 44) {
                     uint32_t hdr_sz = *(uint32_t*)ptx_buf;
                     if (hdr_sz >= 12 && hdr_sz <= 256 && hdr_sz < (uint32_t)rd) {
-                        uint32_t pw = 512;
                         uint32_t bpp = (hdr_sz >= 16) ? *(uint32_t*)(ptx_buf + 0x0C) : 16;
+                        uint32_t pw = (hdr_sz >= 12) ? *(uint16_t*)(ptx_buf + 0x08) : 512;
+                        if (pw == 0 || pw > 2048) pw = 512;
                         const uint8_t *pdata = ptx_buf + hdr_sz;
                         uint32_t data_bytes = (uint32_t)rd - hdr_sz;
                         if (bpp == 8) {
@@ -6713,8 +6716,10 @@ void vflash_run_frame(VFlash *vf) {
                 uint8_t hdr[16];
                 cdrom_read_file(vf->cd, pe2, hdr, 0, 16);
                 ptx_bpp = *(uint32_t*)(hdr + 0x0C);
-                if (ptx_bpp != 8) ptx_bpp = 16; /* default 16bpp */
-                printf("[GAME-DISPLAY] PTX bpp=%d\n", ptx_bpp);
+                if (ptx_bpp != 8) ptx_bpp = 16;
+                vf->ptx_stride = *(uint16_t*)(hdr + 0x08);
+                if (vf->ptx_stride == 0 || vf->ptx_stride > 2048) vf->ptx_stride = 512;
+                printf("[GAME-DISPLAY] PTX bpp=%d stride=%d\n", ptx_bpp, vf->ptx_stride);
             }
             /* Clear background */
             for (int i = 0; i < VFLASH_SCREEN_W * VFLASH_SCREEN_H; i++)
@@ -6725,8 +6730,8 @@ void vflash_run_frame(VFlash *vf) {
                 if (sy >= src_h) sy = src_h - 1;
                 for (int x = 0; x < 320; x++) {
                     if (ptx_bpp == 8) {
-                        /* 8bpp indexed: byte = palette index, stride 512 bytes */
-                        uint8_t idx = ((uint8_t*)ptx_data)[sy * 512 + x];
+                        /* 8bpp indexed: byte = palette index */
+                        uint8_t idx = ((uint8_t*)ptx_data)[sy * vf->ptx_stride + x];
                         if (idx == 0) continue;
                         /* Use LCD palette (XBGR1555) if available, else grayscale */
                         if (vf->lcd.pal_written > 0) {
