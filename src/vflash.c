@@ -6749,7 +6749,7 @@ void vflash_run_frame(VFlash *vf) {
     if (vf->boot_phase >= 900) {
         /* Check if game has written to render FB via DC registers.
          * Only blit if dc_vblank_cb was set by game code (not our default). */
-        if (vf->dc_vblank_cb && vf->dc_vblank_cb != 0x109D1CE0) {
+        if (vf->dc_regs[0x40/4] != 0) { /* FB bank 0 set → render has target */
             uint32_t rfb_off = vf->lcd.upbase - VFLASH_RAM_BASE;
             if (rfb_off < VFLASH_RAM_SIZE - 320*240*2) {
                 for (int y = 0; y < VFLASH_SCREEN_H; y++)
