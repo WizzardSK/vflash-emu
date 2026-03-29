@@ -6100,14 +6100,11 @@ void vflash_run_frame(VFlash *vf) {
         }
 
         /* Ensure game loop code is intact (BSS clear may zero it).
-         * The first instruction at 0x109D1CE0 should be EB000588 (BL). */
+         * Restore from backup (post-init BOOT.BIN with correct BL targets). */
         if (vf->boot_phase >= 900 &&
-            *(uint32_t*)(vf->ram + 0x9D1CE0) == 0 && vf->cd && vf->cd->is_open) {
-            CDEntry gl_re;
-            if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &gl_re)) {
-                cdrom_read_file(vf->cd, &gl_re, vf->ram + 0x9D0000, 0xB0014,
-                                0xA80000 - 0x9D0000);
-            }
+            *(uint32_t*)(vf->ram + 0x9D1CE0) == 0 && vf->rtos_backup) {
+            memcpy(vf->ram + 0x9D0000, vf->rtos_backup + 0xC0B014,
+                   0xA80000 - 0x9D0000);
         }
 
         /* After any restore, re-set game flags (backup has them at 0).
@@ -6464,26 +6461,21 @@ void vflash_run_frame(VFlash *vf) {
             *(uint32_t*)(vf->ram + 0xBBEAE0) = 0;  /* clear sentinel */
             printf("[ENTITY] Created 8 dummy entities at %08X\n", ent_addr);
         }
-        /* Relocate game loop code from BOOT.BIN to 0x109D0000 area.
-         * BOOT.BIN source: 0x10C0CCF4 → dest 0x109D1CE0 (offset 0x23B014).
-         * Covers game main loop + surrounding functions.
-         * BL offsets are PC-relative and automatically correct after copy. */
-        if (vf->cd && vf->cd->is_open) {
-            CDEntry gl_entry;
-            if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &gl_entry)) {
-                /* Copy 0x109D0000-0x10A80000 from BOOT.BIN.
-                 * Source in file: 0xCB0014 - 0xC00000 = 0xB0014. */
-                uint32_t dst = 0x9D0000;
-                uint32_t file_off = 0xB0014; /* 0x10CB0014 - 0x10C00000 */
-                uint32_t sz = 0xA80000 - 0x9D0000; /* 0xB0000 = 704KB */
-                int rd = cdrom_read_file(vf->cd, &gl_entry,
-                            vf->ram + dst, file_off, sz);
-                if (rd > 0) {
-                    uint32_t gl_first = *(uint32_t*)(vf->ram + 0x9D1CE0);
-                    printf("[RELOC-GAMELOOP] Loaded %d bytes: BOOT.BIN+0x%X→%08X"
-                           " (game_loop[0]=%08X)\n",
-                           rd, file_off, 0x10000000 + dst, gl_first);
-                }
+        /* Relocate game code from BACKUP (post-init BOOT.BIN) to 0x109D0000.
+         * CRITICAL: use rtos_backup, NOT CD — BOOT.BIN init relocates BL targets
+         * internally, so the backup has correct PC-relative offsets while the
+         * raw CD data has pre-relocation offsets that target wrong addresses.
+         * Backup source: 0x10CB0014 (BOOT.BIN+0xB0014 in RAM at init time). */
+        if (vf->rtos_backup) {
+            uint32_t dst = 0x9D0000;
+            uint32_t src = 0xC0B014; /* BOOT.BIN in RAM: 0x10C00000+0xB0014 */
+            uint32_t sz = 0xA80000 - 0x9D0000; /* 704KB */
+            if (src + sz <= VFLASH_RAM_SIZE) {
+                memcpy(vf->ram + dst, vf->rtos_backup + src, sz);
+                uint32_t gl_first = *(uint32_t*)(vf->ram + 0x9D1CE0);
+                printf("[RELOC-GAMELOOP] Copied %d bytes from backup: %08X→%08X"
+                       " (game_loop[0]=%08X)\n",
+                       sz, 0x10000000+src, 0x10000000+dst, gl_first);
             }
         }
         vf->cpu.r[15] = 0x109D1CE0;
@@ -6491,31 +6483,35 @@ void vflash_run_frame(VFlash *vf) {
         vf->timer.timer[0].ctrl = 0;
         vf->timer.irq.enable = 0;
         vf->timer.irq.status = 0;
-        /* Relocate render/engine code from BOOT.BIN to BSS area.
-         * Relocation offset: 0x23B014 (same as RELOC-FIX below).
-         * Covers 0x10A80000-0x10B0DB0C (566KB): render_processing,
-         * division routines, render_init, tree dispatch, etc.
-         * Source: BOOT.BIN 0x10CBB014-0x10D48B20.
-         * BOOT.BIN's own init BSS-clears the source area, so we
-         * re-load BOOT.BIN from CD to get the original code. */
-        if (vf->cd && vf->cd->is_open) {
-            CDEntry boot_e;
-            if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &boot_e)) {
-                /* Reload BOOT.BIN to a temp area — only the range we need.
-                 * Source in BOOT.BIN file: 0xBB014 (= 0xCBB014 - 0xC00000).
-                 * Dest: RAM 0xA80000. Size: 0x8DB0C. */
-                uint32_t file_off = 0xBB014;
-                uint32_t dst = 0xA80000;
-                uint32_t sz  = 0x8DB0C;
-                int rd = cdrom_read_file(vf->cd, &boot_e,
-                            vf->ram + dst, file_off, sz);
-                if (rd > 0) {
-                    uint32_t first = *(uint32_t*)(vf->ram + dst + 0x9100);
-                    printf("[RELOC-RENDER] Loaded %d bytes from BOOT.BIN+0x%X→%08X"
-                           " (render_processing[0]=%08X)\n",
-                           rd, file_off, 0x10000000+dst, first);
-                }
+        /* Relocate render/engine code from BACKUP to BSS area.
+         * Source: backup 0x10CBB014 → dest 0x10A80000 (566KB).
+         * Use backup (post-init) for correct BL targets.
+         * Fallback to CD if backup area is zeroed. */
+        {
+            uint32_t src = 0xCBB014;
+            uint32_t dst = 0xA80000;
+            uint32_t sz  = 0x8DB0C;
+            uint8_t *copy_src = vf->rtos_backup;
+            const char *src_name = "backup";
+            /* Check if backup has code at this offset */
+            if (copy_src && *(uint32_t*)(copy_src + src) == 0) {
+                /* Backup area zeroed by BSS clear — fall back to CD */
+                copy_src = NULL;
             }
+            if (copy_src) {
+                memcpy(vf->ram + dst, copy_src + src, sz);
+            } else if (vf->cd && vf->cd->is_open) {
+                CDEntry boot_e;
+                if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &boot_e)) {
+                    cdrom_read_file(vf->cd, &boot_e,
+                        vf->ram + dst, src - 0xC00000, sz);
+                }
+                src_name = "CD";
+            }
+            uint32_t first = *(uint32_t*)(vf->ram + dst + 0x9100);
+            printf("[RELOC-RENDER] Copied %d bytes from %s: %08X→%08X"
+                   " (render_processing[0]=%08X)\n",
+                   sz, src_name, 0x10000000+src, 0x10000000+dst, first);
         }
         /* Copy 73 unrelocated functions from BOOT.BIN area to relocation targets.
          * BOOT.BIN bootstrap copies game code from 10C0xxxx to 109Dxxxx but never
