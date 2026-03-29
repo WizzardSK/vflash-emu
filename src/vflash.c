@@ -5527,7 +5527,8 @@ void vflash_run_frame(VFlash *vf) {
                             for (uint32_t dy = 0; dy < VFLASH_SCREEN_H; dy++) {
                                 uint32_t sy = dy * src_h / VFLASH_SCREEN_H;
                                 for (uint32_t dx = 0; dx < VFLASH_SCREEN_W; dx++) {
-                                    uint8_t idx = pdata[sy * pw + dx];
+                                    uint32_t sx = dx * pw / VFLASH_SCREEN_W;
+                                    uint8_t idx = pdata[sy * pw + sx];
                                     if (idx == 0 && !has_pal) continue;
                                     vf->framebuf[dy * VFLASH_SCREEN_W + dx] =
                                         has_pal ? pal[idx] :
@@ -5672,7 +5673,8 @@ void vflash_run_frame(VFlash *vf) {
                             for (uint32_t dy = 0; dy < VFLASH_SCREEN_H; dy++) {
                                 uint32_t sy = dy * rows / VFLASH_SCREEN_H;
                                 for (uint32_t dx = 0; dx < VFLASH_SCREEN_W; dx++) {
-                                    uint8_t idx = pdata[sy * pw + dx];
+                                    uint32_t sx = dx * pw / VFLASH_SCREEN_W;
+                                    uint8_t idx = pdata[sy * pw + sx];
                                     if (idx == 0 && !has_pal) continue;
                                     vf->framebuf[dy*VFLASH_SCREEN_W+dx] =
                                         has_pal ? pal[idx] : (0xFF000000|(idx<<16)|(idx<<8)|idx);
@@ -6814,8 +6816,9 @@ void vflash_run_frame(VFlash *vf) {
                 if (sy >= src_h) sy = src_h - 1;
                 for (int x = 0; x < 320; x++) {
                     if (ptx_bpp == 8) {
-                        /* 8bpp indexed: byte = palette index */
-                        uint8_t idx = ((uint8_t*)ptx_data)[sy * vf->ptx_stride + x];
+                        /* 8bpp indexed: byte = palette index, scale width */
+                        int sx = x * vf->ptx_stride / 320;
+                        uint8_t idx = ((uint8_t*)ptx_data)[sy * vf->ptx_stride + sx];
                         if (idx == 0 && !vf->ptx_has_pal) continue;
                         vf->framebuf[y*VFLASH_SCREEN_W+x] = vf->ptx_has_pal ?
                             vf->ptx_pal[idx] : (0xFF000000|(idx<<16)|(idx<<8)|idx);
