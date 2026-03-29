@@ -6717,9 +6717,28 @@ void vflash_run_frame(VFlash *vf) {
         vf->boot_phase = 900;
     }
 
-    /* Game display: show PTX artwork from disc while game loop runs.
-     * The native render pipeline needs entity system (TODO).
-     * For now, display PTX sprite sheets as game scene visuals. */
+    /* Game display: blit render framebuffer (RGB565) if game has written
+     * pixels. Fall back to PTX artwork if render FB is empty. */
+    if (vf->boot_phase >= 900) {
+        /* Check if render FB has game-produced pixels (not our PTX) */
+        uint32_t rfb_off = vf->lcd.upbase - VFLASH_RAM_BASE;
+        if (rfb_off < VFLASH_RAM_SIZE - 320*240*2) {
+            int nz = 0;
+            for (uint32_t pi = 0; pi < 1000 && rfb_off + pi*2 + 2 <= VFLASH_RAM_SIZE; pi++)
+                if (*(uint16_t*)(vf->ram + rfb_off + pi*2)) nz++;
+            if (nz > 100) {
+                /* Render FB has content — blit RGB565 to screen */
+                for (int y = 0; y < VFLASH_SCREEN_H; y++)
+                    for (int x = 0; x < VFLASH_SCREEN_W; x++) {
+                        uint16_t p = *(uint16_t*)(vf->ram + rfb_off + (y*320+x)*2);
+                        uint8_t r=((p>>11)&0x1F), g=((p>>5)&0x3F), b=(p&0x1F);
+                        vf->framebuf[y*VFLASH_SCREEN_W+x] = 0xFF000000 |
+                            ((r<<3|r>>2)<<16) | ((g<<2|g>>4)<<8) | (b<<3|b>>2);
+                    }
+                vf->vid.fb_dirty = 1;
+            }
+        }
+    }
     if (vf->boot_phase >= 900) {
         static uint16_t *ptx_data = NULL;
         static int ptx_w = 0, ptx_h = 0;
