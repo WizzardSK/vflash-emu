@@ -6739,7 +6739,8 @@ void vflash_run_frame(VFlash *vf) {
             }
         }
     }
-    if (vf->boot_phase >= 900) {
+    if (vf->boot_phase >= 900 && !vf->vid.fb_dirty) {
+        /* PTX fallback: only show when render FB has no game content */
         static uint16_t *ptx_data = NULL;
         static int ptx_w = 0, ptx_h = 0;
         static int ptx_idx = 0;
