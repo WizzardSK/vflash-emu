@@ -6279,6 +6279,38 @@ void vflash_run_frame(VFlash *vf) {
              * FUN_10AB1950 (entity draw) only renders when bit 25 changes.
              * Without this, tile rendering is skipped entirely. */
             *(uint32_t*)(vf->ram + 0xB65A00) = 0x02000000;
+            /* HLE entity: create a test draw function + entity + list.
+             * Proves the entity→vtable→draw pipeline works end-to-end.
+             * Draw function fills render FB with red pixels. */
+            {
+                /* ARM draw function at 0x10FFE100: fill FB with red */
+                uint32_t f = 0xFFE100;
+                *(uint32_t*)(vf->ram+f+0x00) = 0xE92D4030; /* PUSH {R4,R5,LR} */
+                *(uint32_t*)(vf->ram+f+0x04) = 0xE59F4018; /* LDR R4, =fb */
+                *(uint32_t*)(vf->ram+f+0x08) = 0xE3A02000; /* MOV R2, #0 */
+                *(uint32_t*)(vf->ram+f+0x0C) = 0xE59F3014; /* LDR R3, =color */
+                /* loop: */
+                *(uint32_t*)(vf->ram+f+0x10) = 0xE4843004; /* STR R3,[R4],#4 */
+                *(uint32_t*)(vf->ram+f+0x14) = 0xE2822001; /* ADD R2,#1 */
+                *(uint32_t*)(vf->ram+f+0x18) = 0xE3520C96; /* CMP R2,#0x9600 */
+                *(uint32_t*)(vf->ram+f+0x1C) = 0xBAFFFFFB; /* BLT loop */
+                *(uint32_t*)(vf->ram+f+0x20) = 0xE8BD8030; /* POP {R4,R5,PC} */
+                *(uint32_t*)(vf->ram+f+0x24) = 0x10BBEAE0; /* pool: FB addr */
+                *(uint32_t*)(vf->ram+f+0x28) = 0x07E007E0; /* pool: green RGB565 */
+                /* Vtable at 0x10FFE200 */
+                *(uint32_t*)(vf->ram+0xFFE200) = 0x10FFE100;
+                *(uint32_t*)(vf->ram+0xFFE204) = 0x10FFE100;
+                *(uint32_t*)(vf->ram+0xFFE208) = 0x10FFE100; /* [2]=draw */
+                /* Entity at 0x10FFE300: [0]=vtable */
+                *(uint32_t*)(vf->ram+0xFFE300) = 0x10FFE200;
+                /* Element array at 0x10FFE2F0 */
+                *(uint32_t*)(vf->ram+0xFFE2F0) = 0x10FFE300;
+                /* Entity list container at 0x10BE3CA4 */
+                *(uint32_t*)(vf->ram+0xBE3CA4) = 0x10FFE2F0; /* start */
+                *(uint32_t*)(vf->ram+0xBE3CB4) = 4;           /* stride */
+                *(uint32_t*)(vf->ram+0xBE3CB8) = 0x10FFE2F4; /* end */
+                printf("[HLE-ENTITY] Test draw entity installed\n");
+            }
             /* Set framebuffer bank addresses in DC registers 0x140-0x14C.
              * Ghidra: fb_resolver reads [0xB8000140 + bank*4] to get FB address.
              * Game video init normally writes these via switch function. */
