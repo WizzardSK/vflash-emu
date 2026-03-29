@@ -726,6 +726,24 @@ int jit_run(JitContext *jit, int cycles) {
             }
         }
 
+
+        /* Force interpreter for BOOT.BIN game code (0x10C0xxxx).
+         * JIT has a stack-relative addressing issue: LDR Rd,[SP,#imm]
+         * reads stale values when SP changes between JIT block compilation
+         * and execution. BOOT.BIN game functions use deep SP-relative
+         * addressing that triggers this. Interpreter handles it correctly. */
+        if (pc >= 0x10C00000 && pc < 0x10E00000) {
+            arm9_step(cpu);
+            executed++;
+            /* Check for IRQ yield after interpreter step */
+            if (!(cpu->cpsr & 0x80) &&
+                (cpu->cpsr & 0x1F) != 0x12 &&
+                ztimer_irq_pending(vflash_get_timer(vf))) {
+                break;
+            }
+            continue;
+        }
+
         /* Check specific HLE intercept addresses — only these need interpreter */
         if (pc == 0x10A881F0 || pc == 0x10A8CDE4 || pc == 0x10A6FC60 ||
             pc == 0x10AB085C || pc == 0x10AB889C || pc == 0x10AB7A00 ||
