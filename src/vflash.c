@@ -4862,21 +4862,32 @@ void vflash_run_frame(VFlash *vf) {
                      * entries and patch them with base+offset (0x10C00000 + file_offset).
                      * This is what the ROM's loader does during CD read. */
                     if (n5a > 100) {
-                        /* Zero ALL 5A5A5A5A entries. The init code at 0x10C0011C
-                         * writes correct values to data sections. Code literal
-                         * pools need valid writable addresses — zero is safe
-                         * (NULL writes trapped by null_trap). Only the entry at
-                         * +0x476C needs a real address (STR target). */
-                        int patched = 0;
-                        for (uint32_t a = 0x24; a < 0xC000; a += 4) {
+                        /* ROM 5A5A5A5A relocation: the ROM patches all 5A entries
+                         * during CD read. The algorithm generates a 4096-entry
+                         * lookup table: value = (index << 20) | 0x0DF2.
+                         * Index assignment: sequential from +0x4000, skipping
+                         * non-5A gaps, wrapping to +0x0260 after +0x425F.
+                         * All games share the same BOOT.BIN 5A layout. */
+                        int patched = 0, idx = 0;
+                        /* Phase 1: +0x4000 to end of data (includes +0x476C) */
+                        for (uint32_t a = 0x4000; a < 0xC000; a += 4) {
                             if (*(uint32_t*)(vf->ram + 0xC00000 + a) == 0x5A5A5A5A) {
-                                *(uint32_t*)(vf->ram + 0xC00000 + a) = 0;
-                                patched++;
+                                *(uint32_t*)(vf->ram + 0xC00000 + a) =
+                                    ((uint32_t)idx << 20) | 0x0DF2;
+                                idx++; patched++;
                             }
                         }
-                        /* Patch +0x476C to safe scratch addr (init writes here) */
-                        *(uint32_t*)(vf->ram + 0xC0476C) = 0x10FFE080;
-                        printf("[BOOT-RELOC] Zeroed %d 5A5A5A5A entries (+0x476C→scratch)\n", patched);
+                        /* Phase 2: +0x0260 to +0x3FFF (wrap) */
+                        for (uint32_t a = 0x260; a < 0x4000; a += 4) {
+                            if (*(uint32_t*)(vf->ram + 0xC00000 + a) == 0x5A5A5A5A) {
+                                *(uint32_t*)(vf->ram + 0xC00000 + a) =
+                                    ((uint32_t)idx << 20) | 0x0DF2;
+                                idx++; patched++;
+                            }
+                        }
+                        /* Header padding (+0x24-0x25F): leave as 5A (not patched by ROM) */
+                        printf("[BOOT-RELOC] Patched %d entries (idx 0-%d, formula: idx<<20|0xDF2)\n",
+                               patched, idx - 1);
                     }
                 }
                 vf->cpu.null_trap_enabled = 1;
