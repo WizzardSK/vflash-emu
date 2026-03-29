@@ -5509,9 +5509,10 @@ void vflash_run_frame(VFlash *vf) {
                             uint32_t sy = dy * src_h / VFLASH_SCREEN_H;
                             for (uint32_t dx = 0; dx < src_w; dx++) {
                                 uint16_t p = px[sy * 2 * pw + dx]; /* even rows */
-                                uint8_t b = ((p >> 10) & 0x1F) << 3;
-                                uint8_t g = ((p >> 5)  & 0x1F) << 3;
-                                uint8_t r = ( p        & 0x1F) << 3;
+                                uint8_t b5 = ((p >> 10) & 0x1F), g5 = ((p >> 5) & 0x1F), r5 = (p & 0x1F);
+                                uint8_t r = (r5 << 3) | (r5 >> 2);
+                                uint8_t g = (g5 << 3) | (g5 >> 2);
+                                uint8_t b = (b5 << 3) | (b5 >> 2);
                                 vf->framebuf[dy * VFLASH_SCREEN_W + dx] =
                                     0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
                             }
@@ -5624,9 +5625,10 @@ void vflash_run_frame(VFlash *vf) {
                             uint32_t sy = dy * src_h / VFLASH_SCREEN_H;
                             for (uint32_t dx = 0; dx < src_w; dx++) {
                                 uint16_t p = px[sy * 2 * pw + dx];
-                                uint8_t b = ((p >> 10) & 0x1F) << 3;
-                                uint8_t g = ((p >> 5)  & 0x1F) << 3;
-                                uint8_t r = ( p        & 0x1F) << 3;
+                                uint8_t b5 = ((p >> 10) & 0x1F), g5 = ((p >> 5) & 0x1F), r5 = (p & 0x1F);
+                                uint8_t r = (r5 << 3) | (r5 >> 2);
+                                uint8_t g = (g5 << 3) | (g5 >> 2);
+                                uint8_t b = (b5 << 3) | (b5 >> 2);
                                 vf->framebuf[dy * VFLASH_SCREEN_W + dx] =
                                     0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
                             }
@@ -6684,10 +6686,12 @@ void vflash_run_frame(VFlash *vf) {
                     if (sx >= ptx_w) sx = ptx_w - 1;
                     uint16_t p = ptx_data[sy * 2 * 512 + sx]; /* even rows */
                     if (p == 0) continue; /* transparent */
-                    /* XBGR1555: R=bits0-4, G=bits5-9, B=bits10-14 */
-                    uint8_t r = (p & 0x1F) << 3;
-                    uint8_t g = ((p >> 5) & 0x1F) << 3;
-                    uint8_t b = ((p >> 10) & 0x1F) << 3;
+                    /* XBGR1555: R=bits0-4, G=bits5-9, B=bits10-14
+                     * Expand 5-bit to 8-bit by replicating top bits into bottom */
+                    uint8_t r5 = (p & 0x1F), g5 = ((p >> 5) & 0x1F), b5 = ((p >> 10) & 0x1F);
+                    uint8_t r = (r5 << 3) | (r5 >> 2);
+                    uint8_t g = (g5 << 3) | (g5 >> 2);
+                    uint8_t b = (b5 << 3) | (b5 >> 2);
                     vf->framebuf[y * VFLASH_SCREEN_W + x] =
                         0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
                 }
