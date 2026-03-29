@@ -6108,13 +6108,17 @@ void vflash_run_frame(VFlash *vf) {
         /* Ensure framebuffer at 0x10BBEAE0 is addressable (render writes RGB565 here) */
         if (*(uint32_t*)(vf->ram + 0xBBEAE0) == 0)
             *(uint32_t*)(vf->ram + 0xBBEAE0) = 0x00010001; /* non-zero sentinel */
-        /* Set lcd.upbase to render pipeline's framebuffer */
+        /* Set lcd.upbase to render pipeline's framebuffer.
+         * Also set dc_vblank_cb so LCD blit is enabled. */
         vf->lcd.upbase = 0x10BBEAE0;
+        if (!vf->dc_vblank_cb)
+            vf->dc_vblank_cb = 0x109D1CE0; /* game loop as placeholder */
         *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;  /* render enable flag */
         *(uint16_t*)(vf->ram + 0xBE49E0) = 1;
         *(uint32_t*)(vf->ram + 0xB009C4) = 1;
         *(uint32_t*)(vf->ram + 0xB902C0) = 3;
         *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;
+        }
     }
 
     /* Force game pre-loop after init gets stuck.
@@ -6343,10 +6347,10 @@ void vflash_run_frame(VFlash *vf) {
                 }
             }
         }
-        /* Clear the 960KB render buffer */
-        memset(vf->ram + 0x48000, 0, 0xF0000);
-        /* Load PTX game artwork to the render buffer at 0x10048000.
+        /* Load PTX game artwork to BOTH the old render buffer (0x10048000)
+         * AND the render pipeline's framebuffer (0x10BBEAE0).
          * Decode XBGR1555 → RGB565 for LCD blit. */
+        memset(vf->ram + 0xBBEAE0, 0, 320*240*2); /* clear render FB */
         if (vf->cd && vf->cd->is_open && vf->ptx_count > 0) {
             CDEntry *pe = &vf->ptx_list[0];
             uint8_t *ptx_buf = malloc(pe->size);
@@ -6371,7 +6375,10 @@ void vflash_run_frame(VFlash *vf) {
                                 fb[dy * 320 + dx] = (r << 11) | (g << 6) | b;
                             }
                         }
-                        printf("[PTX-FB] Loaded %s to render buffer\n", pe->name);
+                        /* Also copy to render pipeline's framebuffer */
+                        uint16_t *fb2 = (uint16_t*)(vf->ram + 0xBBEAE0);
+                        memcpy(fb2, fb, 320*240*2);
+                        printf("[PTX-FB] Loaded %s to render buffer + 0x10BBEAE0\n", pe->name);
                     }
                 }
                 free(ptx_buf);
@@ -6410,10 +6417,22 @@ void vflash_run_frame(VFlash *vf) {
             memset(vf->ram + 0xBE3C40, 1, 0x100);
             /* Also set the second render struct area */
             memset(vf->ram + 0xBE49E0, 1, 0x100);
-            /* Restore specific ctx values */
+            /* Restore specific ctx values (memset fills all with 0x01010101).
+             * Pointer fields MUST be set to valid addresses or 0 (NULL). */
             *(uint32_t*)(vf->ram + 0xBE3C40) = 0;  /* ctx[0] = no crash */
             *(uint32_t*)(vf->ram + 0xBE3C44) = 1;  /* ctx[1] = frame */
-            *(uint32_t*)(vf->ram + 0xBE3C4C) = 0;  /* ctx[3] = no flags */
+            *(uint32_t*)(vf->ram + 0xBE3C4C) = 0;  /* ctx[3] = current frame */
+            *(uint32_t*)(vf->ram + 0xBE3C50) = 0;  /* ctx[4] = last processed */
+            /* Display list pointers — NULL until entities exist */
+            *(uint32_t*)(vf->ram + 0xBE3D20) = 0;  /* display list ptr */
+            *(uint32_t*)(vf->ram + 0xBE3D24) = 0;  /* display list array */
+            *(uint32_t*)(vf->ram + 0xBE3D28) = 0;  /* count */
+            *(uint32_t*)(vf->ram + 0xBE3D2C) = 0;
+            *(uint32_t*)(vf->ram + 0xBE3D30) = 0;
+            *(uint32_t*)(vf->ram + 0xBE3D34) = 0;
+            *(uint32_t*)(vf->ram + 0xBE3D38) = 0;
+            /* Framebuffer address for render pipeline */
+            *(uint32_t*)(vf->ram + 0xBBEAE0) = 0;  /* clear sentinel */
             printf("[ENTITY] Created 8 dummy entities at %08X\n", ent_addr);
         }
         /* Relocate game loop code from BOOT.BIN to 0x109D0000 area.
