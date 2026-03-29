@@ -6476,8 +6476,9 @@ void vflash_run_frame(VFlash *vf) {
                 }
             }
         }
-        /* Set up LCD controller */
-        vf->lcd.upbase = 0x10048000; /* game's own render buffer */
+        /* Set up LCD controller.
+         * Don't set upbase — let render code set it via DC reg 0xB80007B0.
+         * 0x10048000 was kernel code, not a framebuffer! */
         vf->lcd.control = 0x082D; /* 16bpp565, TFT, power, enabled */
         vf->boot_phase = 900;
     }
@@ -6762,9 +6763,12 @@ void vflash_run_frame(VFlash *vf) {
     /* PL111 LCD framebuffer blit: only when game actually writes to LCD
      * (not during asset browser mode where MJP/PTX write directly to framebuf).
      * Skip if video is playing or if the LCD framebuffer hasn't been written by game code. */
+    /* Only LCD blit when render pipeline has set a valid framebuffer via DC.
+     * dc_vblank_cb != 0 means render code configured the display controller. */
     if ((vf->lcd.control & 1) && vf->lcd.upbase >= VFLASH_RAM_BASE &&
         vf->lcd.upbase < VFLASH_RAM_BASE + VFLASH_RAM_SIZE && !vf->vid.fb_dirty &&
-        !vf->mjp_player.playing && (!vf->ptx_loaded || vf->boot_phase >= 900)) {
+        !vf->mjp_player.playing && vf->dc_vblank_cb &&
+        (!vf->ptx_loaded || vf->boot_phase >= 900)) {
         uint32_t fb_off = vf->lcd.upbase - VFLASH_RAM_BASE;
         uint32_t bpp_code = (vf->lcd.control >> 1) & 7;
         /* BPP: 1=2bpp, 2=4bpp, 3=8bpp, 4=16bpp, 5=24bpp, 6=16bpp565 */
