@@ -1342,12 +1342,8 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                     if (v) printf("[BOOT-FLAG] Read 0x900A000C = 0x%08X (warm=%d)\n", v, (v>>1)&1);
                     return v;
                 }
-                case 0x18: {
-                    /* System status register. Bit 25 is checked by render
-                     * pipeline (through debounce at 0x10A59000) to trigger
-                     * entity draw. Set bit 25 permanently. */
-                    return vf->misc_regs[0x18 >> 2] | 0x02000000;
-                }
+                case 0x18:
+                    return vf->misc_regs[0x18 >> 2];
                 case 0x28: return 0x00000000; /* ASIC ID low */
                 case 0x2C: return 0x00000000; /* ASIC ID high */
                 default:
@@ -6227,8 +6223,10 @@ void vflash_run_frame(VFlash *vf) {
              * Also reset render context so render_processing doesn't skip. */
             *(uint32_t*)(vf->ram + 0xBE3C40) = 0;
             *(uint32_t*)(vf->ram + 0xBE3C44) = 1;
-            /* Toggle VBlank bit 25 each frame so entity draw triggers */
-            *(uint32_t*)(vf->ram + 0xB65A00) ^= 0x02000000;
+            /* Toggle bit 25 in system status register 0x900A0018 per-frame.
+             * Debounce at 0x10A59000 needs STABLE signal per frame, not per-read.
+             * Toggle misc_regs so next read returns changed bit. */
+            vf->misc_regs[0x18 >> 2] ^= 0x02000000;
             *(uint32_t*)(vf->ram + 0xBE3C4C) = (uint32_t)vf->frame_count;
             *(uint32_t*)(vf->ram + 0xBE3C50) = (uint32_t)vf->frame_count - 1;
             vf->ram[0xBE3C60] = 1;
