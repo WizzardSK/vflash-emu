@@ -3763,9 +3763,16 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         static int r_log = 0;
         VFlash *vf2 = (VFlash*)ctx;
         if (r_log < 3) r_log++;
-        /* Set dirty flag and populate display list */
-        *(uint32_t*)(vf2->ram + 0xBE3C40) = 1;
-        *(uint32_t*)(vf2->ram + 0xBE3C4C) = 3;
+        /* Set frame-ready and advance frame counter so ctx[3] != ctx[4].
+         * Ghidra: render_processing skips if param_1[3] == param_1[4].
+         * ctx[3] is also a bitfield: bit0=tiles, bit1=sprites, bit2=overlay. */
+        *(uint32_t*)(vf2->ram + 0xBE3C44) = 1; /* frame ready */
+        {
+            uint32_t fc = vf2->frame_count;
+            uint32_t flags = 0x1F; /* all render layers enabled */
+            *(uint32_t*)(vf2->ram + 0xBE3C4C) = (fc << 8) | flags; /* ctx[3] */
+            *(uint32_t*)(vf2->ram + 0xBE3C50) = ((fc-1) << 8) | flags; /* ctx[4] different */
+        }
         /* Build display list from HLE alloc entities */
         if (*(uint32_t*)(vf2->ram + 0xBE3D24) == 0) {
             uint32_t arr = 0xB90000;
