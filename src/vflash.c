@@ -1151,8 +1151,9 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             uint32_t foff = off - 0x38000000u;
 
             /* Display controller registers at 0xB8000700-0xB80007FF (reads).
-             * Return safe defaults so render code doesn't branch to ROM. */
-            if (foff >= 0x700 && foff < 0x800) {
+             * Return safe defaults so render code doesn't branch to ROM.
+             * Only during game phase — early boot uses this range for flash polling. */
+            if (foff >= 0x700 && foff < 0x800 && vf->boot_phase >= 800) {
                 switch (foff) {
                 case 0x770: return 1;    /* status: ready */
                 case 0x774: return 0;    /* clear */
@@ -1839,8 +1840,9 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
 
             /* Display controller registers at 0xB8000700-0xB80007FF.
              * Render code writes VBlank callback, framebuffer pointer, etc.
-             * These are NOT flash commands — intercept before flash handler. */
-            if (foff >= 0x700 && foff < 0x800) {
+             * These are NOT flash commands — intercept before flash handler.
+             * Only during game phase to avoid breaking ROM flash polling. */
+            if (foff >= 0x700 && foff < 0x800 && vf->boot_phase >= 800) {
                 static int dc_log = 0;
                 if (dc_log < 20) {
                     printf("[DC] Write 0x%08X = 0x%08X PC=%08X\n",
@@ -6084,9 +6086,14 @@ void vflash_run_frame(VFlash *vf) {
         }
 
         /* After any restore, re-set game flags (backup has them at 0).
-         * Also reset render context so render_processing doesn't skip. */
+         * Also reset render context so render_processing doesn't skip.
+         * ctx[3] must differ from ctx[4] each frame (frame counter vs last processed). */
         *(uint32_t*)(vf->ram + 0xBE3C40) = 0;  /* ctx[0] = 0 (no error) */
         *(uint32_t*)(vf->ram + 0xBE3C44) = 1;  /* ctx[1] = 1 (frame ready) */
+        /* ctx[3] == ctx[4]: render_processing skips draw path.
+         * Setting ctx[3] != ctx[4] enters draw path but causes massive
+         * slowdown (BSS function calls in render pipeline hit HLE intercepts).
+         * TODO: populate BSS render dependencies first, then enable. */
         *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;  /* render enable flag */
         *(uint16_t*)(vf->ram + 0xBE49E0) = 1;
         *(uint32_t*)(vf->ram + 0xB009C4) = 1;
