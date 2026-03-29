@@ -266,6 +266,8 @@ ROM[0x00] → flash copy → flash remap (0x118)
 | JIT blocked IRQ delivery | CPSR I-bit window invisible to JIT | JIT yield after MSR CPSR enables IRQ |
 | Timer load zeroed after bp900 | Per-frame re-enable failed (load=0) | Restore load=37500 if zeroed |
 | LCD 0x84 DMA spin-wait | Incredibles BEQ self at 0x10C5D3B4 | Return bit 4 set (transfer complete) |
+| PTX decoded as 16bpp | 8bpp indexed shown as psychedelic colors | Detect bpp from header +0x0C, use LCD palette |
+| PTX stride hardcoded 512 | Horizontal banding on 1024-wide images | Read width from header +0x08 |
 | VFF entry hardcoded | Only one scene worked | Dynamic entry scan (LDR+PUSH pattern) |
 | VFF section offset | Data shifted by 0x3A0 | Header is 0x60 bytes, loader uses 0x400 padded |
 | Scene callbacks stub | Tiles not decompressed | Call all 65 dispatch table callbacks |
@@ -283,7 +285,7 @@ ROM[0x00] → flash copy → flash remap (0x118)
 - ATAPI CD-ROM: INQUIRY, READ(10), READ CD, READ TOC, READ CAPACITY, MODE SENSE
 - MJP video: byte-swap, byte-stuffing restore, in-place decode, scaling
 - IMA ADPCM + PCM WAV audio, 22050→44100Hz stereo resampling
-- PTX: XBGR1555, 512px stride, interleaved scene/sprite
+- PTX: 8bpp indexed (palette from LCD) or 16bpp XBGR1555, stride from header
 - VFF: "vfD0" container, 3 sections (ARM script + tile descriptors/pixels + tilemap)
 - VFF tile decompression: scene callbacks decompress 8bpp tiles (29 tiles, 1.2MB)
 - ISO 9660 with recursive search, BIN/CUE auto-detect
