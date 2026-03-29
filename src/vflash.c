@@ -4259,13 +4259,16 @@ void vflash_run_frame(VFlash *vf) {
         ztimer_tick(&vf->timer, actual);
         done += (int)actual;
 
-        /* Per-slice PC escape check: if render code branches to flash ROM
-         * (0xB8000000+) or other non-RAM areas, redirect to game loop. */
-        if (vf->boot_phase >= 900) {
+        /* Per-slice PC escape check: redirect if PC leaves valid code areas.
+         * Active from boot_phase 800+ (game init can also escape). */
+        if (vf->boot_phase >= 800) {
             uint32_t esc_pc = vf->cpu.r[15];
-            if ((esc_pc >= 0xB8000000u && esc_pc < 0xB8200000u) ||
-                (esc_pc < 0x10000000u && esc_pc > 0x1000u)) {
-                vf->cpu.r[15] = 0x109D1CE0;
+            int escaped = (esc_pc >= 0xB8000000u) ||
+                          (esc_pc < 0x10000000u && esc_pc > 0x1000u) ||
+                          (esc_pc >= 0x11000000u && esc_pc < 0xB8000000u);
+            if (escaped) {
+                /* Redirect to idle (game-agnostic, works for all games) */
+                vf->cpu.r[15] = 0x10FFF000;
                 vf->cpu.cpsr = 0x000000D3;
             }
         }
