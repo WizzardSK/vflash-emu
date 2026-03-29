@@ -265,9 +265,44 @@ static int compile_data_processing(EmitBuf *e, uint32_t insn, uint32_t pc) {
     if (S) {
 flags_only:
         /* Update CPSR N, Z flags from result/comparison.
-         * Simple approach: compute N and Z from EDX (or flags). */
-        if (opcode != 8 && opcode != 10 && opcode != 11) {
-            /* N and Z from result in EDX */
+         * Original code: compute from EDX result for data processing with S.
+         * FIX: also handle CMP/TST/CMN which jump here via goto. */
+        if (opcode == 8 || opcode == 10 || opcode == 11) {
+            /* CMP/TST/CMN: x86 flags set by cmp/test/add.
+             * Capture via LAHF before any flag-clobbering ops. */
+            emit8(e, 0x9F); /* LAHF → AH = SF:ZF:0:AF:0:PF:1:CF */
+            emit_mov_r32_r32(e, RCX, RAX);
+            emit_shr_r32_imm(e, RCX, 8); /* CL = flags byte */
+
+            emit_ldr_disp32(e, RAX, REG_CPU, ARM_CPSR);
+            emit_and_r32_imm32(e, RAX, 0x0FFFFFFF);
+
+            /* Z: CL bit 6 → CPSR bit 30 */
+            emit_mov_r32_r32(e, RDX, RCX);
+            emit_and_r32_imm32(e, RDX, 0x40);
+            emit_shl_r32_imm(e, RDX, 24);
+            emit_or_r32_r32(e, RAX, RDX);
+            /* N: CL bit 7 → CPSR bit 31 */
+            emit_mov_r32_r32(e, RDX, RCX);
+            emit_and_r32_imm32(e, RDX, 0x80);
+            emit_shl_r32_imm(e, RDX, 24);
+            emit_or_r32_r32(e, RAX, RDX);
+            /* C: CL bit 0. CMP: ARM C = !CF (inverted) */
+            emit_mov_r32_r32(e, RDX, RCX);
+            emit_and_r32_imm32(e, RDX, 1);
+            if (opcode == 10) {
+                /* Invert: C = 1 - CF */
+                emit_mov_r32_imm32(e, RSI, 1);
+                emit_sub_r32_r32(e, RSI, RDX);
+                emit_mov_r32_r32(e, RDX, RSI);
+            }
+            emit_shl_r32_imm(e, RDX, 29);
+            emit_or_r32_r32(e, RAX, RDX);
+
+            emit_str_disp32(e, REG_CPU, RAX, ARM_CPSR);
+        } else {
+            /* Non-comparison S-bit ops: N and Z from result in EDX.
+             * Original code preserved — only added CMP path above. */
             emit_load_arm_reg(e, RAX, -1); /* load CPSR */
             emit_ldr_disp32(e, RAX, REG_CPU, ARM_CPSR);
             emit_and_r32_imm32(e, RAX, 0x0FFFFFFF); /* clear N,Z,C,V */
@@ -280,7 +315,6 @@ flags_only:
             emit_or_r32_r32(e, RAX, RCX);
             /* N flag: bit 31 of EDX */
             emit_mov_r32_r32(e, RCX, RDX);
-            emit_shr_r32_imm(e, RCX, 3); /* bit 31 → bit 28 (N position) */
             emit_and_r32_imm32(e, RCX, 0x80000000);
             emit_or_r32_r32(e, RAX, RCX);
             emit_str_disp32(e, REG_CPU, RAX, ARM_CPSR);
@@ -727,22 +761,6 @@ int jit_run(JitContext *jit, int cycles) {
         }
 
 
-        /* Force interpreter for BOOT.BIN game code (0x10C0xxxx).
-         * JIT has a stack-relative addressing issue: LDR Rd,[SP,#imm]
-         * reads stale values when SP changes between JIT block compilation
-         * and execution. BOOT.BIN game functions use deep SP-relative
-         * addressing that triggers this. Interpreter handles it correctly. */
-        if (pc >= 0x10C00000 && pc < 0x10E00000) {
-            arm9_step(cpu);
-            executed++;
-            /* Check for IRQ yield after interpreter step */
-            if (!(cpu->cpsr & 0x80) &&
-                (cpu->cpsr & 0x1F) != 0x12 &&
-                ztimer_irq_pending(vflash_get_timer(vf))) {
-                break;
-            }
-            continue;
-        }
 
         /* Check specific HLE intercept addresses — only these need interpreter */
         if (pc == 0x10A881F0 || pc == 0x10A8CDE4 || pc == 0x10A6FC60 ||
