@@ -6121,20 +6121,12 @@ void vflash_run_frame(VFlash *vf) {
         /* Ensure framebuffer at 0x10BBEAE0 is addressable (render writes RGB565 here) */
         if (*(uint32_t*)(vf->ram + 0xBBEAE0) == 0)
             *(uint32_t*)(vf->ram + 0xBBEAE0) = 0x00010001; /* non-zero sentinel */
-        /* Write button state to game input variables per-frame.
-         * The native input driver (0x10A37024) reads from 0x900D0000 and
-         * writes to context+0xE0, but it's never called (event system not init'd).
-         * Bypass: write directly to likely input locations in game RAM. */
-        {
-            uint32_t btn = vf->input;
-            uint32_t btn_inv = (~btn) & 0x1FF; /* active-low for game code */
-            /* Game context input field (driver writes to ctx+0xE0) */
-            if (*(uint32_t*)(vf->ram + 0xB668A0) >= 0x10000000)
-                *(uint32_t*)(vf->ram + 0xB66980) = btn_inv;
-            /* Direct input state variables */
-            *(uint32_t*)(vf->ram + 0xBE49F0) = btn;     /* input raw */
-            *(uint32_t*)(vf->ram + 0xBE49F4) = btn_inv; /* input active-low */
-        }
+        /* Write button state to game input variable at 0x10AFDE50.
+         * Found via TST pattern search: game checks button bitmask here.
+         * Refs: LDR R0/R1,=0x10AFDE50 at 0x109D17A8 and 0x109D19DC.
+         * Bitmask: bit0=Up, bit1=Down, bit2=Left, bit3=Right,
+         * bit4=Red, bit5=Yellow, bit6=Green, bit7=Blue, bit8=Enter */
+        *(uint32_t*)(vf->ram + 0xAFDE50) = vf->input;
         /* Set lcd.upbase to render pipeline's framebuffer.
          * Also set dc_vblank_cb so LCD blit is enabled. */
         vf->lcd.upbase = 0x10BBEAE0;
