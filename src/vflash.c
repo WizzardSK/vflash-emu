@@ -235,6 +235,8 @@ struct VFlash {
     int       ptx_count;
     int       ptx_index;   /* current displayed index */
     int       ptx_stride;  /* pixel stride from PTX header */
+    uint32_t  ptx_pal[256]; /* embedded ARGB32 palette from PTX tail */
+    int       ptx_has_pal;  /* palette extracted */
     int       ptx_loaded;  /* 1 after gallery scanned */
 
     /* WAV sound list */
@@ -5505,21 +5507,36 @@ void vflash_run_frame(VFlash *vf) {
                         const uint8_t *pdata = ptx_buf + hdr_sz;
                         uint32_t data_bytes = (uint32_t)rd - hdr_sz;
                         if (bpp == 8) {
-                            /* 8bpp indexed: 1 byte per pixel */
-                            uint32_t rows = data_bytes / pw;
+                            /* 8bpp indexed: 1 byte per pixel.
+                             * Palette: 256×XBGR1555 at end of image data. */
+                            uint32_t img_sz = pw * (*(uint16_t*)(ptx_buf + 0x0A));
+                            uint32_t rows = img_sz / pw;
+                            uint32_t pal_off = img_sz;
+                            uint32_t pal[256];
+                            int has_pal = (pal_off + 512 <= data_bytes);
+                            if (has_pal) {
+                                for (int i = 0; i < 256; i++) {
+                                    uint16_t p = *(uint16_t*)(pdata + pal_off + i*2);
+                                    uint8_t r5=p&0x1F, g5=(p>>5)&0x1F, b5=(p>>10)&0x1F;
+                                    pal[i] = 0xFF000000 | ((r5<<3|r5>>2)<<16) |
+                                             ((g5<<3|g5>>2)<<8) | (b5<<3|b5>>2);
+                                }
+                            }
                             uint32_t src_h = rows;
                             if (src_h > 480) src_h = 480;
                             for (uint32_t dy = 0; dy < VFLASH_SCREEN_H; dy++) {
                                 uint32_t sy = dy * src_h / VFLASH_SCREEN_H;
                                 for (uint32_t dx = 0; dx < VFLASH_SCREEN_W; dx++) {
                                     uint8_t idx = pdata[sy * pw + dx];
-                                    if (idx == 0) continue;
+                                    if (idx == 0 && !has_pal) continue;
                                     vf->framebuf[dy * VFLASH_SCREEN_W + dx] =
-                                        0xFF000000 | (idx<<16) | (idx<<8) | idx;
+                                        has_pal ? pal[idx] :
+                                        (0xFF000000 | (idx<<16) | (idx<<8) | idx);
                                 }
                             }
-                            printf("[PTX] Displayed %s (8bpp %ux%u grayscale)\n",
-                                   ptx_entry.name, pw, rows);
+                            printf("[PTX] Displayed %s (8bpp %ux%u %s)\n",
+                                   ptx_entry.name, pw, rows,
+                                   has_pal ? "palette" : "grayscale");
                         } else {
                             /* 16bpp XBGR1555: interlaced rows, stride 512 */
                             uint32_t total_rows = data_bytes / (pw * 2);
@@ -5642,14 +5659,23 @@ void vflash_run_frame(VFlash *vf) {
                         const uint8_t *pdata = ptx_buf + hdr_sz;
                         uint32_t data_bytes = (uint32_t)rd - hdr_sz;
                         if (bpp == 8) {
-                            uint32_t rows = data_bytes / pw;
+                            uint32_t ph = (hdr_sz >= 12) ? *(uint16_t*)(ptx_buf + 0x0A) : 256;
+                            uint32_t img_sz = pw * ph;
+                            uint32_t rows = ph;
+                            uint32_t pal[256]; int has_pal = (img_sz + 512 <= data_bytes);
+                            if (has_pal)
+                                for (int i = 0; i < 256; i++) {
+                                    uint16_t p = *(uint16_t*)(pdata + img_sz + i*2);
+                                    uint8_t r5=p&0x1F,g5=(p>>5)&0x1F,b5=(p>>10)&0x1F;
+                                    pal[i]=0xFF000000|((r5<<3|r5>>2)<<16)|((g5<<3|g5>>2)<<8)|(b5<<3|b5>>2);
+                                }
                             for (uint32_t dy = 0; dy < VFLASH_SCREEN_H; dy++) {
                                 uint32_t sy = dy * rows / VFLASH_SCREEN_H;
                                 for (uint32_t dx = 0; dx < VFLASH_SCREEN_W; dx++) {
                                     uint8_t idx = pdata[sy * pw + dx];
-                                    if (idx == 0) continue;
+                                    if (idx == 0 && !has_pal) continue;
                                     vf->framebuf[dy*VFLASH_SCREEN_W+dx] =
-                                        0xFF000000 | (idx<<16) | (idx<<8) | idx;
+                                        has_pal ? pal[idx] : (0xFF000000|(idx<<16)|(idx<<8)|idx);
                                 }
                             }
                         } else {
@@ -6739,7 +6765,28 @@ void vflash_run_frame(VFlash *vf) {
                 if (ptx_bpp != 8) ptx_bpp = 16;
                 vf->ptx_stride = *(uint16_t*)(hdr + 0x08);
                 if (vf->ptx_stride == 0 || vf->ptx_stride > 2048) vf->ptx_stride = 512;
-                printf("[GAME-DISPLAY] PTX bpp=%d stride=%d\n", ptx_bpp, vf->ptx_stride);
+                /* Extract embedded palette from PTX tail (256 × XBGR1555) */
+                if (ptx_bpp == 8) {
+                    uint32_t ph = *(uint16_t*)(hdr + 0x0A);
+                    uint32_t img_sz = vf->ptx_stride * ph;
+                    uint32_t total = ptx_w > 0 ? (uint32_t)(ptx_h * 512 * 2) : 0;
+                    /* ptx_data has data_bytes; palette at img_sz offset */
+                    CDEntry *pe3 = &vf->ptx_list[ptx_idx];
+                    uint8_t pal_buf[512];
+                    uint32_t pal_file_off = *(uint32_t*)(hdr) + img_sz;
+                    int prd = cdrom_read_file(vf->cd, pe3, pal_buf, pal_file_off, 512);
+                    if (prd == 512) {
+                        for (int i = 0; i < 256; i++) {
+                            uint16_t p = *(uint16_t*)(pal_buf + i*2);
+                            uint8_t r5=p&0x1F,g5=(p>>5)&0x1F,b5=(p>>10)&0x1F;
+                            vf->ptx_pal[i]=0xFF000000|((r5<<3|r5>>2)<<16)|
+                                ((g5<<3|g5>>2)<<8)|(b5<<3|b5>>2);
+                        }
+                        vf->ptx_has_pal = 1;
+                    }
+                }
+                printf("[GAME-DISPLAY] PTX bpp=%d stride=%d pal=%d\n",
+                       ptx_bpp, vf->ptx_stride, vf->ptx_has_pal);
             }
             /* Clear background */
             for (int i = 0; i < VFLASH_SCREEN_W * VFLASH_SCREEN_H; i++)
@@ -6752,19 +6799,9 @@ void vflash_run_frame(VFlash *vf) {
                     if (ptx_bpp == 8) {
                         /* 8bpp indexed: byte = palette index */
                         uint8_t idx = ((uint8_t*)ptx_data)[sy * vf->ptx_stride + x];
-                        if (idx == 0) continue;
-                        /* Use LCD palette (XBGR1555) if available, else grayscale */
-                        if (vf->lcd.pal_written > 0) {
-                            uint16_t p = vf->lcd.palette[idx];
-                            uint8_t r5 = (p & 0x1F), g5 = ((p>>5)&0x1F), b5 = ((p>>10)&0x1F);
-                            vf->framebuf[y*VFLASH_SCREEN_W+x] = 0xFF000000 |
-                                (((r5<<3)|(r5>>2)) << 16) |
-                                (((g5<<3)|(g5>>2)) << 8) |
-                                ((b5<<3)|(b5>>2));
-                        } else {
-                            vf->framebuf[y*VFLASH_SCREEN_W+x] =
-                                0xFF000000 | (idx<<16) | (idx<<8) | idx;
-                        }
+                        if (idx == 0 && !vf->ptx_has_pal) continue;
+                        vf->framebuf[y*VFLASH_SCREEN_W+x] = vf->ptx_has_pal ?
+                            vf->ptx_pal[idx] : (0xFF000000|(idx<<16)|(idx<<8)|idx);
                     } else {
                         /* 16bpp XBGR1555: interlaced rows, stride 512 pixels */
                         uint16_t p = ptx_data[sy * 2 * 512 + x];
