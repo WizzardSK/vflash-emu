@@ -6126,33 +6126,35 @@ void vflash_run_frame(VFlash *vf) {
          * This function is an event callback (no direct callers —
          * registered via µMORE event system which isn't initialized). */
         *(uint32_t*)(vf->ram + 0xAFDE50) = vf->input;
-        if (vf->boot_phase >= 900 && vf->input != vf->input_prev) {
-            /* Call button handler: save CPU, run function, restore */
-            uint32_t spc = vf->cpu.r[15], slr = vf->cpu.r[14];
-            uint32_t scpsr = vf->cpu.cpsr, sr0 = vf->cpu.r[0];
-            vf->cpu.r[15] = 0x109D17A4;
-            vf->cpu.r[14] = 0x10FFF000; /* return to idle */
-            vf->cpu.cpsr = 0x000000D3;
-            vf->cpu.r[0] = vf->input; /* button state as arg */
-            int budget = 10000;
-            while (budget > 0 && vf->cpu.r[15] != 0x10FFF000 &&
-                   vf->cpu.r[15] != 0x10FFF00C) {
-                uint64_t cb = vf->cpu.cycles;
-                arm9_step(&vf->cpu);
-                budget -= (int)(vf->cpu.cycles - cb);
-                uint32_t vpc = vf->cpu.r[15];
-                if (vpc >= 0xB8000000u || (vpc < 0x10000000u && vpc > 0x1000u)) {
-                    vf->cpu.r[15] = 0x10FFF000; break;
+        /* Call ALL 6 button handler callbacks per-frame.
+         * These are event callbacks normally dispatched by µMORE event system.
+         * Chain: UP/DOWN handler → YELLOW/GREEN handler → setup functions. */
+        if (vf->boot_phase >= 900) {
+            static const uint32_t btn_handlers[] = {
+                0x109D17A4, 0x109D18A8, 0x109D19D0,
+                0x109D1A20, 0x109D1A9C, 0x109D1B34, 0
+            };
+            uint32_t save_regs[16];
+            memcpy(save_regs, vf->cpu.r, sizeof(save_regs));
+            uint32_t save_cpsr = vf->cpu.cpsr;
+            for (int hi = 0; btn_handlers[hi]; hi++) {
+                vf->cpu.r[15] = btn_handlers[hi];
+                vf->cpu.r[14] = 0x10FFF000;
+                vf->cpu.cpsr = 0x000000D3;
+                vf->cpu.r[0] = vf->input;
+                int budget = 5000;
+                while (budget > 0 && vf->cpu.r[15] != 0x10FFF000) {
+                    uint64_t cb = vf->cpu.cycles;
+                    arm9_step(&vf->cpu);
+                    budget -= (int)(vf->cpu.cycles - cb);
+                    if (budget < 0) break;
+                    uint32_t vpc = vf->cpu.r[15];
+                    if (vpc >= 0xB8000000u || (vpc < 0x10000000u && vpc > 0x1000u))
+                        break;
                 }
             }
-            vf->cpu.r[15] = spc; vf->cpu.r[14] = slr;
-            vf->cpu.cpsr = scpsr; vf->cpu.r[0] = sr0;
-            static int btn_log = 0;
-            if (btn_log < 10) {
-                printf("[INPUT-CB] Called 0x109D17A4 btn=%03X (budget left=%d)\n",
-                       vf->input, budget);
-                btn_log++;
-            }
+            memcpy(vf->cpu.r, save_regs, sizeof(save_regs));
+            vf->cpu.cpsr = save_cpsr;
         }
         /* Set lcd.upbase to render pipeline's framebuffer.
          * Also set dc_vblank_cb so LCD blit is enabled. */
