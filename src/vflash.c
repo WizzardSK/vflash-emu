@@ -897,7 +897,9 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
      * during gameplay, it's accessing a NULL entity pointer.
      * Return dummy vtable ptr for [0x00] so virtual calls go to stubs.
      * Return 1 ("ready") for other offsets to break polling loops. */
-    if (addr < 0x20 && vf->boot_phase >= 900) {
+    if (addr < 0x20 && vf->boot_phase >= 900 &&
+        (vf->cpu.cpsr & 0x1F) != 0x12 && /* not IRQ mode (vector fetch) */
+        (vf->cpu.cpsr & 0x1F) != 0x11) { /* not FIQ mode */
         /* Initialize dummy vtable once at 0x10310000 */
         static int vtbl_init = 0;
         if (!vtbl_init) {
@@ -1559,10 +1561,7 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
         if (roff == 0x3585E0 && val != 3) {
             val = 3;
         }
-        /* Protect code+data (0x10090000-0x10BF0000) from BSS zeroing.
-         * BSS clear should only zero 0x10BF0000-0x10C00000 (actual BSS).
-         * Exception: allow writes to framebuffer area (0x10BBEAE0-0x10BE3C40)
-         * so render pipeline can write black pixels (val=0). */
+        /* Protect code+data (0x10090000-0x10BF0000) from BSS zeroing. */
         if (val == 0 && roff >= 0x90000 && roff < 0xBF0000 &&
             !(roff >= 0xBBEAE0 && roff < 0xBE3C40) &&
             vf->boot_phase >= 800) {
@@ -6198,10 +6197,9 @@ void vflash_run_frame(VFlash *vf) {
             *(uint32_t*)(vf->ram + 0xB902C0) = 3;
             *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;
         } else {
-            /* BOOT.BIN game: force IRQ delivery per-frame.
-             * JIT runs game code atomically — kernel sleep's brief IRQ enable
-             * window is invisible to the IRQ delivery check. Force-deliver
-             * the timer IRQ by temporarily unmasking and calling arm9_irq. */
+            /* Force IRQ delivery per-frame for BOOT.BIN games.
+             * ROM vector ROM[0xD44] is patched at bp900 to point to 0x10FFF040
+             * (timer handler in high SDRAM, safe from calibration test). */
             if (vf->boot_phase >= 900 && ztimer_irq_pending(&vf->timer)) {
                 uint32_t save_cpsr = vf->cpu.cpsr;
                 vf->cpu.cpsr &= ~0x80; /* unmask IRQ */
@@ -6606,10 +6604,32 @@ void vflash_run_frame(VFlash *vf) {
                 }
             }
         }
-        /* Set up LCD controller.
-         * Don't set upbase — let render code set it via DC reg 0xB80007B0.
-         * 0x10048000 was kernel code, not a framebuffer! */
+        /* Set up LCD controller. */
         vf->lcd.control = 0x082D; /* 16bpp565, TFT, power, enabled */
+        /* Fix IRQ vector for BOOT.BIN games: SDRAM vectors get corrupted by
+         * calibration test patterns (0x55555555). Patch ROM directly:
+         * ROM[0xD44] is the pool value loaded by ROM[0x18] (LDR PC,[PC,#0xD24]).
+         * Point it to our timer handler in high SDRAM (never overwritten). */
+        {
+            uint32_t h = 0xFFF040;
+            /* Install timer IRQ handler at 0x10FFF040 */
+            if (*(uint32_t*)(vf->ram + h) == 0) {
+                uint32_t p = h;
+                *(uint32_t*)(vf->ram + p) = 0xE92D500F; p += 4; /* PUSH {R0-R3,R12,LR} */
+                *(uint32_t*)(vf->ram + p) = 0xE59F0008; p += 4; /* LDR R0,[PC,#8] */
+                *(uint32_t*)(vf->ram + p) = 0xE3A01001; p += 4; /* MOV R1,#1 */
+                *(uint32_t*)(vf->ram + p) = 0xE5801000; p += 4; /* STR R1,[R0] */
+                *(uint32_t*)(vf->ram + p) = 0xE8BD500F; p += 4; /* POP {R0-R3,R12,LR} */
+                *(uint32_t*)(vf->ram + p) = 0xE25EF004; p += 4; /* SUBS PC,LR,#4 */
+                *(uint32_t*)(vf->ram + p) = 0x9001000C; p += 4; /* pool: timer IntClr */
+            }
+            /* Patch ROM vector pool to point directly to handler */
+            if (vf->has_rom && vf->rom_size > 0xD48) {
+                *(uint32_t*)(vf->rom + 0xD44) = 0x10000000 + h;
+                printf("[IRQ-ROM] Patched ROM[0xD44] → 0x%08X (timer handler)\n",
+                       0x10000000 + h);
+            }
+        }
         vf->boot_phase = 900;
     }
 
