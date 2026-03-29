@@ -6091,9 +6091,9 @@ void vflash_run_frame(VFlash *vf) {
         *(uint32_t*)(vf->ram + 0xBE3C40) = 0;  /* ctx[0] = 0 (no error) */
         *(uint32_t*)(vf->ram + 0xBE3C44) = 1;  /* ctx[1] = 1 (frame ready) */
         /* ctx[3] == ctx[4]: render_processing skips draw path.
-         * Setting ctx[3] != ctx[4] enters draw path but causes massive
-         * slowdown (BSS function calls in render pipeline hit HLE intercepts).
-         * TODO: populate BSS render dependencies first, then enable. */
+         * With ctx[3] != ctx[4]: draw path entered, runs at 10 FPS,
+         * but entity/display list data empty → no pixels rendered.
+         * Need to populate display list + entity vtables first. */
         *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;  /* render enable flag */
         *(uint16_t*)(vf->ram + 0xBE49E0) = 1;
         *(uint32_t*)(vf->ram + 0xB009C4) = 1;
