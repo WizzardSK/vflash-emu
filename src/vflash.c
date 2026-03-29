@@ -6118,7 +6118,6 @@ void vflash_run_frame(VFlash *vf) {
         *(uint32_t*)(vf->ram + 0xB009C4) = 1;
         *(uint32_t*)(vf->ram + 0xB902C0) = 3;
         *(uint32_t*)(vf->ram + 0xBE3EC0) = 1;
-        }
     }
 
     /* Force game pre-loop after init gets stuck.
