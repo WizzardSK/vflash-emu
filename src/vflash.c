@@ -6671,29 +6671,52 @@ void vflash_run_frame(VFlash *vf) {
             }
         }
         if (ptx_data) {
-            /* Clear to desert brown (Cars themed) */
-            for (int i = 0; i < VFLASH_SCREEN_W * VFLASH_SCREEN_H; i++)
-                vf->framebuf[i] = 0xFF8B6914;
             /* Display PTX scaled to fit 320x240 screen.
-             * PTX uses interlaced rows (even rows = image data).
-             * Stride is 512 pixels per row. */
-            int src_h = ptx_h / 2; /* actual image height (even rows only) */
+             * Detect format from header: +0x0C = bpp (8 or 16). */
+            static int ptx_bpp = 0;
+            if (!ptx_bpp) {
+                /* Re-read header to get bpp */
+                CDEntry *pe2 = &vf->ptx_list[ptx_idx];
+                uint8_t hdr[16];
+                cdrom_read_file(vf->cd, pe2, hdr, 0, 16);
+                ptx_bpp = *(uint32_t*)(hdr + 0x0C);
+                if (ptx_bpp != 8) ptx_bpp = 16; /* default 16bpp */
+                printf("[GAME-DISPLAY] PTX bpp=%d\n", ptx_bpp);
+            }
+            /* Clear background */
+            for (int i = 0; i < VFLASH_SCREEN_W * VFLASH_SCREEN_H; i++)
+                vf->framebuf[i] = 0xFF000000;
+            int src_h = (ptx_bpp == 8) ? ptx_h : ptx_h / 2;
             for (int y = 0; y < 240; y++) {
                 int sy = y * src_h / 240;
                 if (sy >= src_h) sy = src_h - 1;
                 for (int x = 0; x < 320; x++) {
-                    int sx = x;
-                    if (sx >= ptx_w) sx = ptx_w - 1;
-                    uint16_t p = ptx_data[sy * 2 * 512 + sx]; /* even rows */
-                    if (p == 0) continue; /* transparent */
-                    /* XBGR1555: R=bits0-4, G=bits5-9, B=bits10-14
-                     * Expand 5-bit to 8-bit by replicating top bits into bottom */
-                    uint8_t r5 = (p & 0x1F), g5 = ((p >> 5) & 0x1F), b5 = ((p >> 10) & 0x1F);
-                    uint8_t r = (r5 << 3) | (r5 >> 2);
-                    uint8_t g = (g5 << 3) | (g5 >> 2);
-                    uint8_t b = (b5 << 3) | (b5 >> 2);
-                    vf->framebuf[y * VFLASH_SCREEN_W + x] =
-                        0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+                    if (ptx_bpp == 8) {
+                        /* 8bpp indexed: byte = palette index, stride 512 bytes */
+                        uint8_t idx = ((uint8_t*)ptx_data)[sy * 512 + x];
+                        if (idx == 0) continue;
+                        /* Use LCD palette (XBGR1555) if available, else grayscale */
+                        if (vf->lcd.pal_written > 0) {
+                            uint16_t p = vf->lcd.palette[idx];
+                            uint8_t r5 = (p & 0x1F), g5 = ((p>>5)&0x1F), b5 = ((p>>10)&0x1F);
+                            vf->framebuf[y*VFLASH_SCREEN_W+x] = 0xFF000000 |
+                                (((r5<<3)|(r5>>2)) << 16) |
+                                (((g5<<3)|(g5>>2)) << 8) |
+                                ((b5<<3)|(b5>>2));
+                        } else {
+                            vf->framebuf[y*VFLASH_SCREEN_W+x] =
+                                0xFF000000 | (idx<<16) | (idx<<8) | idx;
+                        }
+                    } else {
+                        /* 16bpp XBGR1555: interlaced rows, stride 512 pixels */
+                        uint16_t p = ptx_data[sy * 2 * 512 + x];
+                        if (p == 0) continue;
+                        uint8_t r5 = (p&0x1F), g5 = ((p>>5)&0x1F), b5 = ((p>>10)&0x1F);
+                        vf->framebuf[y*VFLASH_SCREEN_W+x] = 0xFF000000 |
+                            (((r5<<3)|(r5>>2)) << 16) |
+                            (((g5<<3)|(g5>>2)) << 8) |
+                            ((b5<<3)|(b5>>2));
+                    }
                 }
             }
             /* Render multi-layer VFF scene from decompressed tile data.
