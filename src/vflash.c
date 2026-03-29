@@ -1175,7 +1175,7 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
 
             /* Display controller regs 0x100-0x1FF: read-back stored values */
             if (foff >= 0x100 && foff < 0x200 && vf->boot_phase >= 800) {
-                uint32_t rv = vf->dc_regs[foff - 0x100];
+                uint32_t rv = vf->dc_regs[(foff - 0x100) >> 2];
                 return rv;
             }
             /* Display controller registers at 0xB8000700-0xB80007FF (reads). */
@@ -1870,7 +1870,7 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
              * Only during game phase to avoid breaking ROM flash polling. */
             if (foff >= 0x100 && foff < 0x200 && vf->boot_phase >= 800) {
                 /* Store in a register array for read-back */
-                vf->dc_regs[foff - 0x100] = val;
+                vf->dc_regs[(foff - 0x100) >> 2] = val;
                 return;
             }
             if (foff >= 0x700 && foff < 0x800 && vf->boot_phase >= 800) {
@@ -6273,10 +6273,10 @@ void vflash_run_frame(VFlash *vf) {
             /* Set framebuffer bank addresses in DC registers 0x140-0x14C.
              * Ghidra: fb_resolver reads [0xB8000140 + bank*4] to get FB address.
              * Game video init normally writes these via switch function. */
-            vf->dc_regs[0x40] = 0x10BBEAE0; /* bank 0: main render FB */
-            vf->dc_regs[0x44] = 0x10BBEAE0; /* bank 1: same (double-buffer) */
-            vf->dc_regs[0x48] = 0x10BBEAE0; /* bank 2 */
-            vf->dc_regs[0x4C] = 0x10BBEAE0; /* bank 3 */
+            vf->dc_regs[0x40/4] = 0x10BBEAE0; /* bank 0: main render FB */
+            vf->dc_regs[0x44/4] = 0x10BBEAE0; /* bank 1 */
+            vf->dc_regs[0x48/4] = 0x10BBEAE0; /* bank 2 */
+            vf->dc_regs[0x4C/4] = 0x10BBEAE0; /* bank 3 */
             /* Initialize render device struct at 0x10BBD500 (DAT_10ae9674).
              * Ghidra: FUN_10ab9650 reads [+0xC]=fb_base, [+0x14]=format,
              * [+0x18]=width, [+0x1C]=height. Without this, render has no target. */
