@@ -58,7 +58,10 @@ static SR bshift(uint32_t val, int type, int amt, int cin) {
 
 static SR decode_shift(ARM9 *cpu, uint32_t insn) {
     int rm=insn&0xF, type=(insn>>5)&3, amt;
-    uint32_t val=cpu->r[rm]; if(rm==15) val+=4;
+    uint32_t val=cpu->r[rm];
+    /* ARM spec: Rm=PC reads as inst+8 (PC is already inst+8).
+     * Exception: register-specified shift (bit4=1) adds +4 → inst+12. */
+    if(rm==15 && (insn&(1<<4))) val+=4;
     if(insn&(1<<4)) { amt=cpu->r[(insn>>8)&0xF]&0xFF; }
     else { amt=(insn>>7)&0x1F;
         if(!amt && type==3){ SR r; r.c=val&1; r.v=(val>>1)|((uint32_t)C_FLAG<<31); return r; }

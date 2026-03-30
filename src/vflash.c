@@ -3534,6 +3534,11 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
                 val = *(uint32_t*)(vf->ram + doff);
             *(uint32_t*)(vf->ram + roff + 12) = pos + 4;
             cpu->r[0] = val;
+            static int ri_log = 0;
+            if (ri_log < 20) {
+                printf("[READ-INT] pos=%d val=0x%08X LR=%08X\n", pos, val, cpu->r[14]);
+                ri_log++;
+            }
         }
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
@@ -3604,6 +3609,14 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     if (addr == 0x10AB32C0 || addr == 0x10AB3304 || addr == 0x10AB3348 ||
         addr == 0x10AB3060 || addr == 0x10AB30A0) {
         cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* HLE scene setup function (FUN_10ACCBD0): returns scene iterator index.
+     * Original function searches render context for scene range. We return 0
+     * (first scene) so the deserializer proceeds with scene creation. */
+    if (addr == 0x10ACCBD0 && ((VFlash*)ctx)->boot_phase >= 800) {
+        cpu->r[0] = 0; /* success: first scene index */
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
@@ -3793,6 +3806,22 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
             cpu->r[15] = cpu->r[14] & ~3u;
             return 1;
         }
+    }
+    /* HLE memcpy at 10A70144: R0=dst, R1=src, R2=count.
+     * Byte-by-byte copy that's extremely slow in interpreter mode. */
+    if (addr == 0x10A70144) {
+        VFlash *vf2 = (VFlash*)ctx;
+        uint32_t dst = cpu->r[0] - 0x10000000;
+        uint32_t src = cpu->r[1] - 0x10000000;
+        uint32_t len = cpu->r[2];
+        if (dst < VFLASH_RAM_SIZE && src < VFLASH_RAM_SIZE &&
+            dst + len <= VFLASH_RAM_SIZE && src + len <= VFLASH_RAM_SIZE && len < 0x200000) {
+            memmove(vf2->ram + dst, vf2->ram + src, len);
+        }
+        cpu->r[0] = cpu->r[0]; /* preserve R0 */
+        cpu->r[15] = *(uint32_t*)(vf2->ram + (cpu->r[13] - 0x10000000)); /* POP PC */
+        cpu->r[13] += 4;
+        return 1;
     }
     /* HLE memset at 10A4D500: R0=dst, R1=val, R2=len → R0=dst.
      * PROTECT RTOS code area (0x10A00000-0x10B00000) from being zeroed. */
@@ -7006,26 +7035,116 @@ void vflash_run_frame(VFlash *vf) {
             }
         }
 
-        /* Re-run VFF scene init to decompress tiles (scene init is fast).
-         * Tiles were decompressed to 0x10240000 before BSS clear zeroed them.
-         * With RELOC-FIX applied, the decompression code is now available. */
+        /* Call scene deserializer with resource table from sec[0].
+         * Resource table at 0x104FE96C: scene objects (type=1 sprites, type=2 tiles)
+         * with descriptor pointers into sec[0] and data pointers into sec[1]. */
         {
-            uint32_t dt_base = 0x500800;
-            /* Check if dispatch table has valid entries */
-            uint32_t dt_first = *(uint32_t*)(vf->ram + dt_base);
-            if (dt_first != 0) {
-                /* Verify scene deserializer code is present */
-                uint32_t deser_first = *(uint32_t*)(vf->ram + 0xACD65C);
-                printf("[SCENE] Deserializer at 0x10ACD65C: %08X, "
-                       "vtable at 0x10B2C13C: %08X %08X\n",
-                       deser_first,
-                       *(uint32_t*)(vf->ram + 0xB2C13C),
-                       *(uint32_t*)(vf->ram + 0xB2C140));
-                /* Log dispatch table entry 0 for verification */
-                printf("[SCENE] DT[0]: vtab=%08X desc=%08X data=%08X\n",
-                       *(uint32_t*)(vf->ram + dt_base),
-                       *(uint32_t*)(vf->ram + dt_base + 0x14),
-                       *(uint32_t*)(vf->ram + dt_base + 0x2C));
+            uint32_t deser_first = *(uint32_t*)(vf->ram + 0xACD65C);
+            /* Verify deserializer code is present (PUSH instruction) */
+            if ((deser_first & 0xFFFF0000) == 0xE92D0000) {
+                /* Find resource table: scan sec[0] for first 6-word entry
+                 * pattern: type(1), flags(4), desc_ptr(104Fxxxx) */
+                uint32_t restab = 0;
+                for (uint32_t scan = 0x4FE800; scan < 0x500000; scan += 4) {
+                    uint32_t w0 = *(uint32_t*)(vf->ram + scan);
+                    uint32_t w1 = *(uint32_t*)(vf->ram + scan + 4);
+                    uint32_t w2 = *(uint32_t*)(vf->ram + scan + 8);
+                    if (w0 == 1 && w1 == 4 && w2 >= 0x104F0000 && w2 < 0x10700000) {
+                        restab = scan;
+                        break;
+                    }
+                }
+                if (restab) {
+                    printf("[SCENE] Resource table at 0x%08X: %08X %08X %08X\n",
+                           0x10000000 + restab,
+                           *(uint32_t*)(vf->ram + restab),
+                           *(uint32_t*)(vf->ram + restab + 4),
+                           *(uint32_t*)(vf->ram + restab + 8));
+
+                    /* Set up HLE reader vtable and object */
+                    uint32_t vt = 0xFFD100;
+                    memset(vf->ram + vt, 0, 0x80);
+                    *(uint32_t*)(vf->ram + vt + 0x10) = HLE_READER_READ;
+                    *(uint32_t*)(vf->ram + vt + 0x14) = HLE_READER_BULK;
+                    *(uint32_t*)(vf->ram + vt + 0x18) = HLE_READER_SEEK;
+                    *(uint32_t*)(vf->ram + vt + 0x20) = HLE_READER_BYTE;
+
+                    /* Reader object at 0x10FFD000 */
+                    uint32_t robj = 0xFFD000;
+                    *(uint32_t*)(vf->ram + robj + 0)  = 0x10000000 + vt;
+                    *(uint32_t*)(vf->ram + robj + 4)  = 0x10000000 + restab;
+                    *(uint32_t*)(vf->ram + robj + 8)  = 0x2000; /* 8KB table */
+                    *(uint32_t*)(vf->ram + robj + 12) = 0;      /* pos = 0 */
+
+                    /* Parent object for scene registration */
+                    uint32_t pvt = 0xFFD180;
+                    memset(vf->ram + pvt, 0, 0x80);
+                    *(uint32_t*)(vf->ram + pvt + 0x40) = HLE_PARENT_REG;
+                    for (int vi = 0; vi < 32; vi++)
+                        if (*(uint32_t*)(vf->ram + pvt + vi*4) == 0)
+                            *(uint32_t*)(vf->ram + pvt + vi*4) = 0x10FFE000;
+                    uint32_t pobj = 0xFFD080;
+                    memset(vf->ram + pobj, 0, 0x80);
+                    *(uint32_t*)(vf->ram + pobj) = 0x10000000 + pvt;
+
+                    /* Install ARM stubs at reader method addresses */
+                    uint32_t stubs[] = {0xFFD200, 0xFFD240, 0xFFD280, 0xFFD2C0, 0xFFD300};
+                    for (int si2 = 0; si2 < 5; si2++) {
+                        *(uint32_t*)(vf->ram + stubs[si2])     = 0xE1A00000;
+                        *(uint32_t*)(vf->ram + stubs[si2] + 4) = 0xE12FFF1E;
+                    }
+
+                    /* Set up render context for deserializer.
+                     * context[4] must be > setup return value (0) for range check.
+                     * context[8] onwards: scene object list pointers. */
+                    *(uint32_t*)(vf->ram + 0xBE3C44) = 100; /* context[1]: count > 0 */
+                    /* context+8 needs a valid scene iterator object */
+                    {
+                        uint32_t sobj = 0xFFD400;
+                        memset(vf->ram + sobj, 0, 0x80);
+                        /* Scene iterator: [0]=data_ptr, [0x10]=start, [0x14]=end */
+                        *(uint32_t*)(vf->ram + sobj) = 0x10000000 + restab;
+                        *(uint32_t*)(vf->ram + sobj + 0x10) = 0;
+                        *(uint32_t*)(vf->ram + sobj + 0x14) = 0x2000;
+                        *(uint32_t*)(vf->ram + 0xBE3C48) = 0x10000000 + sobj;
+                    }
+
+                    /* Call FUN_10acd65c(context, reader, parent) */
+                    uint32_t save_regs[16]; uint32_t save_cpsr;
+                    memcpy(save_regs, vf->cpu.r, sizeof(save_regs));
+                    save_cpsr = vf->cpu.cpsr;
+
+                    vf->cpu.r[0] = 0x10BE3C40;
+                    vf->cpu.r[1] = 0x10000000 + robj;
+                    vf->cpu.r[2] = 0x10000000 + pobj;
+                    vf->cpu.r[15] = 0x10ACD65C;
+                    vf->cpu.r[14] = 0x10FFF000;
+                    vf->cpu.r[13] = 0x10B8D000;
+                    vf->cpu.cpsr = 0x000000D3;
+
+                    int steps;
+                    for (steps = 0; steps < 5000000; steps++) {
+                        uint32_t pc = vf->cpu.r[15];
+                        arm9_step(&vf->cpu);
+                        uint32_t npc = vf->cpu.r[15];
+                        /* Trace first 20 BL calls */
+                        static int bl_t = 0;
+                        if (bl_t < 20 && pc >= 0x10A00000 && pc < 0x10D00000 &&
+                            npc != pc + 4 && npc >= 0x10000000 && npc < 0x11000000 &&
+                            npc != pc + 2) {
+                            printf("[SCENE-BL] %08X → %08X R0=%08X R1=%08X\n",
+                                   pc, npc, vf->cpu.r[0], vf->cpu.r[1]);
+                            bl_t++;
+                        }
+                        if (npc == 0x10FFF000 || npc < 4) break;
+                    }
+                    uint32_t pos = *(uint32_t*)(vf->ram + robj + 12);
+                    printf("[SCENE] Deserializer: %d steps, pos=%d/%d, R0=%08X PC=%08X\n",
+                           steps, pos, 0x2000, vf->cpu.r[0], vf->cpu.r[15]);
+
+                    memcpy(vf->cpu.r, save_regs, sizeof(save_regs));
+                    vf->cpu.cpsr = save_cpsr;
+                }
             }
         }
 
