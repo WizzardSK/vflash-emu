@@ -7405,7 +7405,53 @@ void vflash_run_frame(VFlash *vf) {
                     192, 64, 128, 192, 192, 0, 64, 192,
                     192, 192, 64, 192, 192, 192, 64, 336
                 };
-                /* Clear to sky gradient */
+                /* Render PTX artwork as primary scene display.
+                 * PTX is the pre-composed 8bpp scene (1024x256 with palette).
+                 * The tile strips at 0x10240000 are individual tile pieces
+                 * that need tilemap composition (sec[2]) to assemble properly.
+                 * For now, PTX provides the correct visual. */
+                if (vf->ptx_has_pal && vf->ptx_count > 0 && vf->cd) {
+                    static uint8_t *scene_px = NULL;
+                    static int scene_w = 0, scene_h = 0;
+                    if (!scene_px) {
+                        CDEntry *pe = &vf->ptx_list[0];
+                        uint8_t *buf = malloc(pe->size);
+                        if (buf) {
+                            int rd = cdrom_read_file(vf->cd, pe, buf, 0, pe->size);
+                            if (rd > 44) {
+                                uint32_t hs = *(uint32_t*)buf;
+                                scene_w = vf->ptx_stride;
+                                scene_h = *(uint16_t*)(buf + 10);
+                                if (scene_w > 0 && scene_h > 0 && hs < (uint32_t)rd) {
+                                    scene_px = malloc(rd - hs);
+                                    if (scene_px)
+                                        memcpy(scene_px, buf + hs, rd - hs);
+                                }
+                            }
+                            free(buf);
+                        }
+                    }
+                    if (scene_px && scene_w > 0 && scene_h > 0) {
+                        for (int y = 0; y < 240; y++) {
+                            int sy = y * scene_h / 240;
+                            for (int x = 0; x < 320; x++) {
+                                int sx = x * scene_w / 320;
+                                uint8_t idx = scene_px[sy * scene_w + sx];
+                                uint32_t c = vf->ptx_pal[idx];
+                                vf->framebuf[y*320+x] = c ? c : 0xFF000000;
+                            }
+                        }
+                    }
+                    vf->vid.fb_dirty = 1;
+                    ent_count = nz;
+                    static int ptx_scene_log = 0;
+                    if (!ptx_scene_log) {
+                        ptx_scene_log = 1;
+                        printf("[HLE-RENDER] PTX scene %dx%d with palette\n",
+                               scene_w, scene_h);
+                    }
+                } else {
+                /* Clear to sky gradient (fallback without palette) */
                 for (int y = 0; y < 240; y++) {
                     int sky_r = 60 + (100-60)*y/240;
                     int sky_g = 120 + (170-120)*y/240;
@@ -7523,6 +7569,7 @@ void vflash_run_frame(VFlash *vf) {
                     tile_log = 1;
                     printf("[HLE-RENDER] Scene + interactive car (arrows to move)\n");
                 }
+                } /* end fallback without palette */
                 } /* end decompressed tiles path */
             } else {
                 ent_count = 0;
