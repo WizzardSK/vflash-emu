@@ -7462,9 +7462,6 @@ void vflash_run_frame(VFlash *vf) {
                     int th = layer_tiles[idx].th;
                     uint32_t dp = tile_off + tile_offsets[ti];
                     if (dp + (uint32_t)(tw*th) > VFLASH_RAM_SIZE) continue;
-                    uint8_t cr = layer_colors[idx].r;
-                    uint8_t cg = layer_colors[idx].g;
-                    uint8_t cb = layer_colors[idx].b;
                     int lh = (ly == 0) ? 80 : 60;
                     int y_start = ly * 240 / 320;
                     if (y_start + lh > 240) lh = 240 - y_start;
@@ -7476,15 +7473,25 @@ void vflash_run_frame(VFlash *vf) {
                             if (sx >= tw) sx = tw - 1;
                             uint8_t v = vf->ram[dp + sy * tw + sx];
                             if (v == 0) continue;
-                            /* Alpha-blend: pixel = old*(1-a) + color*a */
-                            uint32_t old = vf->framebuf[y*320+x];
-                            uint8_t or2=(old>>16)&0xFF, og=(old>>8)&0xFF, ob=old&0xFF;
-                            int a = v;
-                            uint8_t nr = (uint8_t)((or2*(255-a) + cr*a) / 255);
-                            uint8_t ng = (uint8_t)((og*(255-a) + cg*a) / 255);
-                            uint8_t nb = (uint8_t)((ob*(255-a) + cb*a) / 255);
-                            vf->framebuf[y*320+x] =
-                                0xFF000000|((uint32_t)nr<<16)|((uint32_t)ng<<8)|nb;
+                            if (vf->ptx_has_pal) {
+                                /* Use PTX palette for true color rendering */
+                                uint32_t c = vf->ptx_pal[v];
+                                if (c & 0xFF000000)
+                                    vf->framebuf[y*320+x] = c;
+                            } else {
+                                /* Fallback: per-layer color intensity */
+                                uint8_t cr = layer_colors[idx].r;
+                                uint8_t cg = layer_colors[idx].g;
+                                uint8_t cb = layer_colors[idx].b;
+                                uint32_t old = vf->framebuf[y*320+x];
+                                uint8_t or2=(old>>16)&0xFF, og=(old>>8)&0xFF, ob=old&0xFF;
+                                int a = v;
+                                uint8_t nr = (uint8_t)((or2*(255-a) + cr*a) / 255);
+                                uint8_t ng = (uint8_t)((og*(255-a) + cg*a) / 255);
+                                uint8_t nb = (uint8_t)((ob*(255-a) + cb*a) / 255);
+                                vf->framebuf[y*320+x] =
+                                    0xFF000000|((uint32_t)nr<<16)|((uint32_t)ng<<8)|nb;
+                            }
                         }
                     }
                 }
