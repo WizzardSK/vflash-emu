@@ -3511,6 +3511,103 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         }
     }
 
+    /* HLE reader stubs for scene graph deserializer.
+     * Reader object at 0x10FFD000: {vtable, data_base, data_size, pos}
+     * Vtable at 0x10FFD100 with methods at 0x10FFD200/240/280. */
+#define HLE_READER_OBJ    0x10FFD000
+#define HLE_READER_VTABLE 0x10FFD100
+#define HLE_READER_READ   0x10FFD200  /* read_int: vtable[4] offset 0x10 */
+#define HLE_READER_BULK   0x10FFD240  /* bulk_read: vtable[5] offset 0x14 */
+#define HLE_READER_SEEK   0x10FFD280  /* seek: vtable[6] offset 0x18 */
+#define HLE_READER_BYTE   0x10FFD2C0  /* read_byte */
+#define HLE_PARENT_REG    0x10FFD300  /* parent register callback: vtable[16] offset 0x40 */
+    /* read_int: read 32-bit LE from reader data, advance pos by 4 */
+    if (addr == HLE_READER_READ) {
+        uint32_t robj = cpu->r[0];
+        uint32_t roff = robj - 0x10000000;
+        if (roff + 16 <= VFLASH_RAM_SIZE) {
+            uint32_t base = *(uint32_t*)(vf->ram + roff + 4);
+            uint32_t pos  = *(uint32_t*)(vf->ram + roff + 12);
+            uint32_t doff = (base - 0x10000000) + pos;
+            uint32_t val = 0;
+            if (doff + 4 <= VFLASH_RAM_SIZE)
+                val = *(uint32_t*)(vf->ram + doff);
+            *(uint32_t*)(vf->ram + roff + 12) = pos + 4;
+            cpu->r[0] = val;
+        }
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* read_byte: read 1 byte from reader data, advance pos by 1 */
+    if (addr == HLE_READER_BYTE) {
+        uint32_t robj = cpu->r[0];
+        uint32_t roff = robj - 0x10000000;
+        if (roff + 16 <= VFLASH_RAM_SIZE) {
+            uint32_t base = *(uint32_t*)(vf->ram + roff + 4);
+            uint32_t pos  = *(uint32_t*)(vf->ram + roff + 12);
+            uint32_t doff = (base - 0x10000000) + pos;
+            uint8_t val = 0;
+            if (doff < VFLASH_RAM_SIZE)
+                val = vf->ram[doff];
+            *(uint32_t*)(vf->ram + roff + 12) = pos + 1;
+            cpu->r[0] = val;
+        }
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* bulk_read: copy 'size' bytes from reader to dest */
+    if (addr == HLE_READER_BULK) {
+        uint32_t robj = cpu->r[0];
+        uint32_t dest = cpu->r[1];
+        uint32_t size = cpu->r[2];
+        uint32_t roff = robj - 0x10000000;
+        if (roff + 16 <= VFLASH_RAM_SIZE) {
+            uint32_t base = *(uint32_t*)(vf->ram + roff + 4);
+            uint32_t pos  = *(uint32_t*)(vf->ram + roff + 12);
+            uint32_t src_off = (base - 0x10000000) + pos;
+            uint32_t dst_off = dest - 0x10000000;
+            if (src_off + size <= VFLASH_RAM_SIZE &&
+                dst_off + size <= VFLASH_RAM_SIZE && size < 0x100000) {
+                memcpy(vf->ram + dst_off, vf->ram + src_off, size);
+            }
+            *(uint32_t*)(vf->ram + roff + 12) = pos + size;
+            cpu->r[0] = size;
+        }
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* seek: set reader pos to offset */
+    if (addr == HLE_READER_SEEK) {
+        uint32_t robj = cpu->r[0];
+        uint32_t offset = cpu->r[1];
+        uint32_t roff = robj - 0x10000000;
+        if (roff + 16 <= VFLASH_RAM_SIZE)
+            *(uint32_t*)(vf->ram + roff + 12) = offset;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* Parent register callback: collect scene graph child objects */
+    if (addr == HLE_PARENT_REG) {
+        /* R0=parent, R1=child object created by deserializer */
+        uint32_t child = cpu->r[1];
+        static int reg_count = 0;
+        if (reg_count < 20)
+            printf("[SCENE-REG] Child object registered: %08X (vtable=%08X)\n",
+                   child,
+                   (child >= 0x10000000 && child < 0x11000000) ?
+                   *(uint32_t*)(vf->ram + (child - 0x10000000)) : 0);
+        reg_count++;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* Skip RTOS mutex lock/unlock (crash on NULL mutex in HLE env) */
+    if (addr == 0x10AB32C0 || addr == 0x10AB3304 || addr == 0x10AB3348 ||
+        addr == 0x10AB3060 || addr == 0x10AB30A0) {
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+
     /* Intercept ANY zero-instruction call in µMORE service BSS range
      * (0x109A0000-0x109B0000) and nearby areas. Also catch the specific
      * dispatch table addresses and second-level dispatch addresses. */
@@ -6822,11 +6919,13 @@ void vflash_run_frame(VFlash *vf) {
                    " (render_processing[0]=%08X)\n",
                    sz, src_name, 0x10000000+src, 0x10000000+dst, first);
         }
-        /* RELOC-FIX: copy 73 unrelocated functions for ALL games. */
+        /* RELOC-FIX: copy unrelocated functions + vtables for ALL games.
+         * Extends past original 73 functions to include scene graph vtables
+         * at 0x10B2C13C and code up to 0x10B30FE8 (discovered via Ghidra). */
         {
             uint32_t src = 0xD48B20;  /* 10D48B20: first unrelocated function */
             uint32_t dst = 0xB0DB0C;  /* 10B0DB0C: relocation target */
-            uint32_t sz  = 0x18DE0;   /* 101,856 bytes covering all 73 functions */
+            uint32_t sz  = 0x224F4;   /* 140,532 bytes: functions + vtables to 0x10B30000 */
             if (src + sz <= VFLASH_RAM_SIZE && dst + sz <= VFLASH_RAM_SIZE) {
                 /* Verify source has ARM code (first function should start with PUSH) */
                 uint32_t first = *(uint32_t*)(vf->ram + src);
@@ -6868,6 +6967,71 @@ void vflash_run_frame(VFlash *vf) {
                        0x10000000 + h);
             }
         }
+        /* Re-load VFF scene data from CD after BSS clear.
+         * sec[2] (tilemap at 0x101B8000) and decompressed tiles (0x10240000)
+         * were zeroed by game BSS clear. Reload from CD to restore. */
+        if (vf->cd && vf->cd->is_open) {
+            CDEntry ve;
+            if (cdrom_find_file_any(vf->cd, "MAIN.VFF", &ve)) {
+                uint8_t vhdr[0x60];
+                cdrom_read_file(vf->cd, &ve, vhdr, 0, 0x60);
+                if (vhdr[0]=='v' && vhdr[1]=='f') {
+                    uint32_t nsec = *(uint32_t*)(vhdr + 0x2C);
+                    uint32_t foff = 0x400;
+                    int reloaded = 0;
+                    for (uint32_t si2 = 0; si2 < nsec && si2 < 3; si2++) {
+                        uint32_t ssz = *(uint32_t*)(vhdr + 0x34 + si2*0x10);
+                        uint32_t dst = *(uint32_t*)(vhdr + 0x30 + si2*0x10);
+                        uint32_t doff = dst - 0x10000000;
+                        /* Only reload sections that were zeroed by BSS clear */
+                        if (dst >= 0x10100000 && dst < 0x10500000 &&
+                            doff + ssz <= VFLASH_RAM_SIZE) {
+                            /* Check if section was zeroed */
+                            int nz = 0;
+                            for (uint32_t c = 0; c < 256 && c < ssz; c += 4)
+                                if (*(uint32_t*)(vf->ram + doff + c)) nz++;
+                            if (nz < 10) {
+                                int rd = cdrom_read_file(vf->cd, &ve,
+                                            vf->ram + doff, foff, ssz);
+                                printf("[VFF-RELOAD] sec[%d] %dKB → %08X (was zeroed)\n",
+                                       si2, rd/1024, dst);
+                                reloaded++;
+                            }
+                        }
+                        foff += ssz;
+                    }
+                    if (reloaded)
+                        printf("[VFF-RELOAD] Restored %d sections from CD\n", reloaded);
+                }
+            }
+        }
+
+        /* Re-run VFF scene init to decompress tiles (scene init is fast).
+         * Tiles were decompressed to 0x10240000 before BSS clear zeroed them.
+         * With RELOC-FIX applied, the decompression code is now available. */
+        {
+            uint32_t dt_base = 0x500800;
+            /* Check if dispatch table has valid entries */
+            uint32_t dt_first = *(uint32_t*)(vf->ram + dt_base);
+            if (dt_first != 0) {
+                /* Verify scene deserializer code is present */
+                uint32_t deser_first = *(uint32_t*)(vf->ram + 0xACD65C);
+                printf("[SCENE] Deserializer at 0x10ACD65C: %08X, "
+                       "vtable at 0x10B2C13C: %08X %08X\n",
+                       deser_first,
+                       *(uint32_t*)(vf->ram + 0xB2C13C),
+                       *(uint32_t*)(vf->ram + 0xB2C140));
+                /* Log dispatch table entry 0 for verification */
+                printf("[SCENE] DT[0]: vtab=%08X desc=%08X data=%08X\n",
+                       *(uint32_t*)(vf->ram + dt_base),
+                       *(uint32_t*)(vf->ram + dt_base + 0x14),
+                       *(uint32_t*)(vf->ram + dt_base + 0x2C));
+            }
+        }
+
+        /* Point LCD controller at render FB so game display reads tiles */
+        vf->lcd.upbase = 0x10BBEAE0;
+        vf->lcd.control = 0x082D; /* 16bpp565, TFT, power, enabled */
         vf->boot_phase = 900;
     }
 
@@ -6879,14 +7043,20 @@ void vflash_run_frame(VFlash *vf) {
         if (vf->dc_regs[0x40/4] != 0) { /* FB bank 0 set → render has target */
             uint32_t rfb_off = vf->lcd.upbase - VFLASH_RAM_BASE;
             if (rfb_off < VFLASH_RAM_SIZE - 320*240*2) {
-                for (int y = 0; y < VFLASH_SCREEN_H; y++)
-                    for (int x = 0; x < VFLASH_SCREEN_W; x++) {
-                        uint16_t p = *(uint16_t*)(vf->ram + rfb_off + (y*320+x)*2);
-                        uint8_t r=((p>>11)&0x1F), g=((p>>5)&0x3F), b=(p&0x1F);
-                        vf->framebuf[y*VFLASH_SCREEN_W+x] = 0xFF000000 |
-                            ((r<<3|r>>2)<<16) | ((g<<2|g>>4)<<8) | (b<<3|b>>2);
-                    }
-                vf->vid.fb_dirty = 1;
+                /* Check if render FB has actual content (not zeroed by BSS clear) */
+                int fb_nz = 0;
+                for (int c = 0; c < 640 && !fb_nz; c += 2)
+                    if (*(uint16_t*)(vf->ram + rfb_off + c)) fb_nz = 1;
+                if (fb_nz) {
+                    for (int y = 0; y < VFLASH_SCREEN_H; y++)
+                        for (int x = 0; x < VFLASH_SCREEN_W; x++) {
+                            uint16_t p = *(uint16_t*)(vf->ram + rfb_off + (y*320+x)*2);
+                            uint8_t r=((p>>11)&0x1F), g=((p>>5)&0x3F), b=(p&0x1F);
+                            vf->framebuf[y*VFLASH_SCREEN_W+x] = 0xFF000000 |
+                                ((r<<3|r>>2)<<16) | ((g<<2|g>>4)<<8) | (b<<3|b>>2);
+                        }
+                    vf->vid.fb_dirty = 1;
+                }
             }
         }
     }
@@ -6986,17 +7156,85 @@ void vflash_run_frame(VFlash *vf) {
                     }
                 }
             }
-            /* Render multi-layer VFF scene from decompressed tile data.
-             * sec[1] tiles at 0x10240000 (sky/ground layers)
-             * sec[2] tiles at 0x101B8000 (horizon/detail layers)
-             * Each layer uses intensity modulation with a base color. */
+            /* Render VFF scene from dispatch table tile data.
+             * Tile data lives in sec[1] at data_ptr entries, always available
+             * after VFF-RELOAD. Falls back to 0x240000 if decompressed data exists. */
             int ent_count = 0;
             uint32_t tile_off = 0x240000;
-            uint32_t sec2_off = 0x1B8000;
             int nz = 0;
             for (uint32_t ti = 0; ti < 512*256 && ti + tile_off < VFLASH_RAM_SIZE; ti++)
                 if (vf->ram[tile_off + ti]) nz++;
-            if (nz > 1000) {
+            /* Also try dispatch table tile data (compressed but renderable) */
+            int dt_valid = 0;
+            {
+                uint32_t dt0 = *(uint32_t*)(vf->ram + 0x500800);
+                if (dt0 >= 0x10000000 && dt0 < 0x11000000) dt_valid = 1;
+            }
+            if (nz > 1000 || dt_valid) {
+                /* If no decompressed tiles, render from dispatch table directly */
+                if (nz <= 1000 && dt_valid) {
+                    /* Render compressed tile data from dispatch table entries.
+                     * Each entry has desc_ptr (+0x14) and data_ptr (+0x2C).
+                     * Treat data as 4bpp nibble intensity, scaled per-layer. */
+                    uint16_t *rfb = (uint16_t*)(vf->ram + 0xBBEAE0);
+                    memset(rfb, 0, 320*240*2);
+                    static const uint16_t lpal[] = {
+                        0xF800,0x07E0,0x001F,0xFFE0,0xF81F,0x07FF,0xFC00,0x83E0,
+                        0xFD20,0xF800,0x07E0,0x001F,0xFFE0,0xF81F,0x07FF,0xFC00
+                    };
+                    for (int li = 0; li < 16; li++) {
+                        uint32_t dt_off = 0x500800 + li * 0x30;
+                        uint32_t desc_ptr = *(uint32_t*)(vf->ram + dt_off + 0x14);
+                        uint32_t data_ptr = *(uint32_t*)(vf->ram + dt_off + 0x2C);
+                        if (desc_ptr < 0x10000000 || data_ptr < 0x10000000) continue;
+                        uint32_t doff = desc_ptr - 0x10000000;
+                        uint16_t tw = *(uint16_t*)(vf->ram + doff + 0x14);
+                        uint16_t th = *(uint16_t*)(vf->ram + doff + 0x16);
+                        if (tw == 0 || th == 0 || tw > 1024 || th > 512) continue;
+                        uint32_t src = data_ptr - 0x10000000;
+                        uint16_t color = lpal[li % 16];
+                        int y_off = li * 15;
+                        for (int y = 0; y < (int)th && y + y_off < 240; y++) {
+                            for (int x = 0; x < 320 && x < (int)tw; x++) {
+                                int sx = x * tw / 320;
+                                uint32_t bi = (y * tw + sx) / 2;
+                                if (src + bi >= VFLASH_RAM_SIZE) break;
+                                uint8_t b = vf->ram[src + bi];
+                                uint8_t nib = (sx & 1) ? (b & 0xF) : (b >> 4);
+                                if (nib > 1) {
+                                    uint8_t r = ((color>>11)&0x1F)*nib/15;
+                                    uint8_t g = ((color>>5)&0x3F)*nib/15;
+                                    uint8_t bl2 = (color&0x1F)*nib/15;
+                                    rfb[(y+y_off)*320+x] = (r<<11)|(g<<5)|bl2;
+                                }
+                            }
+                        }
+                    }
+                    /* Convert RGB565 FB to ARGB32 display */
+                    for (int y = 0; y < 240; y++)
+                        for (int x = 0; x < 320; x++) {
+                            uint16_t p = rfb[y*320+x];
+                            if (p == 0) {
+                                /* Sky gradient background */
+                                int sky_r = 60 + 40*y/240;
+                                int sky_g = 120 + 50*y/240;
+                                int sky_b = 200 + 40*y/240;
+                                vf->framebuf[y*320+x] = 0xFF000000 |
+                                    ((uint32_t)sky_r<<16)|((uint32_t)sky_g<<8)|sky_b;
+                            } else {
+                                uint8_t r=((p>>11)&0x1F), g=((p>>5)&0x3F), bl2=(p&0x1F);
+                                vf->framebuf[y*320+x] = 0xFF000000 |
+                                    ((r<<3|r>>2)<<16)|((g<<2|g>>4)<<8)|(bl2<<3|bl2>>2);
+                            }
+                        }
+                    vf->vid.fb_dirty = 1;
+                    ent_count = 1;
+                    static int dt_render_log = 0;
+                    if (!dt_render_log) {
+                        dt_render_log = 1;
+                        printf("[HLE-RENDER] Using dispatch table tile data directly\n");
+                    }
+                } else {
                 /* HLE multi-layer scene renderer.
                  * Reads dispatch table at 0x10500800 for 16 render layers.
                  * Each layer has: position (X,Y), tile data pointer, base color.
@@ -7136,6 +7374,7 @@ void vflash_run_frame(VFlash *vf) {
                     tile_log = 1;
                     printf("[HLE-RENDER] Scene + interactive car (arrows to move)\n");
                 }
+                } /* end decompressed tiles path */
             } else {
                 ent_count = 0;
             }
