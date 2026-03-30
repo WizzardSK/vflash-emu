@@ -7392,12 +7392,18 @@ void vflash_run_frame(VFlash *vf) {
                     192, 64, 128, 192, 192, 0, 64, 192,
                     192, 192, 64, 192, 192, 192, 64, 336
                 };
-                /* Render PTX artwork as primary scene display.
-                 * PTX is the pre-composed 8bpp scene (1024x256 with palette).
-                 * The tile strips at 0x10240000 are individual tile pieces
-                 * that need tilemap composition (sec[2]) to assemble properly.
-                 * For now, PTX provides the correct visual. */
-                if (vf->ptx_count > 0 && vf->cd) {
+                /* Scene display: prefer decompressed tiles from sec[1] + sec[2]
+                 * viewport mask over PTX atlas (which is a sprite sheet, not
+                 * a pre-composed scene). Fall through to tile path when tiles
+                 * at 0x10240000 are available. Use PTX only as last resort. */
+                int have_tiles = 0;
+                {
+                    /* Check if decompressed tiles at 0x10240000 are present */
+                    uint32_t t_base = 0x240000;
+                    for (int c2 = 0; c2 < 256; c2 += 4)
+                        if (*(uint32_t*)(vf->ram + t_base + c2)) { have_tiles = 1; break; }
+                }
+                if (!have_tiles && vf->ptx_count > 0 && vf->cd) {
                     static uint8_t *scene_px = NULL;
                     static int scene_w = 0, scene_h = 0, scene_bpp = 0;
                     if (!scene_px) {
@@ -7422,37 +7428,31 @@ void vflash_run_frame(VFlash *vf) {
                         }
                     }
                     if (scene_px && scene_w > 0 && scene_h > 0) {
-                        /* Auto-crop: find actual content bounds (skip black borders) */
-                        int content_w = scene_w, content_h = scene_h;
-                        int bpp_bytes = (scene_bpp == 8) ? 1 : 2;
-                        /* Find rightmost non-black column */
-                        for (int cx = scene_w - 1; cx > 0; cx--) {
-                            int has = 0;
-                            for (int cy = 0; cy < scene_h && !has; cy += 4) {
-                                uint32_t off2 = (cy * scene_w + cx) * bpp_bytes;
-                                if (scene_bpp == 8) {
-                                    if (scene_px[off2] > 1) has = 1;
-                                } else {
-                                    uint16_t p = *(uint16_t*)(scene_px + off2);
-                                    if (p > 0) has = 1;
-                                }
-                            }
-                            if (has) { content_w = cx + 1; break; }
+                        /* Render PTX at 1:1 pixel ratio, centered viewport.
+                         * PTX is a large atlas (e.g. 1024×256). Show a
+                         * 320×240 window into it, centered vertically. */
+                        int src_x = 0, src_y = 0;
+                        int view_w = 320, view_h = 240;
+                        if (scene_h < 240) {
+                            /* PTX is shorter than display — scale up vertically */
+                            view_h = scene_h;
                         }
-                        /* Fill screen height, crop width if needed */
-                        int disp_h = 240;
-                        int disp_w = 240 * content_w / content_h;
-                        if (disp_w > 320) disp_w = 320;
-                        int y_off = 0;
-                        int x_off = (320 - disp_w) / 2;
-                        /* Clear to black */
+                        if (scene_w < 320) {
+                            view_w = scene_w;
+                        }
+                        int y_off = (240 - view_h) / 2;
+                        int x_off = (320 - view_w) / 2;
+                        /* Center source viewport in PTX */
+                        src_y = (scene_h > view_h) ? (scene_h - view_h) / 2 : 0;
                         memset(vf->framebuf, 0, 320*240*4);
-                        for (int y = 0; y < disp_h; y++) {
-                            int sy = y * content_h / disp_h;
-                            for (int x = 0; x < disp_w; x++) {
-                                int sx = x * content_w / disp_w;
-                                int dy = y + y_off, dx = x + x_off;
-                                if (dy < 0 || dy >= 240 || dx < 0 || dx >= 320) continue;
+                        for (int y = 0; y < view_h; y++) {
+                            int sy = src_y + y;
+                            if (sy >= scene_h) break;
+                            for (int x = 0; x < view_w; x++) {
+                                int sx = src_x + x;
+                                if (sx >= scene_w) break;
+                                int dx = x + x_off, dy = y + y_off;
+                                if (dx < 0 || dx >= 320 || dy < 0 || dy >= 240) continue;
                                 if (scene_bpp == 8) {
                                     uint8_t idx = scene_px[sy * scene_w + sx];
                                     uint32_t c = vf->ptx_pal[idx];
@@ -7470,12 +7470,105 @@ void vflash_run_frame(VFlash *vf) {
                             }
                         }
                     }
+                    /* ---- sec[2] tilemap compositor ----
+                     * VFF sec[2] at RAM+0x1B8000: 156 blocks of 0x3C00 bytes each.
+                     * Each block = 240 rows × 64 cols (byte per cell).
+                     * Block 0, rows 0-55: circular viewport mask (tile indices 0-20).
+                     *   Index 0x12 (18) = fully inside circle, 0 = outside.
+                     *   Edge values (7,8,0xC,0xE) = antialiased border.
+                     * Block 0, rows 112-239: 8bpp scene background pixels.
+                     * Apply the circular mask over the PTX scene. */
+                    {
+                        #define SEC2_OFF     0x1B8000
+                        #define SEC2_BLK_SZ  0x3C00   /* 15360 bytes per block */
+                        #define SEC2_COLS    64
+                        #define SEC2_MASK_ROWS 56     /* circular mask rows (layer A) */
+                        #define SEC2_GFX_START 112    /* graphics portion start row */
+                        #define SEC2_GFX_ROWS  128    /* graphics rows */
+                        uint32_t sec2_base = SEC2_OFF;
+                        /* Verify sec[2] data is present (not zeroed) */
+                        int sec2_ok = 0;
+                        for (int c = 0; c < 256; c += 4) {
+                            if (*(uint32_t*)(vf->ram + sec2_base + 0x140 + c)) {
+                                sec2_ok = 1;
+                                break;
+                            }
+                        }
+                        if (sec2_ok) {
+                            /* Extract circular mask from block 0, rows 0-55 */
+                            uint8_t *mask_data = vf->ram + sec2_base;
+                            /* Find mask bounding box for scaling */
+                            int mask_x0 = SEC2_COLS, mask_y0 = SEC2_MASK_ROWS;
+                            int mask_x1 = 0, mask_y1 = 0;
+                            for (int my = 0; my < SEC2_MASK_ROWS; my++) {
+                                for (int mx = 0; mx < SEC2_COLS; mx++) {
+                                    if (mask_data[my * SEC2_COLS + mx] > 0) {
+                                        if (mx < mask_x0) mask_x0 = mx;
+                                        if (mx > mask_x1) mask_x1 = mx;
+                                        if (my < mask_y0) mask_y0 = my;
+                                        if (my > mask_y1) mask_y1 = my;
+                                    }
+                                }
+                            }
+                            if (mask_x1 > mask_x0 && mask_y1 > mask_y0) {
+                                int mw = mask_x1 - mask_x0 + 1;
+                                int mh = mask_y1 - mask_y0 + 1;
+                                /* Scale mask to cover display area centered */
+                                int dw = 320, dh = 240;
+                                /* Mask aspect ratio preserved, fill height */
+                                int scaled_h = dh;
+                                int scaled_w = mw * dh / mh;
+                                if (scaled_w > dw) {
+                                    scaled_w = dw;
+                                    scaled_h = mh * dw / mw;
+                                }
+                                int ox = (dw - scaled_w) / 2;
+                                int oy = (dh - scaled_h) / 2;
+                                /* Darken pixels outside the circular mask */
+                                for (int y = 0; y < 240; y++) {
+                                    for (int x = 0; x < 320; x++) {
+                                        /* Map screen coord to mask coord */
+                                        int mx = (x - ox) * mw / scaled_w + mask_x0;
+                                        int my = (y - oy) * mh / scaled_h + mask_y0;
+                                        int alpha = 0; /* outside = fully dark */
+                                        if (mx >= mask_x0 && mx <= mask_x1 &&
+                                            my >= mask_y0 && my <= mask_y1) {
+                                            uint8_t mv = mask_data[my * SEC2_COLS + mx];
+                                            /* Scale: 0x12(18)=full, 0=none, edges=partial */
+                                            alpha = mv * 255 / 20;
+                                            if (alpha > 255) alpha = 255;
+                                        }
+                                        if (alpha < 255) {
+                                            uint32_t px = vf->framebuf[y*320+x];
+                                            uint8_t r = (px >> 16) & 0xFF;
+                                            uint8_t g = (px >>  8) & 0xFF;
+                                            uint8_t b = px & 0xFF;
+                                            r = (uint8_t)(r * alpha / 255);
+                                            g = (uint8_t)(g * alpha / 255);
+                                            b = (uint8_t)(b * alpha / 255);
+                                            vf->framebuf[y*320+x] = 0xFF000000 |
+                                                ((uint32_t)r << 16) |
+                                                ((uint32_t)g << 8) | b;
+                                        }
+                                    }
+                                }
+                                static int sec2_log = 0;
+                                if (!sec2_log) {
+                                    sec2_log = 1;
+                                    printf("[SEC2] Viewport mask %dx%d at (%d,%d),"
+                                           " scaled to %dx%d\n",
+                                           mw, mh, mask_x0, mask_y0,
+                                           scaled_w, scaled_h);
+                                }
+                            }
+                        }
+                    }
                     vf->vid.fb_dirty = 1;
                     ent_count = nz;
                     static int ptx_scene_log = 0;
                     if (!ptx_scene_log) {
                         ptx_scene_log = 1;
-                        printf("[HLE-RENDER] PTX scene %dx%d %dbpp\n",
+                        printf("[HLE-RENDER] PTX scene %dx%d %dbpp + sec[2] mask\n",
                                scene_w, scene_h, scene_bpp);
                     }
                 } else {
@@ -7596,6 +7689,52 @@ void vflash_run_frame(VFlash *vf) {
                 if (!tile_log) {
                     tile_log = 1;
                     printf("[HLE-RENDER] Scene + interactive car (arrows to move)\n");
+                }
+                /* Apply sec[2] circular viewport mask over tile scene */
+                {
+                    uint8_t *blk0 = vf->ram + 0x1B8000;
+                    int sec2_ok = 0;
+                    for (int c2 = 0; c2 < 64; c2 += 4)
+                        if (*(uint32_t*)(blk0 + 0x140 + c2)) { sec2_ok = 1; break; }
+                    if (sec2_ok) {
+                        /* Build mask bounds from block 0 rows 0-55 (64 cols) */
+                        int mx0=64, my0=56, mx1=0, my1=0;
+                        for (int my = 0; my < 56; my++)
+                            for (int mx = 0; mx < 64; mx++)
+                                if (blk0[my*64+mx]) {
+                                    if (mx<mx0) mx0=mx; if (mx>mx1) mx1=mx;
+                                    if (my<my0) my0=my; if (my>my1) my1=my;
+                                }
+                        if (mx1 > mx0 && my1 > my0) {
+                            int mw=mx1-mx0+1, mh=my1-my0+1;
+                            int sh=240, sw=mw*240/mh;
+                            if (sw>320) { sw=320; sh=mh*320/mw; }
+                            int ox=(320-sw)/2, oy=(240-sh)/2;
+                            for (int y=0; y<240; y++) {
+                                for (int x=0; x<320; x++) {
+                                    int mmx=(x-ox)*mw/sw+mx0;
+                                    int mmy=(y-oy)*mh/sh+my0;
+                                    int alpha = 0;
+                                    if (mmx>=mx0 && mmx<=mx1 && mmy>=my0 && mmy<=my1)
+                                        alpha = blk0[mmy*64+mmx] * 255 / 20;
+                                    if (alpha > 255) alpha = 255;
+                                    if (alpha < 255) {
+                                        uint32_t px = vf->framebuf[y*320+x];
+                                        uint8_t r=((px>>16)&0xFF)*alpha/255;
+                                        uint8_t g=((px>>8)&0xFF)*alpha/255;
+                                        uint8_t b=(px&0xFF)*alpha/255;
+                                        vf->framebuf[y*320+x] = 0xFF000000 |
+                                            ((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                                    }
+                                }
+                            }
+                            static int mask_log = 0;
+                            if (!mask_log) {
+                                mask_log = 1;
+                                printf("[SEC2-MASK] Applied %dx%d viewport over tiles\n", mw, mh);
+                            }
+                        }
+                    }
                 }
                 } /* end fallback without palette */
                 } /* end decompressed tiles path */
@@ -7874,6 +8013,144 @@ void vflash_run_frame(VFlash *vf) {
                 inp_log++;
             }
         }
+    }
+
+    /* ---- Direct VFF sec[2] scene compositor ----
+     * Runs every frame after boot_phase 800, bypassing RTOS dependencies.
+     * Reads sec[2] data from RAM at 0x101B8000 (reloaded from CD after BSS clear).
+     * Structure: 156 blocks × 0x3C00 bytes. Each block = 240 rows × 64 cols.
+     *   Rows 0-55:   layer A tilemap (circular viewport mask, indices 0-20)
+     *   Rows 56-111: layer B tilemap (background fill, index 0x16)
+     *   Rows 112-239: scene graphics (8bpp intensity data)
+     * Composites PTX background + circular viewport mask directly to framebuffer. */
+    if (vf->has_rom && vf->boot_phase >= 800 && !vf->vid.fb_dirty &&
+        vf->cd && vf->cd->is_open) {
+        static int sec2_init = 0;
+        static uint8_t *scene_px = NULL;
+        static int scene_w = 0, scene_h = 0, scene_bpp = 0;
+        static uint8_t mask_alpha[320 * 240]; /* precomputed viewport mask */
+
+        if (!sec2_init) {
+            /* Check sec[2] data present at RAM+0x1B8000 */
+            int sec2_ok = 0;
+            for (int c = 0; c < 256; c += 4) {
+                if (*(uint32_t*)(vf->ram + 0x1B8000 + 0x140 + c)) {
+                    sec2_ok = 1; break;
+                }
+            }
+            if (!sec2_ok) goto sec2_skip; /* retry next frame */
+            sec2_init = 1;
+            /* Load PTX scene image */
+            if (vf->ptx_count > 0) {
+                CDEntry *pe = &vf->ptx_list[0];
+                uint8_t *buf = malloc(pe->size);
+                if (buf) {
+                    int rd = cdrom_read_file(vf->cd, pe, buf, 0, pe->size);
+                    if (rd > 44) {
+                        uint32_t hs = *(uint32_t*)buf;
+                        scene_w = *(uint16_t*)(buf + 8);
+                        if (scene_w == 0) scene_w = vf->ptx_stride;
+                        scene_h = *(uint16_t*)(buf + 10);
+                        scene_bpp = *(uint32_t*)(buf + 12);
+                        if (scene_bpp != 8) scene_bpp = 16;
+                        if (scene_w > 0 && scene_h > 0 && hs < (uint32_t)rd) {
+                            scene_px = malloc(rd - hs);
+                            if (scene_px)
+                                memcpy(scene_px, buf + hs, rd - hs);
+                        }
+                    }
+                    free(buf);
+                }
+            }
+            /* Build circular viewport mask from sec[2] block 0 */
+            memset(mask_alpha, 255, sizeof(mask_alpha)); /* default = fully visible */
+            if (sec2_ok) {
+                uint8_t *blk0 = vf->ram + 0x1B8000;
+                /* Find mask bounding box (rows 0-55, 64 cols) */
+                int mx0 = 64, my0 = 56, mx1 = 0, my1 = 0;
+                for (int my = 0; my < 56; my++)
+                    for (int mx = 0; mx < 64; mx++)
+                        if (blk0[my * 64 + mx] > 0) {
+                            if (mx < mx0) mx0 = mx;
+                            if (mx > mx1) mx1 = mx;
+                            if (my < my0) my0 = my;
+                            if (my > my1) my1 = my;
+                        }
+                if (mx1 > mx0 && my1 > my0) {
+                    int mw = mx1 - mx0 + 1, mh = my1 - my0 + 1;
+                    /* Scale mask to display, centered */
+                    int sw = 320, sh = 240;
+                    int scaled_h = sh, scaled_w = mw * sh / mh;
+                    if (scaled_w > sw) { scaled_w = sw; scaled_h = mh * sw / mw; }
+                    int ox = (sw - scaled_w) / 2, oy = (sh - scaled_h) / 2;
+                    memset(mask_alpha, 0, sizeof(mask_alpha)); /* start fully dark */
+                    for (int y = 0; y < 240; y++) {
+                        for (int x = 0; x < 320; x++) {
+                            int mmx = (x - ox) * mw / scaled_w + mx0;
+                            int mmy = (y - oy) * mh / scaled_h + my0;
+                            if (mmx >= mx0 && mmx <= mx1 && mmy >= my0 && mmy <= my1) {
+                                uint8_t mv = blk0[mmy * 64 + mmx];
+                                int a = mv * 255 / 20;
+                                if (a > 255) a = 255;
+                                mask_alpha[y * 320 + x] = (uint8_t)a;
+                            }
+                        }
+                    }
+                    printf("[SEC2] Viewport mask %dx%d at (%d,%d) scaled to %dx%d\n",
+                           mw, mh, mx0, my0, scaled_w, scaled_h);
+                }
+            }
+            printf("[SEC2-SCENE] PTX %dx%d %dbpp, mask ready\n",
+                   scene_w, scene_h, scene_bpp);
+        }
+
+        /* Render scene every frame */
+        if (scene_px && scene_w > 0 && scene_h > 0) {
+            /* Render PTX at 1:1 with circular mask applied */
+            int view_w = (scene_w < 320) ? scene_w : 320;
+            int view_h = (scene_h < 240) ? scene_h : 240;
+            int src_y = (scene_h > view_h) ? (scene_h - view_h) / 2 : 0;
+            int y_off = (240 - view_h) / 2;
+            int x_off = (320 - view_w) / 2;
+            memset(vf->framebuf, 0, 320 * 240 * 4);
+            for (int y = 0; y < view_h; y++) {
+                int sy = src_y + y;
+                if (sy >= scene_h) break;
+                int dy = y + y_off;
+                for (int x = 0; x < view_w; x++) {
+                    int sx = x;
+                    if (sx >= scene_w) break;
+                    int dx = x + x_off;
+                    if (dx < 0 || dx >= 320 || dy < 0 || dy >= 240) continue;
+                    uint32_t color = 0;
+                    if (scene_bpp == 8) {
+                        uint8_t idx = scene_px[sy * scene_w + sx];
+                        color = vf->ptx_pal[idx];
+                    } else {
+                        uint16_t p = *(uint16_t*)(scene_px + (sy*scene_w+sx)*2);
+                        if (p != 0) {
+                            uint8_t r=(p&0x1F)<<3, g=((p>>5)&0x1F)<<3,
+                                    b=((p>>10)&0x1F)<<3;
+                            color = 0xFF000000|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                        }
+                    }
+                    if (color) {
+                        int a = mask_alpha[dy * 320 + dx];
+                        if (a >= 255) {
+                            vf->framebuf[dy * 320 + dx] = color;
+                        } else if (a > 0) {
+                            uint8_t r = ((color >> 16) & 0xFF) * a / 255;
+                            uint8_t g = ((color >> 8) & 0xFF) * a / 255;
+                            uint8_t b = (color & 0xFF) * a / 255;
+                            vf->framebuf[dy*320+dx] = 0xFF000000 |
+                                ((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                        }
+                    }
+                }
+            }
+            vf->vid.fb_dirty = 1;
+        }
+        sec2_skip: ;
     }
 
     vf->input_prev = vf->input;
