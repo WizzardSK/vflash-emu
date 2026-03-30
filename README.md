@@ -19,27 +19,32 @@ No other emulator exists for this system.
 
 | Key | Action |
 |-----|--------|
-| Left / Right | Browse PTX image gallery (88 images) |
-| Up / Down | Browse VFF game scenes (20 scenes) |
-| Z (Red) | Next MJP video (20 videos) |
-| X (Yellow) | Stop video playback |
+| Arrow Left / Right | Parallax scroll desert scene |
+| Arrow Up / Down | Browse VFF game scenes (17 scenes) |
+| Enter | Toggle PTX photo overlay |
+| Z (Red) | Next PTX photo / Next MJP video |
+| X (Yellow) | Prev PTX photo / Stop video |
+| C (Green) | Toggle VFF display format |
 | F5 | Save screenshot (BMP) |
 | F11 | Toggle fullscreen |
 | Esc | Quit |
 
-Background voice/SFX audio plays automatically from 561 WAV files on disc.
+Scene rendering: 10 parallax layers with per-layer color tinting, circular
+viewport mask from sec[2] tilemap, vertical box filter smoothing, desert sky gradient.
+Background voice/SFX audio plays automatically from WAV files on disc.
 
 ## Status
 
-**JIT compiler: 37 FPS, 1.4MB game code relocated from BOOT.BIN** — ARM926EJ-S → x86_64
-basic block JIT compiler translates 9000+ code blocks on the fly. µMORE v4.0 RTOS
-boots, game task launched via HLE FIQ handler + Nucleus TCB creation. Real game loop
-code (not stub) relocated from BOOT.BIN CD: game logic (0x109D0000, 704KB), render
-engine (0x10A80000, 566KB), unrelocated functions (0x10B0DB0C, 100KB). Render pipeline
-executes real code: render_processing, display controller setup, VIC configuration.
-VFF tile decompression: 29 tiles (1.2MB) decompressed from disc. RTOS code area
-protected from BSS clear (write protection 0x109D0000-0x10BF0000). HLE hot functions:
-software division (~40x speedup), memcpy, memset, byte copy, strcmp, event pump skip.
+**Scene rendering + JIT: 37 FPS** — Desert landscape with 10 parallax layers,
+circular viewport mask from VFF sec[2] tilemap, per-layer color tinting (sky/mesa/
+vegetation/road), vertical box filtering, parallax scrolling with arrow keys.
+ARM926EJ-S → x86_64 JIT compiler (9000+ blocks). µMORE v4.0 RTOS boots, game task
+launched via HLE FIQ + Nucleus TCB. 1.4MB game code relocated from BOOT.BIN CD.
+
+**VFF format fully decoded**: sec[0]=ARM scene script, sec[1]=compressed sprites
+(custom format), sec[2]=tilemap + raw 8bpp tile pixels. Tile data is UNCOMPRESSED
+in sec[2] at offset 0x88000 (29 tiles, 512px wide, verified 100% byte match).
+PTX files = Knowledge World photo atlases (car parts tutorial), not scene backgrounds.
 
 BOOT.BIN 5A5A5A5A relocation reverse-engineered: ROM generates a 4096-entry lookup
 table with `value = (idx << 20) | 0x0DF2`, indices sequential from +0x4000 with
@@ -71,9 +76,10 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **CD-ROM init** | ✅ Native through kernel vtable, disc query succeeds |
 | **VFF scene loading** | ✅ ARM code + graphics + tilemap loaded to RAM |
 | **VFF scene init** | ✅ 58-entry dispatch table (graphics/audio/render layers) |
-| **VFF scene builder** | ✅ 65 callbacks decompress 1.2MB tile data (29 tiles) |
-| **VFF tile decompression** | ✅ 8bpp tiles decompressed, rendered to framebuffer |
-| **VFF tile display** | ✅ HLE multi-layer scene + PTX artwork via native render FB |
+| **VFF scene builder** | ✅ 65 callbacks, dispatch table setup |
+| **VFF sec[2] tilemap** | ✅ 156 blocks decoded, circular viewport mask extracted |
+| **VFF tile rendering** | ✅ 10 parallax layers, per-layer color, box filter, scrolling |
+| **VFF tile discovery** | ✅ Tiles are raw sec[2]+0x88000 data (not compressed) |
 | **Game loop** | ✅ tick→sync→render at 37 FPS via JIT |
 | **JIT compiler** | ✅ ARM→x86_64, 9000+ blocks, 1B+ instructions JIT'd |
 | **HLE hot functions** | ✅ Division, memcpy, memset, strcmp — native C |
@@ -95,12 +101,15 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 
 ### Remaining for gameplay
 
-**VFF tile decompression working**: Scene callbacks (65 total) decompress sec[1]
-compressed tile data into 1.2MB of 8bpp indexed pixels at 0x10240000 (29 tiles).
-Tilemap at 0x101B8000 (64-byte stride) maps tile indices to screen positions.
-Dispatch table (58 entries in 0x30-byte groups) decoded: graphics layers with
-compressed sizes, audio channels (22050Hz stereo), and render layers with tile
-data pointers + X/Y position offsets.
+**VFF sec[2] fully decoded**: 156 blocks × 15360 bytes each. Block 0 rows 0-55 =
+circular viewport mask (64×49, antialiased edge indices 0-20). Offset 0x88000+ =
+raw 8bpp tile pixel data (29 tiles, all 512px wide, 4-1024 rows tall). Tiles are
+intensity maps rendered with per-layer RGB tinting. PTX files (28 _KWF*.PTX) are
+photo atlases for Knowledge World tutorial, NOT scene backgrounds.
+
+**Sprite compression**: sec[1] data uses custom compression (not zlib/LZ77/LZW).
+44 bytes + compressed body per sprite entry. Decompression routine not yet identified
+in BOOT.BIN ARM code. Resource table: 59 entries (55 sprites + 4 metadata).
 
 **Render draw path**: render_processing (0x10A89100) is called every game loop
 iteration but returns early. The function checks render context flags at
@@ -139,10 +148,11 @@ separate bump area at 0x390000. 10A77648 (variant) HLE'd at 0x320000.
 - Kernel vtable: 7 function pointers from ROM at [1000C76C+0x2C..+0x44]
 
 **VFF format decoded**: header (0x60 bytes) with entry point (+0x10), init callback
-(+0x20), section count (+0x2C). sec[0]=ARM scene script (up to 1.8MB), sec[1]=tile
-descriptors (29×44B: width/height/8bpp) + compressed tile pixel data, sec[2]=compressed
-tilemap. Dispatch table at header+0x10: 0x30-byte groups of {graphics_layer, audio,
-render_layer} with IDs, compressed sizes, callbacks, tile data pointers, and XY offsets.
+(+0x20), section count (+0x2C). sec[0]=ARM scene script (up to 1.2MB), sec[1]=compressed
+sprite data (custom format), sec[2]=tilemap blocks + raw tile pixels. sec[2] layout:
+blocks 0-35 = tilemap metadata (64×240 per block, circular viewport mask in block 0),
+offset 0x88000+ = 29 uncompressed 8bpp tile intensity maps (512px wide).
+Cars disc: 17 VFF files (CW×6 gameplay, GZ×7 puzzles, KW, MAIN, OPENING, STORY).
 
 **Ghidra RE completed**: full game task entry, render pipeline, VFF scene format,
 BOOT.BIN CD driver (10C21680), kernel service dispatch, game engine object system.
@@ -291,8 +301,9 @@ ROM[0x00] → flash copy → flash remap (0x118)
 - MJP video: byte-swap, byte-stuffing restore, in-place decode, scaling
 - IMA ADPCM + PCM WAV audio, 22050→44100Hz stereo resampling
 - PTX: 8bpp indexed (palette from LCD) or 16bpp XBGR1555, stride from header
-- VFF: "vfD0" container, 3 sections (ARM script + tile descriptors/pixels + tilemap)
-- VFF tile decompression: scene callbacks decompress 8bpp tiles (29 tiles, 1.2MB)
+- VFF: "vfD0" container, 3 sections (ARM script + compressed sprites + tilemap+tiles)
+- VFF sec[2]: tilemap blocks (circular viewport mask) + raw 8bpp tile pixels at +0x88000
+- Scene compositor: 10 parallax layers, per-layer color tinting, box filter, scrolling
 - ISO 9660 with recursive search, BIN/CUE auto-detect
 - Interactive debugger with breakpoints, disassembly, memory dump
 
