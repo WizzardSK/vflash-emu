@@ -7422,18 +7422,35 @@ void vflash_run_frame(VFlash *vf) {
                         }
                     }
                     if (scene_px && scene_w > 0 && scene_h > 0) {
-                        /* Preserve aspect ratio: fit width, center vertically */
-                        int disp_w = 320;
-                        int disp_h = 320 * scene_h / scene_w;
-                        if (disp_h > 240) { disp_h = 240; disp_w = 240 * scene_w / scene_h; }
-                        int y_off = (240 - disp_h) / 2;
+                        /* Auto-crop: find actual content bounds (skip black borders) */
+                        int content_w = scene_w, content_h = scene_h;
+                        int bpp_bytes = (scene_bpp == 8) ? 1 : 2;
+                        /* Find rightmost non-black column */
+                        for (int cx = scene_w - 1; cx > 0; cx--) {
+                            int has = 0;
+                            for (int cy = 0; cy < scene_h && !has; cy += 4) {
+                                uint32_t off2 = (cy * scene_w + cx) * bpp_bytes;
+                                if (scene_bpp == 8) {
+                                    if (scene_px[off2] > 1) has = 1;
+                                } else {
+                                    uint16_t p = *(uint16_t*)(scene_px + off2);
+                                    if (p > 0) has = 1;
+                                }
+                            }
+                            if (has) { content_w = cx + 1; break; }
+                        }
+                        /* Fill screen height, crop width if needed */
+                        int disp_h = 240;
+                        int disp_w = 240 * content_w / content_h;
+                        if (disp_w > 320) disp_w = 320;
+                        int y_off = 0;
                         int x_off = (320 - disp_w) / 2;
                         /* Clear to black */
                         memset(vf->framebuf, 0, 320*240*4);
                         for (int y = 0; y < disp_h; y++) {
-                            int sy = y * scene_h / disp_h;
+                            int sy = y * content_h / disp_h;
                             for (int x = 0; x < disp_w; x++) {
-                                int sx = x * scene_w / disp_w;
+                                int sx = x * content_w / disp_w;
                                 int dy = y + y_off, dx = x + x_off;
                                 if (dy < 0 || dy >= 240 || dx < 0 || dx >= 320) continue;
                                 if (scene_bpp == 8) {
