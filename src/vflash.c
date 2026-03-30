@@ -5863,7 +5863,7 @@ void vflash_run_frame(VFlash *vf) {
         printf("[MJP] Found %d MJP video files\n", vf->mjp_count);
     }
     /* Navigate gallery with Left/Right keys (only when video not playing) */
-    if (vf->ptx_count > 0 && vf->cd && vf->cd->is_open && !vf->mjp_player.playing && vf->boot_phase < 900) {
+    if (vf->ptx_count > 0 && vf->cd && vf->cd->is_open && !vf->mjp_player.playing && vf->boot_phase < 800) {
         uint32_t pressed = vf->input & ~vf->input_prev;
         int new_idx = vf->ptx_index;
         if (pressed & VFLASH_BTN_RIGHT) new_idx = (vf->ptx_index + 1) % vf->ptx_count;
@@ -5936,7 +5936,7 @@ void vflash_run_frame(VFlash *vf) {
 
     /* MJP video player — Z=next video, X=stop, auto-load on frame 1.
      * Disabled during game phase to prevent video flickering over game scene. */
-    if (vf->cd && vf->cd->is_open && vf->mjp_count > 0 && vf->boot_phase < 900) {
+    if (vf->cd && vf->cd->is_open && vf->mjp_count > 0 && vf->boot_phase < 800) {
         uint32_t pressed = vf->input & ~vf->input_prev;
         int load_mjp = 0;
         if (pressed & VFLASH_BTN_RED) {
@@ -6100,7 +6100,7 @@ void vflash_run_frame(VFlash *vf) {
     /* VFF scene viewer: load and display VFF scene on Enter/Up/Down.
      * VFF format: header (0x400) + sections (code, framebuf, data).
      * Only active when video is not playing and game loop is not running. */
-    if (vf->cd && vf->cd->is_open && !vf->mjp_player.playing && vf->boot_phase < 900) {
+    if (vf->cd && vf->cd->is_open && !vf->mjp_player.playing && vf->boot_phase < 800) {
         static int vff_loaded = 0;
         static CDEntry vff_list[32];
         static int vff_count = 0, vff_index = 0;
@@ -7197,8 +7197,8 @@ void vflash_run_frame(VFlash *vf) {
             }
         }
     }
-    if (vf->boot_phase >= 900 && !vf->vid.fb_dirty) {
-        /* PTX fallback: only show when render FB has no game content */
+    if (0 && vf->boot_phase >= 900 && !vf->vid.fb_dirty) {
+        /* PTX fallback: DISABLED — sec[2] direct compositor handles display */
         static uint16_t *ptx_data = NULL;
         static int ptx_w = 0, ptx_h = 0;
         static int ptx_idx = 0;
@@ -8075,7 +8075,7 @@ void vflash_run_frame(VFlash *vf) {
      *   Rows 56-111: layer B tilemap (background fill, index 0x16)
      *   Rows 112-239: scene graphics (8bpp intensity data)
      * Composites PTX background + circular viewport mask directly to framebuffer. */
-    if (vf->has_rom && vf->boot_phase >= 800 && !vf->vid.fb_dirty &&
+    if (vf->has_rom && vf->boot_phase >= 800 &&
         vf->cd && vf->cd->is_open) {
         static int sec2_init = 0;
         static uint8_t *scene_px = NULL;
@@ -8092,28 +8092,6 @@ void vflash_run_frame(VFlash *vf) {
             }
             if (!sec2_ok) goto sec2_skip; /* retry next frame */
             sec2_init = 1;
-            /* Load PTX scene image */
-            if (vf->ptx_count > 0) {
-                CDEntry *pe = &vf->ptx_list[0];
-                uint8_t *buf = malloc(pe->size);
-                if (buf) {
-                    int rd = cdrom_read_file(vf->cd, pe, buf, 0, pe->size);
-                    if (rd > 44) {
-                        uint32_t hs = *(uint32_t*)buf;
-                        scene_w = *(uint16_t*)(buf + 8);
-                        if (scene_w == 0) scene_w = vf->ptx_stride;
-                        scene_h = *(uint16_t*)(buf + 10);
-                        scene_bpp = *(uint32_t*)(buf + 12);
-                        if (scene_bpp != 8) scene_bpp = 16;
-                        if (scene_w > 0 && scene_h > 0 && hs < (uint32_t)rd) {
-                            scene_px = malloc(rd - hs);
-                            if (scene_px)
-                                memcpy(scene_px, buf + hs, rd - hs);
-                        }
-                    }
-                    free(buf);
-                }
-            }
             /* Build circular viewport mask from sec[2] block 0 */
             memset(mask_alpha, 255, sizeof(mask_alpha)); /* default = fully visible */
             if (sec2_ok) {
@@ -8152,54 +8130,78 @@ void vflash_run_frame(VFlash *vf) {
                            mw, mh, mx0, my0, scaled_w, scaled_h);
                 }
             }
-            printf("[SEC2-SCENE] PTX %dx%d %dbpp, mask ready\n",
-                   scene_w, scene_h, scene_bpp);
+            printf("[SEC2-SCENE] Direct tile compositor ready\n");
         }
 
-        /* Render scene every frame */
-        if (scene_px && scene_w > 0 && scene_h > 0) {
-            /* Render PTX at 1:1 with circular mask applied */
-            int view_w = (scene_w < 320) ? scene_w : 320;
-            int view_h = (scene_h < 240) ? scene_h : 240;
-            int src_y = (scene_h > view_h) ? (scene_h - view_h) / 2 : 0;
-            int y_off = (240 - view_h) / 2;
-            int x_off = (320 - view_w) / 2;
-            memset(vf->framebuf, 0, 320 * 240 * 4);
-            for (int y = 0; y < view_h; y++) {
-                int sy = src_y + y;
-                if (sy >= scene_h) break;
-                int dy = y + y_off;
-                for (int x = 0; x < view_w; x++) {
-                    int sx = x;
-                    if (sx >= scene_w) break;
-                    int dx = x + x_off;
-                    if (dx < 0 || dx >= 320 || dy < 0 || dy >= 240) continue;
-                    uint32_t color = 0;
-                    if (scene_bpp == 8) {
-                        uint8_t idx = scene_px[sy * scene_w + sx];
-                        color = vf->ptx_pal[idx];
-                    } else {
-                        uint16_t p = *(uint16_t*)(scene_px + (sy*scene_w+sx)*2);
-                        if (p != 0) {
-                            uint8_t r=(p&0x1F)<<3, g=((p>>5)&0x1F)<<3,
-                                    b=((p>>10)&0x1F)<<3;
-                            color = 0xFF000000|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
-                        }
-                    }
-                    if (color) {
-                        int a = mask_alpha[dy * 320 + dx];
-                        if (a >= 255) {
-                            vf->framebuf[dy * 320 + dx] = color;
-                        } else if (a > 0) {
-                            uint8_t r = ((color >> 16) & 0xFF) * a / 255;
-                            uint8_t g = ((color >> 8) & 0xFF) * a / 255;
-                            uint8_t b = (color & 0xFF) * a / 255;
-                            vf->framebuf[dy*320+dx] = 0xFF000000 |
-                                ((uint32_t)r<<16)|((uint32_t)g<<8)|b;
-                        }
+        /* Render parallax desert scene every frame */
+        {
+            static const uint32_t t_off[] = {
+                0x000000,0x020000,0x028000,0x02C000,0x034000,
+                0x038000,0x048000,0x04A000,0x05A000,0x062000,
+                0x072000,0x074000,0x0F4000,0x0F6000,0x0FA000,
+                0x0FE000,0x0FE800,0x0FF800,0x100800,0x102800,
+                0x104800,0x105800,0x109800,0x119800,0x11B800,
+                0x12B800,0x12D800,0x131800,0x135800,
+            };
+            static const int t_h[] = {
+                256,64,32,64,32,128,16,128,64,128,16,1024,
+                16,32,32,4,8,8,16,16,8,32,128,16,128,16,32,32,84,
+            };
+            static const struct { int ti,y0,dh; uint8_t r,g,b; } L[] = {
+                {22,0,120, 90,150,210},{24,10,110, 110,170,220},
+                {9,50,100, 195,165,125},{5,60,110, 185,155,105},
+                {7,70,120, 85,135,60},{0,60,180, 175,145,90},
+                {8,140,100, 120,120,115},{3,150,90, 155,125,80},
+                {1,160,80, 210,185,135},{28,170,70, 180,150,105},
+            };
+            uint32_t tb = 0x1B8000 + 0x88000; /* tiles in sec[2] */
+            static int sx = 0;
+            if (vf->input & VFLASH_BTN_LEFT) sx -= 3;
+            if (vf->input & VFLASH_BTN_RIGHT) sx += 3;
+            if (sx < 0) sx += 512; if (sx >= 512) sx -= 512;
+            /* Sky gradient */
+            for (int y=0;y<240;y++){
+                int t=y*256/240;
+                int sr=80+(200-80)*t/256, sg=140+(180-140)*t/256, sb=210+(140-210)*t/256;
+                for(int x=0;x<320;x++)
+                    vf->framebuf[y*320+x]=0xFF000000|((uint32_t)sr<<16)|((uint32_t)sg<<8)|sb;
+            }
+            /* Parallax layers */
+            for (int li=0;li<10;li++){
+                int ti=L[li].ti,th=t_h[ti],y0=L[li].y0,dh=L[li].dh;
+                uint8_t cr=L[li].r,cg=L[li].g,cb=L[li].b;
+                uint32_t base=tb+t_off[ti];
+                if(base+512*th>VFLASH_RAM_SIZE) continue;
+                int lsx=sx*(li+2)/12;
+                int vs=th/dh; if(vs<2)vs=2; if(vs>8)vs=8;
+                for(int y=y0;y<y0+dh&&y<240;y++){
+                    int sy0=(y-y0)*th/dh;
+                    for(int x=0;x<320;x++){
+                        int ssx=((x*512/320)+lsx)%512;
+                        int sum=0,cnt=0;
+                        for(int d=0;d<vs&&sy0+d<th;d++){sum+=vf->ram[base+(sy0+d)*512+ssx];cnt++;}
+                        uint8_t v=(uint8_t)(cnt?sum/cnt:0);
+                        if(v<8)continue;
+                        uint32_t old=vf->framebuf[y*320+x];
+                        uint8_t or2=(old>>16)&0xFF,og=(old>>8)&0xFF,ob=old&0xFF;
+                        int a=v;
+                        vf->framebuf[y*320+x]=0xFF000000|
+                            ((uint32_t)((or2*(255-a)+cr*a)/255)<<16)|
+                            ((uint32_t)((og*(255-a)+cg*a)/255)<<8)|
+                            ((ob*(255-a)+cb*a)/255);
                     }
                 }
             }
+            /* Circular mask */
+            for(int y=0;y<240;y++)
+                for(int x=0;x<320;x++){
+                    int a=mask_alpha[y*320+x];
+                    if(a<255){
+                        uint32_t px=vf->framebuf[y*320+x];
+                        uint8_t r=((px>>16)&0xFF)*a/255,g=((px>>8)&0xFF)*a/255,b=(px&0xFF)*a/255;
+                        vf->framebuf[y*320+x]=0xFF000000|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                    }
+                }
             vf->vid.fb_dirty = 1;
         }
         sec2_skip: ;
