@@ -7122,6 +7122,52 @@ void vflash_run_frame(VFlash *vf) {
                     printf("[SCENE] Created %d sprites + %d tiles from resource table\n",
                            sprites, tiles);
                 }
+                /* Re-run VFF scene callbacks now that RELOC code is in place.
+                 * First pass (before RELOC) had zeroed code → NOPs.
+                 * Second pass may decompress tiles or initialize scene objects. */
+                {
+                    uint32_t dt_base_off = 0x500800;
+                    uint32_t s0_addr = 0x104E2000;
+                    int cb_total = 0, cb_steps = 0;
+                    uint32_t save_regs2[16]; uint32_t save_cpsr2;
+                    memcpy(save_regs2, vf->cpu.r, sizeof(save_regs2));
+                    save_cpsr2 = vf->cpu.cpsr;
+                    for (uint32_t di = 0; di < 0xDA0; di += 4) {
+                        uint32_t v = *(uint32_t*)(vf->ram + dt_base_off + di);
+                        /* Callback pointers are in VFF sec[0] code area or BOOT.BIN */
+                        if ((v >= s0_addr && v < s0_addr + 0x20000) ||
+                            (v >= 0x10A00000 && v < 0x10D00000)) {
+                            /* Skip if code at target is zeroed */
+                            uint32_t toff = v - 0x10000000;
+                            if (toff + 4 > VFLASH_RAM_SIZE) continue;
+                            if (*(uint32_t*)(vf->ram + toff) == 0) continue;
+                            vf->cpu.r[0] = 0x10300000;
+                            vf->cpu.r[1] = di;
+                            vf->cpu.r[15] = v;
+                            vf->cpu.r[14] = 0x10FFF000;
+                            vf->cpu.r[13] = 0x10B8D000;
+                            vf->cpu.cpsr = 0x000000D3;
+                            int si;
+                            for (si = 0; si < 200000; si++) {
+                                arm9_step(&vf->cpu);
+                                uint32_t npc = vf->cpu.r[15];
+                                if (npc == 0x10FFF000 || npc < 4 ||
+                                    (npc > 0x11000000 && npc < 0x80000000)) break;
+                            }
+                            cb_steps += si;
+                            cb_total++;
+                        }
+                    }
+                    memcpy(vf->cpu.r, save_regs2, sizeof(save_regs2));
+                    vf->cpu.cpsr = save_cpsr2;
+                    printf("[VFF-EXEC2] Re-ran %d scene callbacks (%d total steps)\n",
+                           cb_total, cb_steps);
+                    /* Check if tiles were decompressed to 0x10240000 */
+                    int nz_tiles = 0;
+                    for (uint32_t t = 0x240000; t < 0x260000; t += 4)
+                        if (*(uint32_t*)(vf->ram + t)) nz_tiles++;
+                    printf("[VFF-EXEC2] Tile data at 0x10240000: %d non-zero words\n", nz_tiles);
+                }
             }
         }
 
