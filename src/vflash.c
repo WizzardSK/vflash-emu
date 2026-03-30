@@ -7422,25 +7422,31 @@ void vflash_run_frame(VFlash *vf) {
                         }
                     }
                     if (scene_px && scene_w > 0 && scene_h > 0) {
-                        for (int y = 0; y < 240; y++) {
-                            int sy = y * scene_h / 240;
-                            for (int x = 0; x < 320; x++) {
-                                int sx = x * scene_w / 320;
+                        /* Preserve aspect ratio: fit width, center vertically */
+                        int disp_w = 320;
+                        int disp_h = 320 * scene_h / scene_w;
+                        if (disp_h > 240) { disp_h = 240; disp_w = 240 * scene_w / scene_h; }
+                        int y_off = (240 - disp_h) / 2;
+                        int x_off = (320 - disp_w) / 2;
+                        /* Clear to black */
+                        memset(vf->framebuf, 0, 320*240*4);
+                        for (int y = 0; y < disp_h; y++) {
+                            int sy = y * scene_h / disp_h;
+                            for (int x = 0; x < disp_w; x++) {
+                                int sx = x * scene_w / disp_w;
+                                int dy = y + y_off, dx = x + x_off;
+                                if (dy < 0 || dy >= 240 || dx < 0 || dx >= 320) continue;
                                 if (scene_bpp == 8) {
-                                    /* 8bpp indexed with PTX palette */
                                     uint8_t idx = scene_px[sy * scene_w + sx];
                                     uint32_t c = vf->ptx_pal[idx];
-                                    vf->framebuf[y*320+x] = c ? c : 0xFF000000;
+                                    vf->framebuf[dy*320+dx] = c ? c : 0xFF000000;
                                 } else {
-                                    /* 16bpp XBGR1555 direct color */
                                     uint32_t off2 = (sy * scene_w + sx) * 2;
                                     uint16_t p = *(uint16_t*)(scene_px + off2);
-                                    if (p == 0) {
-                                        vf->framebuf[y*320+x] = 0xFF000000;
-                                    } else {
+                                    if (p != 0) {
                                         uint8_t r=(p&0x1F)<<3, g=((p>>5)&0x1F)<<3,
                                                 b=((p>>10)&0x1F)<<3;
-                                        vf->framebuf[y*320+x] = 0xFF000000 |
+                                        vf->framebuf[dy*320+dx] = 0xFF000000 |
                                             ((uint32_t)r<<16)|((uint32_t)g<<8)|b;
                                     }
                                 }
