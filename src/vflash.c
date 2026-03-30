@@ -5127,11 +5127,18 @@ void vflash_run_frame(VFlash *vf) {
                 phase = 101;
                 printf("[BOOT] BOOT.BIN init complete → idle at 0x%08X\n", pc);
                 /* Early backup: RTOS code should be intact at this point.
-                 * Do it unconditionally (even if later backup exists). */
+                 * BOOT.BIN init relocated code to 0x109D0000+ before returning. */
                 {
                     if (!vf->rtos_backup) vf->rtos_backup = malloc(VFLASH_RAM_SIZE);
                     if (vf->rtos_backup) {
                         memcpy(vf->rtos_backup, vf->ram, VFLASH_RAM_SIZE);
+                        printf("[EARLY-BACKUP] [9D0000]=%08X [9D1CE0]=%08X "
+                               "[A80000]=%08X [A89100]=%08X [B0DB0C]=%08X\n",
+                               *(uint32_t*)(vf->ram + 0x9D0000),
+                               *(uint32_t*)(vf->ram + 0x9D1CE0),
+                               *(uint32_t*)(vf->ram + 0xA80000),
+                               *(uint32_t*)(vf->ram + 0xA89100),
+                               *(uint32_t*)(vf->ram + 0xB0DB0C));
                     }
                 }
                 /* Check if BSS service table got populated */
@@ -6911,19 +6918,48 @@ void vflash_run_frame(VFlash *vf) {
          * Some games (Incredibles) run directly from BOOT.BIN (0x10C0xxxx).
          * Skip relocation for those — it would overwrite their running code! */
         int game_in_bootbin = (vf->cpu.r[15] >= 0x10C00000 && vf->cpu.r[15] < 0x10E00000);
-        /* RELOC-GAMELOOP: restore utility code for ALL games (including BOOT.BIN).
-         * BOOT.BIN games (Incredibles) still need utility functions at 0x109Dxxxx
-         * because their switch case handlers BL into this area. */
-        if (vf->rtos_backup) {
-            uint32_t dst = 0x9D0000;
-            uint32_t src = 0xC0B014; /* BOOT.BIN in RAM: 0x10C00000+0xB0014 */
-            uint32_t sz = 0xA80000 - 0x9D0000; /* 704KB */
-            if (src + sz <= VFLASH_RAM_SIZE) {
-                memcpy(vf->ram + dst, vf->rtos_backup + src, sz);
-                uint32_t gl_first = *(uint32_t*)(vf->ram + 0x9D1CE0);
-                printf("[RELOC-GAMELOOP] Copied %d bytes from backup: %08X→%08X"
-                       " (game_loop[0]=%08X)\n",
-                       sz, 0x10000000+src, 0x10000000+dst, gl_first);
+        /* RELOC: restore relocated code that was zeroed by BSS clear.
+         * Game code lives in BOOT.BIN at 0x10C00000+. The game init copies it to
+         * 0x109D0000+ (with delta 0x23B014) then BSS-clears. We restore from the
+         * BOOT.BIN copy in backup RAM (5A-patched but code intact).
+         * Strategy: find first ARM code in BOOT.BIN area, copy to target. */
+        {
+            const uint32_t RELOC_DELTA = 0x23B014;
+            /* Find actual code start in BOOT.BIN area by scanning for PUSH */
+            uint32_t code_start = 0;
+            uint8_t *src_ram = vf->rtos_backup ? vf->rtos_backup : vf->ram;
+            for (uint32_t scan = 0xC0C000; scan < 0xD00000; scan += 4) {
+                uint32_t w = *(uint32_t*)(src_ram + scan);
+                if ((w & 0xFFFF0000) == 0xE92D0000) {
+                    code_start = scan;
+                    break;
+                }
+            }
+            if (!code_start) code_start = 0xC0C4A4; /* Cars default */
+
+            uint32_t target_start = code_start - RELOC_DELTA;
+            /* Copy entire code block from BOOT.BIN area to relocated target */
+            uint32_t copy_end = 0xB30000; /* max target address */
+            uint32_t copy_sz = copy_end - target_start;
+            uint32_t src_end = code_start + copy_sz;
+            if (src_end > VFLASH_RAM_SIZE) copy_sz = VFLASH_RAM_SIZE - code_start;
+
+            /* Clear target area first, then copy */
+            if (target_start >= 0x9D0000 && target_start + copy_sz <= VFLASH_RAM_SIZE) {
+                memset(vf->ram + 0x9D0000, 0, target_start - 0x9D0000); /* zero gap */
+                memcpy(vf->ram + target_start, src_ram + code_start, copy_sz);
+                uint32_t first = *(uint32_t*)(vf->ram + target_start);
+                printf("[RELOC] Copied %dKB: 0x%08X → 0x%08X (first=%08X)\n",
+                       copy_sz/1024, 0x10000000+code_start,
+                       0x10000000+target_start, first);
+                /* Verify key addresses */
+                printf("[RELOC] gameloop[0]=%08X render[0]=%08X fix[0]=%08X\n",
+                       *(uint32_t*)(vf->ram + 0x9D1CE0),
+                       *(uint32_t*)(vf->ram + 0xA89100),
+                       *(uint32_t*)(vf->ram + 0xB0DB0C));
+            } else {
+                printf("[RELOC] FAILED: code_start=0x%08X target=0x%08X\n",
+                       0x10000000+code_start, 0x10000000+target_start);
             }
         }
         if (!game_in_bootbin) {
@@ -6937,56 +6973,7 @@ void vflash_run_frame(VFlash *vf) {
             printf("[GAME] Running from BOOT.BIN at PC=0x%08X — PC+timer preserved\n",
                    vf->cpu.r[15]);
         }
-        /* RELOC-RENDER: restore render/engine code for ALL games.
-         * BOOT.BIN games also call render functions in this area. */
-        {
-            uint32_t src = 0xCBB014;
-            uint32_t dst = 0xA80000;
-            uint32_t sz  = 0x8DB0C;
-            uint8_t *copy_src = vf->rtos_backup;
-            const char *src_name = "backup";
-            /* Check if backup has code at this offset */
-            if (copy_src && *(uint32_t*)(copy_src + src) == 0) {
-                /* Backup area zeroed by BSS clear — fall back to CD */
-                copy_src = NULL;
-            }
-            if (copy_src) {
-                memcpy(vf->ram + dst, copy_src + src, sz);
-            } else if (vf->cd && vf->cd->is_open) {
-                CDEntry boot_e;
-                if (cdrom_find_file_any(vf->cd, "BOOT.BIN", &boot_e)) {
-                    cdrom_read_file(vf->cd, &boot_e,
-                        vf->ram + dst, src - 0xC00000, sz);
-                }
-                src_name = "CD";
-            }
-            uint32_t first = *(uint32_t*)(vf->ram + dst + 0x9100);
-            printf("[RELOC-RENDER] Copied %d bytes from %s: %08X→%08X"
-                   " (render_processing[0]=%08X)\n",
-                   sz, src_name, 0x10000000+src, 0x10000000+dst, first);
-        }
-        /* RELOC-FIX: copy unrelocated functions + vtables for ALL games.
-         * Extends past original 73 functions to include scene graph vtables
-         * at 0x10B2C13C and code up to 0x10B30FE8 (discovered via Ghidra). */
-        {
-            uint32_t src = 0xD48B20;  /* 10D48B20: first unrelocated function */
-            uint32_t dst = 0xB0DB0C;  /* 10B0DB0C: relocation target */
-            uint32_t sz  = 0x224F4;   /* 140,532 bytes: functions + vtables to 0x10B30000 */
-            if (src + sz <= VFLASH_RAM_SIZE && dst + sz <= VFLASH_RAM_SIZE) {
-                /* Verify source has ARM code (first function should start with PUSH) */
-                uint32_t first = *(uint32_t*)(vf->ram + src);
-                if ((first & 0xFFFF0000) == 0xE92D0000 || /* PUSH */
-                    (first & 0xFFFFF000) == 0xE24DD000 || /* SUB SP */
-                    (first & 0xFFFF0000) == 0xE52D0000) { /* STR ..,[SP] */
-                    memcpy(vf->ram + dst, vf->ram + src, sz);
-                    printf("[RELOC-FIX] Copied %d bytes: %08X→%08X (73 functions)\n",
-                           sz, 0x10000000+src, 0x10000000+dst);
-                } else {
-                    printf("[RELOC-FIX] Source %08X has %08X (not a function prologue)\n",
-                           0x10000000+src, first);
-                }
-            }
-        }
+        /* (RELOC-RENDER and RELOC-FIX merged into unified RELOC above) */
         /* Set up LCD controller. */
         vf->lcd.control = 0x082D; /* 16bpp565, TFT, power, enabled */
         /* Fix IRQ vector for BOOT.BIN games: SDRAM vectors get corrupted by
