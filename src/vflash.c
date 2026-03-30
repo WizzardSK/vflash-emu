@@ -7154,6 +7154,15 @@ void vflash_run_frame(VFlash *vf) {
                     for (uint32_t t = 0x240000; t < 0x260000; t += 4)
                         if (*(uint32_t*)(vf->ram + t)) nz_tiles++;
                     printf("[VFF-EXEC2] Tile data at 0x10240000: %d non-zero words\n", nz_tiles);
+                    /* Dump decompressed tiles for visualization */
+                    if (nz_tiles > 100) {
+                        FILE *td = fopen("/tmp/vflash_tiles.bin", "wb");
+                        if (td) {
+                            fwrite(vf->ram + 0x240000, 1, 0x140000, td);
+                            fclose(td);
+                            printf("[VFF-EXEC2] Dumped 1.25MB tile data to /tmp/vflash_tiles.bin\n");
+                        }
+                    }
                 }
             }
         }
@@ -7590,96 +7599,70 @@ void vflash_run_frame(VFlash *vf) {
                         if (layer_y[order[i]] > layer_y[order[j]]) {
                             int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
                         }
-                /* Use DECOMPRESSED tile data at 0x10240000 as layer sources.
-                 * 29 tiles total (512x256, 256x128, etc.) — assign groups of
-                 * tiles to each render layer based on Y position. */
-                static const struct { int tile_idx; int tw; int th; } layer_tiles[16] = {
-                    { 0, 512,256}, /* 0: Y=192 ground — tile 0 (512x256) */
-                    { 5, 512,128}, /* 1: Y=64  terrain — tile 5 (512x128) */
-                    { 9, 512,128}, /* 2: Y=128 horizon — tile 9 (512x128) */
-                    { 7, 256,256}, /* 3: Y=192 vegetation — tile 7 (256x256) */
-                    { 8, 512, 64}, /* 4: Y=192 road — tile 8 (512x64) */
-                    {22, 256,256}, /* 5: Y=0   sky — tile 22 (256x256) */
-                    { 1, 256,128}, /* 6: Y=64  sand — tile 1 (256x128) */
-                    { 3, 256,128}, /* 7: Y=192 dark ground — tile 3 (256x128) */
-                    {24, 512,128}, /* 8: Y=192 light sky — tile 24 (512x128) */
-                    { 6, 128, 64}, /* 9: Y=192 red accent — tile 6 (128x64) */
-                    { 2, 512, 32}, /*10: Y=64  road gray — tile 2 (512x32) */
-                    { 4, 512, 32}, /*11: Y=192 light sand — tile 4 (512x32) */
-                    {21, 256, 64}, /*12: Y=192 dark green — tile 21 (256x64) */
-                    {26, 256, 64}, /*13: Y=192 tan — tile 26 (256x64) */
-                    {27, 128,128}, /*14: Y=64  blue detail — tile 27 (128x128) */
-                    {10, 256, 32}, /*15: Y=336 yellow — tile 10 (256x32) */
-                };
-                /* Tile offset table (cumulative sizes) */
-                static const uint32_t tile_offsets[] = {
-                    0x000000,0x020000,0x028000,0x02C000,0x034000,
-                    0x038000,0x048000,0x04A000,0x05A000,0x062000,
-                    0x072000,0x074000,0x0F4000,0x0F6000,0x0FA000,
-                    0x0FE000,0x0FE800,0x0FF800,0x100800,0x102800,
-                    0x104800,0x105800,0x109800,0x119800,0x11B800,
-                    0x12B800,0x12D800,0x131800,0x135800,
-                };
-                for (int li = 0; li < 16; li++) {
-                    int idx = order[li];
-                    int ly = layer_y[idx];
-                    if (ly >= 240) continue;
-                    int ti = layer_tiles[idx].tile_idx;
-                    int tw = layer_tiles[idx].tw;
-                    int th = layer_tiles[idx].th;
-                    uint32_t dp = tile_off + tile_offsets[ti];
-                    if (dp + (uint32_t)(tw*th) > VFLASH_RAM_SIZE) continue;
-                    int lh = (ly == 0) ? 80 : 60;
-                    int y_start = ly * 240 / 320;
-                    if (y_start + lh > 240) lh = 240 - y_start;
-                    for (int y = y_start; y < y_start + lh && y < 240; y++) {
-                        for (int x = 0; x < 320; x++) {
-                            int sy = (y - y_start) * th / lh;
-                            int sx = x * tw / 320;
-                            if (sy >= th) sy = th - 1;
-                            if (sx >= tw) sx = tw - 1;
-                            uint8_t v = vf->ram[dp + sy * tw + sx];
-                            if (v == 0) continue;
-                            if (vf->ptx_has_pal) {
-                                /* Use PTX palette for true color rendering */
-                                uint32_t c = vf->ptx_pal[v];
-                                if (c & 0xFF000000)
-                                    vf->framebuf[y*320+x] = c;
-                            } else {
-                                /* Fallback: per-layer color intensity */
-                                uint8_t cr = layer_colors[idx].r;
-                                uint8_t cg = layer_colors[idx].g;
-                                uint8_t cb = layer_colors[idx].b;
-                                uint32_t old = vf->framebuf[y*320+x];
-                                uint8_t or2=(old>>16)&0xFF, og=(old>>8)&0xFF, ob=old&0xFF;
-                                int a = v;
-                                uint8_t nr = (uint8_t)((or2*(255-a) + cr*a) / 255);
-                                uint8_t ng = (uint8_t)((og*(255-a) + cg*a) / 255);
-                                uint8_t nb = (uint8_t)((ob*(255-a) + cb*a) / 255);
-                                vf->framebuf[y*320+x] =
-                                    0xFF000000|((uint32_t)nr<<16)|((uint32_t)ng<<8)|nb;
-                            }
-                        }
-                    }
-                }
-                /* Overlay sec[1] tile 11 (1024x512) as detail layer */
+                /* Parallax layer compositor.
+                 * All 29 decompressed tiles are 512px wide, each a separate
+                 * parallax layer covering the SAME screen area. Render back-to-
+                 * front: sky layer first, terrain layers on top, details last.
+                 * Non-zero pixels overwrite (alpha compositing via palette). */
                 {
-                    uint32_t t11 = tile_off + 0x074000;
-                    for (int y = 60; y < 200; y++) {
-                        int sy = (y - 60) * 512 / 140;
-                        for (int x = 0; x < 320; x++) {
-                            int sx = x * 1024 / 320;
-                            if (t11 + sy*1024+sx >= VFLASH_RAM_SIZE) break;
-                            uint8_t v = vf->ram[t11 + sy*1024 + sx];
-                            if (v < 30) continue; /* skip low intensity */
-                            uint32_t old = vf->framebuf[y*320+x];
-                            uint8_t or2=(old>>16)&0xFF, og=(old>>8)&0xFF, ob=old&0xFF;
-                            int a = v / 3; /* subtle overlay */
-                            uint8_t nr = (uint8_t)((or2*(255-a) + 200*a)/255);
-                            uint8_t ng = (uint8_t)((og*(255-a) + 160*a)/255);
-                            uint8_t nb = (uint8_t)((ob*(255-a) + 100*a)/255);
-                            vf->framebuf[y*320+x] =
-                                0xFF000000|((uint32_t)nr<<16)|((uint32_t)ng<<8)|nb;
+                    static const uint32_t tile_offsets[] = {
+                        0x000000,0x020000,0x028000,0x02C000,0x034000,
+                        0x038000,0x048000,0x04A000,0x05A000,0x062000,
+                        0x072000,0x074000,0x0F4000,0x0F6000,0x0FA000,
+                        0x0FE000,0x0FE800,0x0FF800,0x100800,0x102800,
+                        0x104800,0x105800,0x109800,0x119800,0x11B800,
+                        0x12B800,0x12D800,0x131800,0x135800,
+                    };
+                    static const int tile_h[] = {
+                        256,64,32,64,32,128,16,128,64,128,16,1024,
+                        16,32,32,4,8,8,16,16,8,32,128,16,128,16,32,32,84,
+                    };
+                    /* Parallax layer compositor with per-layer color tinting.
+                     * Tiles are 512px wide, 8bpp INTENSITY maps (0=transparent).
+                     * PTX palette is for photos, NOT for landscape tiles.
+                     * Each layer has a characteristic RGB color × tile intensity. */
+                    static const struct {
+                        int ti, y0, dh;
+                        uint8_t r, g, b;
+                    } layers[] = {
+                        {22,   0,  96,  100,160,220}, /* sky */
+                        {24,   0,  96,  120,180,230}, /* sky detail */
+                        { 9,  30, 130,  180,160,130}, /* distant terrain */
+                        { 5,  50, 130,  170,150,110}, /* mid terrain */
+                        { 7,  60, 130,   80,140, 60}, /* vegetation */
+                        { 0,  70, 170,  160,130, 80}, /* main ground */
+                        { 8, 130,  80,  130,130,130}, /* road */
+                        { 1, 140,  70,  200,170,120}, /* sand */
+                        { 3, 150,  70,  140,110, 70}, /* dark ground */
+                        {28, 160,  80,  170,140,100}, /* foreground */
+                    };
+                    int n_layers = sizeof(layers) / sizeof(layers[0]);
+                    int tw = 512;
+                    for (int li = 0; li < n_layers; li++) {
+                        int ti = layers[li].ti;
+                        int th = tile_h[ti];
+                        int y0 = layers[li].y0;
+                        int dh = layers[li].dh;
+                        uint8_t cr = layers[li].r, cg = layers[li].g, cb = layers[li].b;
+                        uint32_t base = tile_off + tile_offsets[ti];
+                        if (base + tw * th > VFLASH_RAM_SIZE) continue;
+                        for (int y = y0; y < y0 + dh && y < 240; y++) {
+                            int sy = (y - y0) * th / dh;
+                            if (sy >= th) sy = th - 1;
+                            uint32_t row = base + sy * tw;
+                            for (int x = 0; x < 320; x++) {
+                                int sx = x * tw / 320;
+                                uint8_t v = vf->ram[row + sx];
+                                if (v < 8) continue; /* transparent */
+                                uint32_t old = vf->framebuf[y*320+x];
+                                uint8_t or2=(old>>16)&0xFF,og=(old>>8)&0xFF,ob=old&0xFF;
+                                int a = v;
+                                uint8_t nr=(uint8_t)((or2*(255-a)+cr*a)/255);
+                                uint8_t ng=(uint8_t)((og*(255-a)+cg*a)/255);
+                                uint8_t nb=(uint8_t)((ob*(255-a)+cb*a)/255);
+                                vf->framebuf[y*320+x] = 0xFF000000 |
+                                    ((uint32_t)nr<<16)|((uint32_t)ng<<8)|nb;
+                            }
                         }
                     }
                 }
