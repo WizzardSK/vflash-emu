@@ -3808,8 +3808,8 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
                 }
             }
         }
-        /* Skip PTX blit — tile overlay already wrote to render FB */
-        if (0 && vf2->ptx_has_pal && vf2->ptx_stride > 0) {
+        /* PTX artwork over tile layers (blended) */
+        if (vf2->ptx_has_pal && vf2->ptx_stride > 0) {
             CDEntry *pe = &vf2->ptx_list[0]; /* first large PTX */
             static uint8_t *ptx_px = NULL;
             static int ptx_h_cached = 0;
