@@ -6769,9 +6769,8 @@ void vflash_run_frame(VFlash *vf) {
                         }
                     }
                 }
-                printf("[VFF-EXEC] Called %d scene callbacks (%d steps, %d BL targets)\n",
-                       cb_called, total_cb_steps, bl_count);
-                printf("[VFF-BL] Total unique BOOT.BIN calls: %d\n", bl_count);
+                printf("[VFF-EXEC] Called %d scene callbacks (%d steps)\n",
+                       cb_called, total_cb_steps);
                 printf("[VFF-SCENE] Entity callback: %d steps\n", si);
                 /* Log entity vtable values after scene callback */
                 printf("[VFF-SCENE] Entity data after callback:\n");
@@ -7294,11 +7293,13 @@ void vflash_run_frame(VFlash *vf) {
                     }
                 }
             }
-            /* Render VFF scene from dispatch table tile data.
-             * Tile data lives in sec[1] at data_ptr entries, always available
-             * after VFF-RELOAD. Falls back to 0x240000 if decompressed data exists. */
+            /* Render VFF scene from tile pixel data.
+             * Tiles are stored UNCOMPRESSED in sec[2] at offset 0x88000
+             * (RAM address 0x10240000 = sec[2] base 0x101B8000 + 0x88000).
+             * 29 tiles, all 512px wide, varying heights (4-1024 rows).
+             * Sprites in sec[1] are compressed (custom format, not yet decoded). */
             int ent_count = 0;
-            uint32_t tile_off = 0x240000;
+            uint32_t tile_off = 0x1B8000 + 0x88000; /* sec[2] + tile data offset */
             int nz = 0;
             for (uint32_t ti = 0; ti < 512*256 && ti + tile_off < VFLASH_RAM_SIZE; ti++)
                 if (vf->ram[tile_off + ti]) nz++;
