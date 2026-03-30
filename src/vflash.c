@@ -7643,13 +7643,22 @@ void vflash_run_frame(VFlash *vf) {
                         uint8_t cr = layers[li].r, cg = layers[li].g, cb = layers[li].b;
                         uint32_t base = tile_off + tile_offsets[ti];
                         if (base + tw * th > VFLASH_RAM_SIZE) continue;
+                        /* Vertical box filter: average N source rows per display row
+                         * to eliminate horizontal banding from tile data. */
+                        int vscale = th / dh; /* source rows per display row */
+                        if (vscale < 2) vscale = 2;
+                        if (vscale > 8) vscale = 8;
                         for (int y = y0; y < y0 + dh && y < 240; y++) {
-                            int sy = (y - y0) * th / dh;
-                            if (sy >= th) sy = th - 1;
-                            uint32_t row = base + sy * tw;
+                            int sy0 = (y - y0) * th / dh;
                             for (int x = 0; x < 320; x++) {
                                 int sx = x * tw / 320;
-                                uint8_t v = vf->ram[row + sx];
+                                /* Average vscale rows for smoother result */
+                                int sum = 0, cnt = 0;
+                                for (int dy = 0; dy < vscale && sy0+dy < th; dy++) {
+                                    sum += vf->ram[base + (sy0+dy)*tw + sx];
+                                    cnt++;
+                                }
+                                uint8_t v = (uint8_t)(cnt ? sum / cnt : 0);
                                 if (v < 8) continue; /* transparent */
                                 uint32_t old = vf->framebuf[y*320+x];
                                 uint8_t or2=(old>>16)&0xFF,og=(old>>8)&0xFF,ob=old&0xFF;
