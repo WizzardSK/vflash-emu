@@ -7635,6 +7635,14 @@ void vflash_run_frame(VFlash *vf) {
                     };
                     int n_layers = sizeof(layers) / sizeof(layers[0]);
                     int tw = 512;
+                    /* Parallax scroll: arrow keys move the camera.
+                     * Each layer scrolls at a different rate (distant=slow,
+                     * near=fast) for depth illusion. */
+                    static int scroll_x = 0;
+                    if (vf->input & VFLASH_BTN_LEFT)  scroll_x -= 3;
+                    if (vf->input & VFLASH_BTN_RIGHT) scroll_x += 3;
+                    if (scroll_x < 0) scroll_x += tw;
+                    if (scroll_x >= tw) scroll_x -= tw;
                     for (int li = 0; li < n_layers; li++) {
                         int ti = layers[li].ti;
                         int th = tile_h[ti];
@@ -7643,15 +7651,16 @@ void vflash_run_frame(VFlash *vf) {
                         uint8_t cr = layers[li].r, cg = layers[li].g, cb = layers[li].b;
                         uint32_t base = tile_off + tile_offsets[ti];
                         if (base + tw * th > VFLASH_RAM_SIZE) continue;
-                        /* Vertical box filter: average N source rows per display row
-                         * to eliminate horizontal banding from tile data. */
-                        int vscale = th / dh; /* source rows per display row */
+                        /* Layer parallax factor: back layers scroll slower */
+                        int layer_scroll = scroll_x * (li + 2) / (n_layers + 2);
+                        /* Vertical box filter */
+                        int vscale = th / dh;
                         if (vscale < 2) vscale = 2;
                         if (vscale > 8) vscale = 8;
                         for (int y = y0; y < y0 + dh && y < 240; y++) {
                             int sy0 = (y - y0) * th / dh;
                             for (int x = 0; x < 320; x++) {
-                                int sx = x * tw / 320;
+                                int sx = ((x * tw / 320) + layer_scroll) % tw;
                                 /* Average vscale rows for smoother result */
                                 int sum = 0, cnt = 0;
                                 for (int dy = 0; dy < vscale && sy0+dy < th; dy++) {
@@ -7721,6 +7730,59 @@ void vflash_run_frame(VFlash *vf) {
                             if (!mask_log) {
                                 mask_log = 1;
                                 printf("[SEC2-MASK] Applied %dx%d viewport over tiles\n", mw, mh);
+                            }
+                        }
+                    }
+                }
+                /* PTX photo overlay: Enter cycles through KW tutorial photos.
+                 * Red/Yellow buttons show next/prev PTX sprite from atlas. */
+                if (vf->ptx_count > 0 && vf->cd) {
+                    static int show_ptx = 0;
+                    static int ptx_idx = 0;
+                    uint32_t press = vf->input & ~vf->input_prev;
+                    if (press & VFLASH_BTN_ENTER) show_ptx = !show_ptx;
+                    if (press & VFLASH_BTN_RED)
+                        ptx_idx = (ptx_idx + 1) % vf->ptx_count;
+                    if (press & VFLASH_BTN_YELLOW)
+                        ptx_idx = (ptx_idx + vf->ptx_count - 1) % vf->ptx_count;
+                    if (show_ptx && vf->ptx_has_pal) {
+                        CDEntry *pe = &vf->ptx_list[ptx_idx];
+                        static uint8_t *pbuf = NULL;
+                        static int pbuf_sz = 0;
+                        static int last_idx = -1;
+                        if (ptx_idx != last_idx) {
+                            last_idx = ptx_idx;
+                            free(pbuf);
+                            pbuf = malloc(pe->size);
+                            if (pbuf) {
+                                pbuf_sz = cdrom_read_file(vf->cd, pe, pbuf, 0, pe->size);
+                            }
+                        }
+                        if (pbuf && pbuf_sz > 44) {
+                            int pw = *(uint16_t*)(pbuf + 8);
+                            int ph = *(uint16_t*)(pbuf + 10);
+                            int hs2 = *(uint32_t*)pbuf;
+                            if (pw == 0) pw = 1024;
+                            /* Show 256×256 photo centered in a window */
+                            int crop_w = (pw < 256) ? pw : 256;
+                            int crop_h = (ph < 256) ? ph : 256;
+                            int dx0 = (320 - crop_w) / 2;
+                            int dy0 = (240 - crop_h) / 2;
+                            for (int y = 0; y < crop_h; y++) {
+                                for (int x = 0; x < crop_w; x++) {
+                                    int sx = x + (ptx_idx % 4) * 256;
+                                    int sy = y + (ptx_idx / 4) * 128;
+                                    if (sx >= pw || sy >= ph) continue;
+                                    int poff = hs2 + sy * pw + sx;
+                                    if (poff >= pbuf_sz) continue;
+                                    uint8_t idx2 = pbuf[poff];
+                                    uint32_t c = vf->ptx_pal[idx2];
+                                    if (c & 0xFF000000) {
+                                        int fx = dx0+x, fy = dy0+y;
+                                        if (fx >= 0 && fx < 320 && fy >= 0 && fy < 240)
+                                            vf->framebuf[fy*320+fx] = c;
+                                    }
+                                }
                             }
                         }
                     }
