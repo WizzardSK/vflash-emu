@@ -7397,9 +7397,9 @@ void vflash_run_frame(VFlash *vf) {
                  * The tile strips at 0x10240000 are individual tile pieces
                  * that need tilemap composition (sec[2]) to assemble properly.
                  * For now, PTX provides the correct visual. */
-                if (vf->ptx_has_pal && vf->ptx_count > 0 && vf->cd) {
+                if (vf->ptx_count > 0 && vf->cd) {
                     static uint8_t *scene_px = NULL;
-                    static int scene_w = 0, scene_h = 0;
+                    static int scene_w = 0, scene_h = 0, scene_bpp = 0;
                     if (!scene_px) {
                         CDEntry *pe = &vf->ptx_list[0];
                         uint8_t *buf = malloc(pe->size);
@@ -7407,8 +7407,11 @@ void vflash_run_frame(VFlash *vf) {
                             int rd = cdrom_read_file(vf->cd, pe, buf, 0, pe->size);
                             if (rd > 44) {
                                 uint32_t hs = *(uint32_t*)buf;
-                                scene_w = vf->ptx_stride;
+                                scene_w = *(uint16_t*)(buf + 8);
+                                if (scene_w == 0) scene_w = vf->ptx_stride;
                                 scene_h = *(uint16_t*)(buf + 10);
+                                scene_bpp = *(uint32_t*)(buf + 12);
+                                if (scene_bpp != 8) scene_bpp = 16;
                                 if (scene_w > 0 && scene_h > 0 && hs < (uint32_t)rd) {
                                     scene_px = malloc(rd - hs);
                                     if (scene_px)
@@ -7423,9 +7426,24 @@ void vflash_run_frame(VFlash *vf) {
                             int sy = y * scene_h / 240;
                             for (int x = 0; x < 320; x++) {
                                 int sx = x * scene_w / 320;
-                                uint8_t idx = scene_px[sy * scene_w + sx];
-                                uint32_t c = vf->ptx_pal[idx];
-                                vf->framebuf[y*320+x] = c ? c : 0xFF000000;
+                                if (scene_bpp == 8) {
+                                    /* 8bpp indexed with PTX palette */
+                                    uint8_t idx = scene_px[sy * scene_w + sx];
+                                    uint32_t c = vf->ptx_pal[idx];
+                                    vf->framebuf[y*320+x] = c ? c : 0xFF000000;
+                                } else {
+                                    /* 16bpp XBGR1555 direct color */
+                                    uint32_t off2 = (sy * scene_w + sx) * 2;
+                                    uint16_t p = *(uint16_t*)(scene_px + off2);
+                                    if (p == 0) {
+                                        vf->framebuf[y*320+x] = 0xFF000000;
+                                    } else {
+                                        uint8_t r=(p&0x1F)<<3, g=((p>>5)&0x1F)<<3,
+                                                b=((p>>10)&0x1F)<<3;
+                                        vf->framebuf[y*320+x] = 0xFF000000 |
+                                            ((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                                    }
+                                }
                             }
                         }
                     }
@@ -7434,8 +7452,8 @@ void vflash_run_frame(VFlash *vf) {
                     static int ptx_scene_log = 0;
                     if (!ptx_scene_log) {
                         ptx_scene_log = 1;
-                        printf("[HLE-RENDER] PTX scene %dx%d with palette\n",
-                               scene_w, scene_h);
+                        printf("[HLE-RENDER] PTX scene %dx%d %dbpp\n",
+                               scene_w, scene_h, scene_bpp);
                     }
                 } else {
                 /* Clear to sky gradient (fallback without palette) */
