@@ -7582,23 +7582,16 @@ void vflash_run_frame(VFlash *vf) {
                     }
                 } else {
                 /* Clear to sky gradient (fallback without palette) */
+                /* Desert sky gradient: light blue at top → warm tan at horizon */
                 for (int y = 0; y < 240; y++) {
-                    int sky_r = 60 + (100-60)*y/240;
-                    int sky_g = 120 + (170-120)*y/240;
-                    int sky_b = 200 + (240-200)*y/240;
+                    int t = y * 256 / 240; /* 0-255 top to bottom */
+                    int sky_r = 80 + (200-80)*t/256;    /* blue→tan */
+                    int sky_g = 140 + (180-140)*t/256;
+                    int sky_b = 210 + (140-210)*t/256;   /* blue→warm */
                     for (int x = 0; x < 320; x++)
                         vf->framebuf[y*320+x] = 0xFF000000 |
                             ((uint32_t)sky_r<<16)|((uint32_t)sky_g<<8)|sky_b;
                 }
-                /* Composite each layer from back (sky) to front (ground).
-                 * Sort by Y position: Y=0 first, Y=336 last. */
-                int order[16];
-                for (int i = 0; i < 16; i++) order[i] = i;
-                for (int i = 0; i < 15; i++)
-                    for (int j = i+1; j < 16; j++)
-                        if (layer_y[order[i]] > layer_y[order[j]]) {
-                            int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
-                        }
                 /* Parallax layer compositor.
                  * All 29 decompressed tiles are 512px wide, each a separate
                  * parallax layer covering the SAME screen area. Render back-to-
@@ -7625,16 +7618,20 @@ void vflash_run_frame(VFlash *vf) {
                         int ti, y0, dh;
                         uint8_t r, g, b;
                     } layers[] = {
-                        {22,   0,  96,  100,160,220}, /* sky */
-                        {24,   0,  96,  120,180,230}, /* sky detail */
-                        { 9,  30, 130,  180,160,130}, /* distant terrain */
-                        { 5,  50, 130,  170,150,110}, /* mid terrain */
-                        { 7,  60, 130,   80,140, 60}, /* vegetation */
-                        { 0,  70, 170,  160,130, 80}, /* main ground */
-                        { 8, 130,  80,  130,130,130}, /* road */
-                        { 1, 140,  70,  200,170,120}, /* sand */
-                        { 3, 150,  70,  140,110, 70}, /* dark ground */
-                        {28, 160,  80,  170,140,100}, /* foreground */
+                        /* Back: sky/clouds (cover top half) */
+                        {22,   0, 120,   90,150,210}, /* sky clouds */
+                        {24,  10, 110,  110,170,220}, /* sky detail */
+                        /* Mid: distant mesa/mountains */
+                        { 9,  50, 100,  195,165,125}, /* distant mesa */
+                        { 5,  60, 110,  185,155,105}, /* terrain band */
+                        /* Main: desert terrain + vegetation */
+                        { 7,  70, 120,   85,135, 60}, /* cactus/scrub */
+                        { 0,  60, 180,  175,145, 90}, /* main desert */
+                        /* Foreground: road + ground */
+                        { 8, 140, 100,  120,120,115}, /* asphalt road */
+                        { 3, 150,  90,  155,125, 80}, /* road shoulder */
+                        { 1, 160,  80,  210,185,135}, /* sandy ground */
+                        {28, 170,  70,  180,150,105}, /* fg detail */
                     };
                     int n_layers = sizeof(layers) / sizeof(layers[0]);
                     int tw = 512;
