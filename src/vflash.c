@@ -3767,10 +3767,49 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
             *(uint32_t*)(vf2->ram + 0xBE3C50) = ((fc-1) << 8) | flags; /* ctx[4] different */
         }
         vf2->ram[0xBE3C60] = 1; /* render state byte */
-        /* HLE: blit PTX artwork (8bpp with palette) to render FB as RGB565.
-         * This gives proper game scene display while tile decompression
-         * is still being reverse-engineered. */
-        if (vf2->ptx_has_pal && vf2->ptx_stride > 0) {
+        /* HLE: blit VFF tile data as 4bpp to render FB.
+         * Compressed tiles at dispatch table +0x2C, dims at desc +0x14.
+         * Not properly decompressed but shows tile structure. */
+        {
+            uint16_t *fb = (uint16_t*)(vf2->ram + 0xBBEAE0);
+            /* Read 9 layers from dispatch table */
+            static const uint16_t layer_pal[] = {
+                0xF800,0x07E0,0x001F,0xFFE0,0xF81F,0x07FF,0xFC00,0x83E0,0xFD20
+            };
+            memset(fb, 0, 320*240*2);
+            for (int li = 0; li < 9; li++) {
+                uint32_t dt_off = 0x500800 + li * 0x30;
+                uint32_t desc_ptr = *(uint32_t*)(vf2->ram + dt_off + 0x14);
+                uint32_t data_ptr = *(uint32_t*)(vf2->ram + dt_off + 0x2C);
+                if (desc_ptr < 0x10000000 || data_ptr < 0x10000000) continue;
+                uint32_t doff = desc_ptr - 0x10000000;
+                uint16_t tw = *(uint16_t*)(vf2->ram + doff + 0x14);
+                uint16_t th = *(uint16_t*)(vf2->ram + doff + 0x16);
+                if (tw == 0 || th == 0 || tw > 1024 || th > 512) continue;
+                uint32_t src = data_ptr - 0x10000000;
+                /* Blit as 4bpp with layer color */
+                uint16_t color = layer_pal[li];
+                int y_off = li * 26; /* stack layers vertically */
+                for (int y = 0; y < (int)th && y + y_off < 240; y++) {
+                    for (int x = 0; x < 320 && x < (int)tw; x++) {
+                        int sx = x * tw / 320;
+                        uint32_t byte_idx = (y * tw + sx) / 2;
+                        if (src + byte_idx >= VFLASH_RAM_SIZE) break;
+                        uint8_t b = vf2->ram[src + byte_idx];
+                        uint8_t nib = (sx & 1) ? (b & 0xF) : (b >> 4);
+                        if (nib > 0 && nib < 12) {
+                            /* Modulate layer color by nibble intensity */
+                            uint8_t r = ((color>>11)&0x1F) * nib / 11;
+                            uint8_t g = ((color>>5)&0x3F) * nib / 11;
+                            uint8_t bl = (color&0x1F) * nib / 11;
+                            fb[(y+y_off)*320+x] = (r<<11)|(g<<5)|bl;
+                        }
+                    }
+                }
+            }
+        }
+        /* Skip PTX blit — tile overlay already wrote to render FB */
+        if (0 && vf2->ptx_has_pal && vf2->ptx_stride > 0) {
             CDEntry *pe = &vf2->ptx_list[0]; /* first large PTX */
             static uint8_t *ptx_px = NULL;
             static int ptx_h_cached = 0;
