@@ -211,6 +211,39 @@ struct VFlash {
     uint32_t  pmu_regs[16];    /* PMU at 0x900B0000 */
     uint64_t  frame_count;
 
+    /* ZEVIO VIC (Vectored Interrupt Controller) at 0xDC000000 */
+    struct {
+        uint32_t status;     /* +0x00: bit 9 = active */
+        uint32_t control;    /* +0x04 */
+        uint32_t enable;     /* +0x08: write 0x200 to kick */
+        uint32_t disable;    /* +0x0C */
+        uint32_t ack;        /* +0x24: read = acknowledge */
+        uint32_t vector;     /* +0x28: read = current source, write = EOI prep */
+        uint32_t eoi;        /* +0x2C: write saved vector for EOI */
+        int      irq_active; /* 1 while IRQ is being serviced (between ack and eoi) */
+    } vic_irq, vic_fiq;
+
+    /* ZEVIO SoC Interrupt Controller at 0xB0001000 */
+    struct {
+        uint32_t global_ctrl; /* +0x00: bit 2 = global enable */
+        uint32_t status;      /* +0x04: low 6 bits = pending, bits 8-13 = enable */
+        uint32_t config[2];   /* +0x08, +0x0C */
+        uint32_t timer_irq[4];/* +0x10..+0x1C: timer IRQ routing */
+        uint32_t irq_clear;   /* +0x20 */
+    } soc_intc;
+
+    /* ZEVIO Timer Block at 0xB000000C (64 timers, stride 0x40) */
+    struct {
+        uint32_t ctrl;    /* +0x00: bit 4 = enable */
+        uint32_t mode;    /* +0x04 */
+        uint32_t match[3];/* +0x08, +0x0C, +0x10 */
+        uint32_t count;   /* +0x14 */
+        uint32_t status;  /* +0x18 */
+        uint32_t pad[6];  /* remaining to fill 0x40 stride */
+    } ztimer_hw[4]; /* only emulate first 4 timers for now */
+    uint32_t ztimer_master; /* 0xB0000000 */
+    int      ztimer_irq_log; /* logging throttle */
+
     VideoRegs vid;
     AudioRegs aud;
     CDRomRegs cdr;
@@ -268,6 +301,11 @@ struct VFlash {
     uint32_t dc_vblank_cb;       /* Display controller VBlank callback (from 0xB80007C0) */
     uint32_t dc_irq_handler;     /* Display controller IRQ handler (from 0xB8000784) */
     uint32_t dc_regs[64];        /* Display controller regs 0xB8000100-0xB80001FF */
+
+    /* VFF sec[1] watchpoint: track compressed sprite data region */
+    uint32_t sec1_base;          /* VA of sec[1] load address (from VFF header) */
+    uint32_t sec1_size;          /* sec[1] size in bytes */
+    int      sec1_wp_log;        /* watchpoint log throttle */
 
     uint32_t  framebuf[VFLASH_SCREEN_W * VFLASH_SCREEN_H];
 };
@@ -980,6 +1018,20 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
                        v, vf->cpu.r[15], vf->atapi.reboot_count);
             rd_wp++;
         }
+        /* sec[1] watchpoint: detect decompressor reading sprite data */
+        if (vf->boot_phase >= 900 && vf->sec1_size > 0 &&
+            (vf->cpu.cpsr & 0x1F) == 0x13) { /* SVC mode = game task */
+            uint32_t s1off = addr - vf->sec1_base;
+            if (s1off < vf->sec1_size) {
+                if (vf->sec1_wp_log < 50) {
+                    printf("[SEC1-WP] PC=%08X read [%08X] (sec1+0x%X)\n",
+                           vf->cpu.r[15], addr, s1off);
+                    vf->sec1_wp_log++;
+                    if (vf->sec1_wp_log == 50)
+                        printf("[SEC1-WP] (throttled — 50 hits logged)\n");
+                }
+            }
+        }
         return *(uint32_t*)(vf->ram + roff);
     }
 
@@ -1092,51 +1144,94 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
-        /* Interrupt controller at 0xDC000000 (Firebird: interrupt.c).
-         * Register layout (group = addr >> 8 & 3):
-         * Group 0 (0x000-0x0FF): IRQ registers
-         * Group 1 (0x100-0x1FF): FIQ registers
-         * Per group:
-         *   0x00: masked status (status & mask)
-         *   0x04: raw status
-         *   0x08: mask set
-         *   0x0C: mask clear
-         *   0x20: current highest priority interrupt (read-only)
-         *   0x24: acknowledge (read: returns current int + lowers pri limit)
-         *   0x28: end-of-interrupt (read: restores pri limit, may clear IRQ)
-         *   0x2C: priority limit */
+        /* ZEVIO VIC at 0xDC000000 (IRQ group +0x00, FIQ group +0x100).
+         * RTOS IRQ handler: reads +0x24 (ACK), +0x28 (vector), services,
+         * then writes saved vector value to +0x2C (EOI). */
         if (off >= 0x5C000000u && off < 0x5C001000u) {
             uint32_t sreg = off - 0x5C000000u;
-            int group = (sreg >> 8) & 3;
+            int is_fiq = (sreg >= 0x100);
             int reg = sreg & 0xFF;
 
-            /* Active interrupt sources: bit 0 = timer */
-            uint32_t active = (vf->timer.irq.status & vf->timer.irq.enable) ? 1 : 0;
+            /* Check if any interrupt is pending via SoC INTC */
+            uint32_t pending = vf->soc_intc.status & 0x3F;
+            uint32_t enabled = (vf->soc_intc.status >> 8) & 0x3F;
+            uint32_t active = pending & enabled;
 
-            if (group < 2) { /* IRQ (0) or FIQ (1) group */
-                switch (reg) {
-                    case 0x00: return active;   /* masked status */
-                    case 0x04: return active;   /* raw status */
-                    case 0x08: return 0xFFFFFFFF; /* mask (all enabled) */
-                    case 0x0C: return 0xFFFFFFFF;
-                    case 0x20: return active ? 0 : (uint32_t)-1; /* current int */
-                    case 0x24: /* ACK: return current int, lower priority */
-                        return active ? 0 : (uint32_t)-1; /* int 0 = timer */
-                    case 0x28: /* EOI: clear interrupt line, return prev pri limit */
-                        vf->timer.irq.status &= ~1; /* clear timer */
-                        vf->timer.timer[0].irq_pending = 0;
-                        return 0;
-                    case 0x2C: return 0; /* priority limit */
-                    default: return 0;
+            switch (reg) {
+                case 0x00: /* STATUS: bit 9 (0x200) = VIC active */
+                    return active ? 0x200 : 0;
+                case 0x04: /* CONTROL */
+                    return is_fiq ? vf->vic_fiq.control : vf->vic_irq.control;
+                case 0x08: /* ENABLE/KICK */
+                    return 0;
+                case 0x0C: /* DISABLE/CLEAR */
+                    return 0;
+                case 0x24: /* ACK: acknowledge interrupt */
+                    if (is_fiq) vf->vic_fiq.irq_active = 1;
+                    else vf->vic_irq.irq_active = 1;
+                    return active; /* return pending source mask */
+                case 0x28: /* VECTOR: return current IRQ source index */
+                {
+                    /* Find first pending source */
+                    uint32_t src = 0;
+                    for (int i = 0; i < 6; i++) {
+                        if (active & (1u << i)) { src = i; break; }
+                    }
+                    if (is_fiq) vf->vic_fiq.vector = src;
+                    else vf->vic_irq.vector = src;
+                    return src;
                 }
-            } else if (group == 2) {
-                switch (reg) {
-                    case 0x00: return 0xFFFFFFFF; /* noninverted */
-                    case 0x04: return 0; /* sticky */
+                case 0x2C: /* EOI register (read) */
+                    return 0;
+                default: return 0;
+            }
+        }
+
+        /* ZEVIO SoC Interrupt Controller at 0xB0001000 */
+        if (off >= 0x30001000u && off < 0x30001100u) {
+            uint32_t reg = off - 0x30001000u;
+            switch (reg) {
+                case 0x00: return vf->soc_intc.global_ctrl;
+                case 0x04: return vf->soc_intc.status;
+                case 0x08: return vf->soc_intc.config[0];
+                case 0x0C: return vf->soc_intc.config[1];
+                case 0x10: return vf->soc_intc.timer_irq[0];
+                case 0x14: return vf->soc_intc.timer_irq[1];
+                case 0x18: return vf->soc_intc.timer_irq[2];
+                case 0x1C: return vf->soc_intc.timer_irq[3];
+                default: return 0;
+            }
+        }
+
+        /* ZEVIO Timer Block at 0xB0000000 */
+        if (off >= 0x30000000u && off < 0x30001000u) {
+            uint32_t reg = off - 0x30000000u;
+            if (reg < 0x0C) {
+                /* Master control (0xB0000000-0xB0000008) */
+                if (reg == 0) return vf->ztimer_master;
+                return 0;
+            }
+            /* Per-timer: base 0x0C, stride 0x40 */
+            uint32_t tidx = (reg - 0x0C) / 0x40;
+            uint32_t treg = (reg - 0x0C) % 0x40;
+            if (tidx < 4) {
+                switch (treg) {
+                    case 0x00: return vf->ztimer_hw[tidx].ctrl;
+                    case 0x04: return vf->ztimer_hw[tidx].mode;
+                    case 0x08: return vf->ztimer_hw[tidx].match[0];
+                    case 0x0C: return vf->ztimer_hw[tidx].match[1];
+                    case 0x10: return vf->ztimer_hw[tidx].match[2];
+                    case 0x14: return vf->ztimer_hw[tidx].count;
+                    case 0x18: return vf->ztimer_hw[tidx].status;
+                    case 0x28: { /* FLAGS: bits 16-18 = active */
+                        uint32_t f = 0;
+                        if (vf->ztimer_hw[tidx].ctrl & 0x10) f |= (1u << 16);
+                        return f;
+                    }
                     default: return 0;
                 }
             }
-            return 0;
+            return 0; /* timer index > 3 — not emulated */
         }
 
         /* PL111 LCD Controller at 0xC0000000 (off = 0x40000000) */
@@ -1156,18 +1251,7 @@ static uint32_t mem_read32(void *ctx, uint32_t addr) {
             }
         }
 
-        /* PL190 VIC at 0xDC000000 (off = 0x5C000000) */
-        /* Secondary VIC for 16-bit reads: same as 32-bit handler */
-        if (off >= 0x5C000000u && off < 0x5C001000u) {
-            uint32_t active = (vf->timer.irq.status & vf->timer.irq.enable) ? 1 : 0;
-            int reg = (off - 0x5C000000u) & 0xFF;
-            switch (reg) {
-                case 0x00: return active;
-                case 0x04: return active;
-                case 0x24: return active ? 0 : (uint32_t)-1;
-                default: return 0;
-            }
-        }
+        /* (ZEVIO VIC reads handled above in primary 0xDC000000 block) */
 
         /* NOR Flash controller at 0xB8000000 (2MB). */
         if (off >= 0x38000000u && off < 0x38200000u && vf->has_rom) {
@@ -1533,6 +1617,18 @@ static uint8_t mem_read8(void *ctx, uint32_t addr) {
         uint32_t roff8 = addr - VFLASH_RAM_BASE;
         /* Force game_main start flag */
         if (roff8 == 0xBE49E0 && vf->boot_phase >= 800) return 1;
+        /* sec[1] watchpoint (byte access — decompressors read byte-by-byte) */
+        if (vf->boot_phase >= 900 && vf->sec1_size > 0 &&
+            (vf->cpu.cpsr & 0x1F) == 0x13) {
+            uint32_t s1off = addr - vf->sec1_base;
+            if (s1off < vf->sec1_size && vf->sec1_wp_log < 50) {
+                printf("[SEC1-WP] PC=%08X read8 [%08X] (sec1+0x%X)\n",
+                       vf->cpu.r[15], addr, s1off);
+                vf->sec1_wp_log++;
+                if (vf->sec1_wp_log == 50)
+                    printf("[SEC1-WP] (throttled — 50 hits logged)\n");
+            }
+        }
         return vf->ram[roff8];
     }
     if (addr >= VFLASH_SRAM_BASE && addr < VFLASH_SRAM_BASE + VFLASH_SRAM_SIZE)
@@ -1724,15 +1820,83 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
             return;
         }
 
-        /* PL190 VIC write at 0xDC000000 */
+        /* ZEVIO VIC write at 0xDC000000 */
         if (off >= 0x5C000000u && off < 0x5C001000u) {
-            uint32_t vreg = off - 0x5C000000u;
-            switch (vreg) {
-                case 0x00C: vf->timer.irq.fiq_sel = val; break;    /* IntSelect */
-                case 0x010: vf->timer.irq.enable |= val; break;    /* IntEnable (set) */
-                case 0x014: vf->timer.irq.enable &= ~val; break;   /* IntEnClr */
-                case 0x018: vf->timer.irq.status |= val; break;    /* SoftInt */
-                case 0x01C: vf->timer.irq.status &= ~val; break;   /* SoftIntClr */
+            uint32_t sreg = off - 0x5C000000u;
+            int is_fiq = (sreg >= 0x100);
+            int reg = sreg & 0xFF;
+            switch (reg) {
+                case 0x04: /* CONTROL */
+                    if (is_fiq) vf->vic_fiq.control = val;
+                    else vf->vic_irq.control = val;
+                    break;
+                case 0x08: /* ENABLE/KICK: write 0x200 to apply */
+                    break;
+                case 0x0C: /* DISABLE/CLEAR: write 0x200 to disable */
+                    break;
+                case 0x2C: /* EOI: write saved vector value to complete IRQ */
+                    if (is_fiq) {
+                        vf->vic_fiq.irq_active = 0;
+                    } else {
+                        vf->vic_irq.irq_active = 0;
+                        /* Clear the serviced IRQ source in SoC INTC */
+                        uint32_t src = vf->vic_irq.vector;
+                        if (src < 6) {
+                            vf->soc_intc.status &= ~(1u << src);
+                        }
+                    }
+                    break;
+            }
+            return;
+        }
+
+        /* ZEVIO SoC Interrupt Controller write at 0xB0001000 */
+        if (off >= 0x30001000u && off < 0x30001100u) {
+            uint32_t reg = off - 0x30001000u;
+            switch (reg) {
+                case 0x00: vf->soc_intc.global_ctrl = val; break;
+                case 0x04: vf->soc_intc.status = val; break;
+                case 0x08: vf->soc_intc.config[0] = val; break;
+                case 0x0C: vf->soc_intc.config[1] = val; break;
+                case 0x10: vf->soc_intc.timer_irq[0] = val; break;
+                case 0x14: vf->soc_intc.timer_irq[1] = val; break;
+                case 0x18: vf->soc_intc.timer_irq[2] = val; break;
+                case 0x1C: vf->soc_intc.timer_irq[3] = val; break;
+                case 0x20: /* IRQ_CLEAR: clear pending bits */
+                    vf->soc_intc.status &= ~(val & 0x3F);
+                    break;
+            }
+            return;
+        }
+
+        /* ZEVIO Timer Block write at 0xB0000000 */
+        if (off >= 0x30000000u && off < 0x30001000u) {
+            uint32_t reg = off - 0x30000000u;
+            if (reg < 0x0C) {
+                if (reg == 0) vf->ztimer_master = val;
+                return;
+            }
+            uint32_t tidx = (reg - 0x0C) / 0x40;
+            uint32_t treg = (reg - 0x0C) % 0x40;
+            if (tidx < 4) {
+                switch (treg) {
+                    case 0x00: /* CTRL: bit 4 = enable */
+                        vf->ztimer_hw[tidx].ctrl = val;
+                        if ((val & 0x10) && vf->ztimer_irq_log < 5) {
+                            printf("[ZTIMER-HW] Timer %d enabled: ctrl=%08X match=%08X\n",
+                                   tidx, val, vf->ztimer_hw[tidx].match[1]);
+                            vf->ztimer_irq_log++;
+                        }
+                        break;
+                    case 0x04: vf->ztimer_hw[tidx].mode = val; break;
+                    case 0x08: vf->ztimer_hw[tidx].match[0] = val; break;
+                    case 0x0C: vf->ztimer_hw[tidx].match[1] = val; break;
+                    case 0x10: vf->ztimer_hw[tidx].match[2] = val; break;
+                    case 0x14: vf->ztimer_hw[tidx].count = val; break;
+                    case 0x18: /* STATUS: write to clear */
+                        vf->ztimer_hw[tidx].status &= ~val;
+                        break;
+                }
             }
             return;
         }
@@ -1972,6 +2136,22 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
                             for (uint32_t ci = 0x1000; ci < vf->rom_size; ci += 4) {
                                 uint32_t rv = *(uint32_t*)(vf->rom + ci);
                                 if (rv != 0) *(uint32_t*)(vf->ram + ci) = rv;
+                            }
+                            /* Preload decompressed RTOS from saved RAM dump.
+                             * ROM boot normally decompresses RTOS from ROM 0xC0000-0x1A0000
+                             * into SDRAM 0x10A00000-0x10C00000. Our HLE boot skips this.
+                             * Load from /tmp/vflash_ram.bin (a previous full-boot dump). */
+                            {
+                                FILE *rdump = fopen("/tmp/vflash_ram.bin", "rb");
+                                if (rdump) {
+                                    /* Read RTOS region: offset 0xA00000, size 0x200000 (2MB) */
+                                    fseek(rdump, 0xA00000, SEEK_SET);
+                                    size_t rd = fread(vf->ram + 0xA00000, 1, 0x200000, rdump);
+                                    fclose(rdump);
+                                    printf("[ROM-PRELOAD] RTOS from RAM dump: %zu bytes at 0x10A00000\n", rd);
+                                } else {
+                                    printf("[ROM-PRELOAD] WARNING: /tmp/vflash_ram.bin not found — RTOS not loaded!\n");
+                                }
                             }
                             /* Set sched_state=3 BEFORE ROM init runs.
                              * µMORE task_start (0x85E88) checks [0x103585E0]==3
@@ -2836,6 +3016,58 @@ static void install_vector_table(VFlash *vf) {
     printf("[HLE]   0x08 SWI   → 0x%08X\n", HLE_STUB_BASE + 2 * 20);
     printf("[HLE]   0x18 IRQ   → 0x%08X\n", HLE_STUB_BASE + 5 * 20);
     printf("[HLE]   0x1C FIQ   → 0x%08X\n", HLE_STUB_BASE + 6 * 20);
+}
+
+/* ============================================================
+ * RTOS IRQ vector chain
+ *
+ * After RTOS is loaded (boot_phase 800), switch from ROM vectors
+ * to the real RTOS IRQ handler at 0x10A15CA0.
+ *
+ * Chain: low_ram[0x18] → LDR PC,[PC,#0x18] → loads low_ram[0x38]
+ *        = 0x1000FF98 → LDR PC,[PC,#0x18] → loads SDRAM[0xFFB8]
+ *        = 0x10A15CA0 (RTOS IRQ handler: VIC ACK→dispatch→EOI)
+ *
+ * Also sets up SDRAM[0x18] identically for MMU configs where
+ * VA 0 maps to PA 0x10000000 instead of PA 0.
+ * ============================================================ */
+static void install_rtos_irq_chain(VFlash *vf) {
+    /* 1. Switch PA 0 from ROM to low_ram (emulates HW SRAM remap) */
+    vf->rom_remapped = 1;
+
+    /* 2. Standard ARM vector table in low_ram: LDR PC,[PC,#0x18] at each slot */
+    uint32_t ldr_pc_18 = 0xE59FF018u;
+    for (int i = 0; i < 8; i++)
+        *(uint32_t*)(vf->low_ram + i * 4) = ldr_pc_18;
+
+    /* Pool at 0x20-0x3C: jump targets for each exception */
+    *(uint32_t*)(vf->low_ram + 0x20) = HLE_STUB_BASE + 0 * 20;  /* RESET → HLE */
+    *(uint32_t*)(vf->low_ram + 0x24) = HLE_STUB_BASE + 1 * 20;  /* UNDEF → HLE fatal */
+    *(uint32_t*)(vf->low_ram + 0x28) = HLE_STUB_BASE + 2 * 20;  /* SWI   → HLE */
+    *(uint32_t*)(vf->low_ram + 0x2C) = HLE_STUB_BASE + 3 * 20;  /* PABT  → HLE fatal */
+    *(uint32_t*)(vf->low_ram + 0x30) = HLE_STUB_BASE + 4 * 20;  /* DABT  → HLE fatal */
+    *(uint32_t*)(vf->low_ram + 0x34) = 0;                        /* reserved */
+    *(uint32_t*)(vf->low_ram + 0x38) = 0x1000FF98u;              /* IRQ → SDRAM chain */
+    *(uint32_t*)(vf->low_ram + 0x3C) = HLE_STUB_BASE + 6 * 20;  /* FIQ  → HLE */
+
+    /* 3. Mirror vectors in SDRAM[0x00-0x3C] for MMU configs mapping VA 0 → SDRAM */
+    for (int i = 0; i < 8; i++)
+        *(uint32_t*)(vf->ram + i * 4) = ldr_pc_18;
+    *(uint32_t*)(vf->ram + 0x20) = *(uint32_t*)(vf->low_ram + 0x20);
+    *(uint32_t*)(vf->ram + 0x24) = *(uint32_t*)(vf->low_ram + 0x24);
+    *(uint32_t*)(vf->ram + 0x28) = *(uint32_t*)(vf->low_ram + 0x28);
+    *(uint32_t*)(vf->ram + 0x2C) = *(uint32_t*)(vf->low_ram + 0x2C);
+    *(uint32_t*)(vf->ram + 0x30) = *(uint32_t*)(vf->low_ram + 0x30);
+    *(uint32_t*)(vf->ram + 0x34) = 0;
+    *(uint32_t*)(vf->ram + 0x38) = 0x1000FF98u;
+    *(uint32_t*)(vf->ram + 0x3C) = *(uint32_t*)(vf->low_ram + 0x3C);
+
+    /* 4. SDRAM chain: 0x1000FF98 → LDR PC,[PC,#0x18] → loads 0x1000FFB8 */
+    *(uint32_t*)(vf->ram + 0xFF98) = 0xE59FF018u;  /* LDR PC,[PC,#0x18] */
+    *(uint32_t*)(vf->ram + 0xFFB8) = 0x10A15CA0u;  /* RTOS IRQ handler */
+
+    printf("[RTOS-VEC] IRQ chain installed: low_ram[0x18]→0x1000FF98→0x10A15CA0\n");
+    printf("[RTOS-VEC] rom_remapped=1 (PA 0 → low_ram)\n");
 }
 
 static int vflash_hle_boot(VFlash *vf) {
@@ -4413,16 +4645,8 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
 
         /* HLE for specific µMORE services */
 
-        /* 0x10A15CA0: int_disable() — saves CPSR, disables IRQ+FIQ.
-         * Called as: old_cpsr = int_disable(); ... int_restore(old_cpsr);
-         * R0 = current CPSR on first call, return saved CPSR value. */
-        if (addr == 0x10A15CA0) {
-            uint32_t old_cpsr = cpu->cpsr;
-            cpu->cpsr |= 0xC0; /* disable IRQ + FIQ */
-            cpu->r[0] = old_cpsr;
-            cpu->r[15] = cpu->r[14] & ~3u;
-            return 1;
-        }
+        /* 0x10A15CA0 is the RTOS IRQ handler — do NOT intercept!
+         * Previously misidentified as int_disable(). Let it run natively. */
 
         /* (chain logging moved above) */
 
@@ -4451,6 +4675,10 @@ void vflash_run_frame(VFlash *vf) {
     const int SLICE = 10000;
     const int TOTAL = 2500000;
 
+    if (vf->frame_count < 5)
+        printf("[FRAME-START] frame=%lu PC=%08X bp=%d\n",
+               (unsigned long)vf->frame_count, vf->cpu.r[15], vf->boot_phase);
+
     vf->vid.fb_dirty = 0;
 
     /* Re-enable timer at frame start if it was disabled.
@@ -4466,6 +4694,7 @@ void vflash_run_frame(VFlash *vf) {
     }
 
     int done = 0;
+    int slice_count = 0;
     while (done < TOTAL) {
         int slice = (TOTAL - done < SLICE) ? (TOTAL - done) : SLICE;
 
@@ -4488,15 +4717,46 @@ void vflash_run_frame(VFlash *vf) {
         }
 
         ztimer_tick(&vf->timer, actual);
-        done += (int)actual;
 
-        /* Per-slice IRQ delivery: JIT doesn't check IRQ between instructions.
-         * If timer IRQ is pending and CPSR allows, deliver it now.
-         * This is critical for BOOT.BIN games where game code briefly enables
-         * IRQ in kernel sleep then disables it — JIT misses the window. */
+        /* ZEVIO hardware timer tick: count up, fire on match */
+        for (int ti = 0; ti < 4; ti++) {
+            if (!(vf->ztimer_hw[ti].ctrl & 0x10)) continue; /* not enabled */
+            vf->ztimer_hw[ti].count += actual;
+            /* Check match[1] (period register) */
+            if (vf->ztimer_hw[ti].match[1] != 0xFFFFFFFF &&
+                vf->ztimer_hw[ti].count >= vf->ztimer_hw[ti].match[1]) {
+                vf->ztimer_hw[ti].count = 0; /* wrap/reload */
+                vf->ztimer_hw[ti].status |= 0x01; /* set IRQ pending */
+                /* Raise IRQ source 0 (timer) in SoC INTC */
+                vf->soc_intc.status |= 0x01; /* bit 0 = timer pending */
+            }
+        }
+
+        done += (int)actual;
+        slice_count++;
+        if (vf->frame_count == 0 && (slice_count % 50 == 0))
+            printf("[SLICE] #%d done=%d/%d PC=%08X actual=%u\n",
+                   slice_count, done, TOTAL, vf->cpu.r[15], actual);
+
+        /* Per-slice IRQ delivery via SoC INTC → VIC → ARM.
+         * Check if any SoC IRQ source is pending AND enabled,
+         * and VIC is not already servicing an interrupt. */
+        {
+            uint32_t pending = vf->soc_intc.status & 0x3F;
+            uint32_t enabled = (vf->soc_intc.status >> 8) & 0x3F;
+            int irq_active = pending & enabled & ~0u;
+            if (irq_active && !vf->vic_irq.irq_active &&
+                !(vf->cpu.cpsr & 0x80)) { /* IRQ not masked in CPSR */
+                if (vf->cpu.r13_irq < 0x10000000u || vf->cpu.r13_irq > 0x10FFFFFFu)
+                    vf->cpu.r13_irq = 0x10800000;
+                arm9_irq(&vf->cpu);
+            }
+        }
+
+        /* Legacy IRQ delivery (for old ztimer path) */
         if (vf->boot_phase >= 300 &&
             ztimer_irq_pending(&vf->timer) &&
-            !(vf->cpu.cpsr & 0x80)) { /* IRQ not masked */
+            !(vf->cpu.cpsr & 0x80)) {
             if (vf->cpu.r13_irq < 0x10000000u || vf->cpu.r13_irq > 0x10FFFFFFu)
                 vf->cpu.r13_irq = 0x10800000;
             arm9_irq(&vf->cpu);
@@ -4510,6 +4770,29 @@ void vflash_run_frame(VFlash *vf) {
         if (vf->has_rom && vf->frame_count > 5) {
             uint32_t pc = vf->cpu.r[15];
             static int phase = 0;
+
+            /* ROM boot kernel detection: when PC enters SDRAM kernel area
+             * with MMU enabled and boot_phase still 0, the ROM boot has
+             * completed and the µMORE scheduler is running.
+             * Set boot_phase=300 and install RTOS IRQ chain so timer IRQs
+             * can reach the RTOS handler at 0x10A15CA0. */
+            if (vf->boot_phase == 0 && vf->cpu.cp15.mmu_enabled &&
+                pc >= 0x10010000 && pc < 0x10200000) {
+                vf->boot_phase = 300;
+                install_rtos_irq_chain(vf);
+                /* Ensure timer is configured for scheduler tick */
+                if (vf->timer.timer[0].load == 0) {
+                    vf->timer.timer[0].load = 37500;
+                    vf->timer.timer[0].count = 37500;
+                    vf->timer.timer[0].ctrl = 0xE2;
+                    vf->timer.irq.enable |= 0x01;
+                }
+                /* Enable SoC INTC timer source */
+                vf->soc_intc.status |= (0x01 << 8); /* enable bit for timer */
+                /* Unmask IRQ in CPSR */
+                vf->cpu.cpsr &= ~0xC0;
+                printf("[ROM-BOOT] Kernel at PC=%08X — boot_phase=300, IRQ chain + timer installed\n", pc);
+            }
 
             /* µMORE init halt at 0x109D1E40: B . with FIQ disabled.
              * Force FIQ enable so timer interrupt can dispatch tasks. */
@@ -4732,6 +5015,7 @@ void vflash_run_frame(VFlash *vf) {
                         vf->timer.timer[0].ctrl = 0xE2;
                         vf->timer.irq.enable |= 0x01;
                         vf->boot_phase = 800;
+                        install_rtos_irq_chain(vf);
                     }
                 }
                 game_start++;
@@ -5697,16 +5981,22 @@ void vflash_run_frame(VFlash *vf) {
      * This only needs to happen once. */
     /* No remap disable needed — flash reads always from ROM. */
 
-    if ((vf->frame_count % 10) == 0) {
+    if (vf->frame_count < 20 || (vf->frame_count % 60) == 0) {
         printf("[Frame %lu] PC=0x%08X CPSR=0x%08X R7=0x%08X R8=0x%08X R9=0x%08X"
-               " T0:load=%u ctrl=0x%X cnt=%u IRQen=0x%X IRQst=0x%X\n",
+               " T0:load=%u ctrl=0x%X cnt=%u IRQen=0x%X IRQst=0x%X bp=%d\n",
                 (unsigned long)vf->frame_count, vf->cpu.r[15],
                 vf->cpu.cpsr, vf->cpu.r[7], vf->cpu.r[8], vf->cpu.r[9],
                 vf->timer.timer[0].load, vf->timer.timer[0].ctrl,
-                vf->timer.timer[0].count, vf->timer.irq.enable, vf->timer.irq.status);
+                vf->timer.timer[0].count, vf->timer.irq.enable, vf->timer.irq.status,
+                vf->boot_phase);
     }
-    /* Display PTX image from disc on frame 0 (instant splash screen) */
-    if (vf->frame_count == 0 && vf->has_rom && vf->cd && vf->cd->is_open) {
+    if (vf->frame_count < 5) {
+        printf("[FRAME-POST] frame=%lu starting post-exec\n", (unsigned long)vf->frame_count);
+        fflush(stdout);
+    }
+    /* Display PTX image from disc on frame 0 (instant splash screen).
+     * Skip in ROM boot mode — the real boot handles display. */
+    if (vf->frame_count == 0 && !vf->has_rom && vf->cd && vf->cd->is_open) {
         CDEntry ptx_entry;
         static const char *ptx_names[] = {
             "_101KW_CHEETAH.PTX", "_101KW_PIC.PTX", "_KWF101.PTX",
@@ -5788,8 +6078,9 @@ void vflash_run_frame(VFlash *vf) {
         }
     }
 
-    /* PTX gallery: scan disc for all PTX files, navigate with Left/Right */
-    if (!vf->ptx_loaded && vf->cd && vf->cd->is_open) {
+    /* PTX gallery: scan disc for all PTX files, navigate with Left/Right.
+     * Skip in ROM boot mode — gallery is HLE-only feature. */
+    if (!vf->ptx_loaded && vf->cd && vf->cd->is_open && !vf->has_rom) {
         vf->ptx_loaded = 1;
         vf->ptx_list = calloc(256, sizeof(CDEntry));
         vf->ptx_count = 0;
@@ -6351,6 +6642,7 @@ void vflash_run_frame(VFlash *vf) {
             vf->timer.timer[0].ctrl = 0xE2;
             vf->timer.irq.enable |= 0x01;
             vf->boot_phase = 800;
+            install_rtos_irq_chain(vf);
             /* Backup ENTIRE RAM — game BSS clear will zero code+data.
              * We restore everything when BSS clear is detected. */
             if (!vf->rtos_backup) {
@@ -6635,6 +6927,13 @@ void vflash_run_frame(VFlash *vf) {
                             int rd = cdrom_read_file(vf->cd, &ve,
                                         vf->ram + (dst - 0x10000000), foff, ssz);
                             printf("[VFF] sec[%d] %dKB → %08X (load_addr)\n", si, rd/1024, dst);
+                            /* Track sec[1] for memory watchpoint */
+                            if (si == 1) {
+                                vf->sec1_base = dst;
+                                vf->sec1_size = ssz;
+                                printf("[VFF] sec[1] watchpoint: %08X-%08X (%dKB)\n",
+                                       dst, dst + ssz, ssz/1024);
+                            }
                         }
                         foff += ssz;
                     }

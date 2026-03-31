@@ -115,6 +115,18 @@ int main(int argc, char **argv) {
                VFLASH_SCREEN_W * scale, VFLASH_SCREEN_H * scale, scale);
     }
 
+    /* Redirect stdout to log file for capture when running in background.
+     * Also keeps line-buffered so messages appear in real time. */
+    {
+        const char *logfile = getenv("VFLASH_LOG");
+        if (logfile) {
+            FILE *lf = freopen(logfile, "w", stdout);
+            if (lf) setlinebuf(lf);
+        } else {
+            setlinebuf(stdout);
+        }
+    }
+
     /* Main loop */
     int       running   = 1;
     SDL_Event ev;
@@ -128,10 +140,13 @@ int main(int argc, char **argv) {
 
         /* Events */
         while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_QUIT) { running = 0; break; }
+            if (ev.type == SDL_QUIT && !headless) {
+                printf("[Main] SDL_QUIT received, exiting\n");
+                running = 0; break;
+            }
             if (ev.type == SDL_KEYDOWN) {
                 switch (ev.key.keysym.sym) {
-                    case SDLK_ESCAPE: running = 0; break;
+                    case SDLK_ESCAPE: printf("[Main] ESC pressed\n"); running = 0; break;
                     case SDLK_F1:
                         debug = !debug;
                         vflash_set_debug(vf, debug);

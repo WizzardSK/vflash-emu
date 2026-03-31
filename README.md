@@ -98,6 +98,10 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **Per-slice IRQ delivery** | ✅ Check IRQ after each JIT slice for CPSR windows |
 | **Render processing** | ✅ VFF tile layers rendering (sky/ground/road visible) |
 | **PTX display** | ✅ 8bpp with palette via native render FB pipeline (RGB565) |
+| **RTOS IRQ vector chain** | ✅ low_ram[0x18]→SDRAM[0xFF98]→0x10A15CA0 (VIC ACK/EOI) |
+| **ROM boot kernel detection** | ✅ MMU+PC in kernel → boot_phase=300 auto-detect |
+| **sec[1] sprite watchpoint** | ✅ Memory read trap for decompressor PC capture |
+| **Headless mode** | ✅ SDL_QUIT ignored, CD scan skipped, VFLASH_LOG env var |
 
 ### Remaining for gameplay
 
@@ -226,7 +230,10 @@ ROM[0x00] → flash copy → flash remap (0x118)
 | `0x900B0000` | 4KB | PMU (clock/PLL) |
 | `0xAA000000` | | ATAPI CD-ROM controller |
 | `0xB8000000` | 2MB | NOR flash mirror + write buffer |
+| `0xB000000C` | 4KB | ZEVIO Timer Block (64 timers, stride 0x40) |
+| `0xB0001000` | 4KB | SoC Interrupt Controller (6 sources) |
 | `0xC0000000` | | PL111 LCD controller |
+| `0xDC000000` | 4KB | ZEVIO VIC (IRQ+FIQ, ACK/Vector/EOI protocol) |
 
 ### Key Bug Fixes
 
@@ -292,6 +299,10 @@ ROM[0x00] → flash copy → flash remap (0x118)
 | Game loop code missing | 0x109D1CE0 was empty | Reload 704KB from BOOT.BIN CD |
 | Phase 101 overwrites bp | boot_phase 800→300 race | Guard with boot_phase < 800 |
 | PC escape to flash ROM | Render writes to 0xB80007xx | DC MMIO intercept + per-slice redirect |
+| IRQ vector not reaching RTOS | Timer stub at 0x10FFF040 skipped scheduler | install_rtos_irq_chain: low_ram→0xFF98→0x10A15CA0 |
+| ROM boot had no boot_phase | Kernel reached but detection missed | Auto-detect: MMU on + PC in scheduler = bp300 |
+| PTX splash blocked headless | cdrom_read_file hung in headless mode | Skip PTX/gallery/scan when has_rom |
+| SDL_QUIT killed headless | Process exited after 1 frame | Ignore SDL_QUIT in headless mode |
 | CPSR mode corruption | Mode bits = 0x00 (invalid) | Per-frame sanity check → force SVC |
 | DC regs as flash writes | 0xB80007xx absorbed silently | Separate DC register handler |
 | BSS clear kills render | Game zeroes 0x10A80000+ | Write protection 0x9D0000-0xBF0000 |

@@ -19,12 +19,17 @@
 #define VFLASH_SCREEN_W     320
 #define VFLASH_SCREEN_H     240
 
-/* Memory map (estimated, needs verification) */
+/* Memory map */
 #define VFLASH_ROM_BASE     0x00000000
 #define VFLASH_RAM_BASE     0x10000000
 #define VFLASH_IO_BASE      0x80000000
 
-/* I/O registers (estimated) */
+/* ZEVIO 1020 I/O regions (verified from RTOS RE) */
+#define ZEVIO_TIMER_BASE    0xB000000C  /* Timer block: 64 timers, stride 0x40 */
+#define ZEVIO_INTC_BASE     0xB0001000  /* SoC interrupt controller */
+#define ZEVIO_VIC_BASE      0xDC000000  /* ARM VIC (IRQ=+0x00, FIQ=+0x100) */
+
+/* Legacy I/O (estimated) */
 #define VFLASH_IO_CDROM     0x80001000
 #define VFLASH_IO_VIDEO     0x80002000
 #define VFLASH_IO_AUDIO     0x80003000
