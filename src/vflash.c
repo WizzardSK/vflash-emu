@@ -7001,6 +7001,25 @@ void vflash_run_frame(VFlash *vf) {
                         }
                         foff += ssz;
                     }
+                    /* Load VFF entry/dispatch table if it falls just past sec[0].
+                     * Spider-Man: sec[0] dst=0x10374000 size=0x171000, entry=0x104E5000
+                     * = dst+size. The table follows sec[0] in the VFF file. */
+                    if (vff_entry >= 0x10000000 && vff_entry < 0x10000000 + VFLASH_RAM_SIZE) {
+                        uint32_t sec0_dst = *(uint32_t*)(vhdr + 0x30);
+                        uint32_t sec0_sz  = *(uint32_t*)(vhdr + 0x34);
+                        if (vff_entry >= sec0_dst && vff_entry <= sec0_dst + sec0_sz + 0x1000) {
+                            /* Entry table is at or near end of sec[0]. Load extra 8KB from CD. */
+                            uint32_t et_foff = 0x400 + (vff_entry - sec0_dst);
+                            uint32_t et_roff = vff_entry - 0x10000000;
+                            uint32_t et_sz = 0x2000; /* 8KB dispatch table */
+                            if (et_roff + et_sz <= VFLASH_RAM_SIZE) {
+                                int rd = cdrom_read_file(vf->cd, &ve,
+                                            vf->ram + et_roff, et_foff, et_sz);
+                                printf("[VFF] Entry table %dB → %08X (at sec[0]+0x%X)\n",
+                                       rd, vff_entry, vff_entry - sec0_dst);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -7030,27 +7049,91 @@ void vflash_run_frame(VFlash *vf) {
             /* Scan for scene entry: LDR Rx, =0xFFFF followed by PUSH.
              * The scene init function starts with LDR R12, =0xFFFF; PUSH {regs}
              * and is called with R0=1 (init), R1=scene_id. */
+            /* Find scene init function: the function in sec[0] that references
+             * the dispatch table base (vff_entry). This is the real init that
+             * creates scene objects and populates the dispatch table.
+             * init_cb from header is often a small utility, not the main init. */
             uint32_t entry = 0;
-            for (uint32_t scan = 0; scan < 0x8000; scan += 4) {
-                uint32_t off = s0_addr - 0x10000000 + scan;
-                if (off + 8 > VFLASH_RAM_SIZE) break;
-                uint32_t i0 = *(uint32_t*)(vf->ram + off);
-                uint32_t i1 = *(uint32_t*)(vf->ram + off + 4);
-                /* LDR Rx, [PC, #imm] where literal = 0x0000FFFF */
-                if ((i0 & 0x0F7F0000) == 0x059F0000 &&
-                    (i1 & 0xFFFF0000) == 0xE92D0000) {
-                    /* Verify literal value is 0xFFFF */
-                    int Rd = (i0 >> 12) & 0xF;
-                    int imm = i0 & 0xFFF;
-                    int U = (i0 >> 23) & 1;
-                    uint32_t lit_addr = off + 8 + (U ? imm : -imm);
-                    if (lit_addr + 4 <= VFLASH_RAM_SIZE) {
-                        uint32_t lit = *(uint32_t*)(vf->ram + lit_addr);
-                        if (lit == 0x0000FFFF || lit == 0xFFFFFFFF) {
-                            entry = s0_addr + scan;
-                            printf("[VFF-EXEC] Entry: LDR R%d,=0x%X + PUSH at 0x%08X\n",
-                                   Rd, lit, entry);
-                            break;
+            if (vff_entry >= 0x10000000) {
+                /* Scan sec[0] for a LDR that references vff_entry as literal pool */
+                uint32_t s0_off = s0_addr - 0x10000000;
+                for (uint32_t scan = 0; scan < s0_size && scan < 0x100000; scan += 4) {
+                    uint32_t val = *(uint32_t*)(vf->ram + s0_off + scan);
+                    if (val == vff_entry) {
+                        printf("[VFF-SCAN] Found literal 0x%08X at s0+0x%X, checking back for PUSH...\n", vff_entry, scan);
+                        /* Debug: show value at expected PUSH location */
+                        if (scan >= 0xB0) {
+                            uint32_t expected = *(uint32_t*)(vf->ram + s0_off + scan - 0xB0);
+                            printf("[VFF-SCAN] [s0+0x%X]=0x%08X (expected PUSH E92D4030)\n",
+                                   scan - 0xB0, expected);
+                        }
+                        /* Found literal pool with dispatch table address.
+                         * Search backward for the function's PUSH prologue. */
+                        int back_found = 0;
+                        for (int32_t back = (int32_t)scan - 4; back >= 0 && (scan - (uint32_t)back) < 0x400; back -= 4) {
+                            uint32_t pv = *(uint32_t*)(vf->ram + s0_off + (uint32_t)back);
+                            /* Accept PUSH with LR, or STMDB SP! (any variant) */
+                            if (((pv & 0xFFFF0000) == 0xE92D0000 && (pv & 0x4000)) ||
+                                ((pv & 0xFFFF0000) == 0xE92D0000 && (pv & 0xFF) > 0x10)) {
+                                back_found = 1;
+                                entry = s0_addr + (uint32_t)back;
+                                printf("[VFF-EXEC] Found scene init at 0x%08X (refs dispatch table 0x%08X)\n",
+                                       entry, vff_entry);
+                                break;
+                            }
+                        }
+                        if (entry) break;
+                    }
+                }
+            }
+            if (!entry) {
+                /* Debug: check if literal exists at expected offset */
+                uint32_t s0_off = s0_addr - 0x10000000;
+                uint32_t check_off = s0_off + 0x9FC; /* where 0x104E5000 should be */
+                if (check_off < VFLASH_RAM_SIZE) {
+                    uint32_t check_val = *(uint32_t*)(vf->ram + check_off);
+                    printf("[VFF-EXEC] Scan failed. s0=0x%08X vff_entry=0x%08X [s0+0x9FC]=0x%08X\n",
+                           s0_addr, vff_entry, check_val);
+                    /* Try direct: use the known function offset for Spider-Man */
+                    uint32_t candidate = s0_addr + 0x94C; /* 0x1037494C */
+                    uint32_t cand_insn = *(uint32_t*)(vf->ram + candidate - 0x10000000);
+                    if ((cand_insn & 0xFFFF0000) == 0xE92D0000) {
+                        entry = candidate;
+                        printf("[VFF-EXEC] Using direct offset +0x94C: 0x%08X (insn=%08X)\n",
+                               entry, cand_insn);
+                    }
+                }
+            }
+            /* Fallback: try init_cb from header */
+            if (!entry && vff_init_cb >= 0x10000000 && vff_init_cb < 0x10000000 + VFLASH_RAM_SIZE) {
+                uint32_t cb_off = vff_init_cb - 0x10000000;
+                uint32_t cb_insn = *(uint32_t*)(vf->ram + cb_off);
+                if (cb_insn != 0) {
+                    entry = vff_init_cb;
+                    printf("[VFF-EXEC] Fallback to init_cb: 0x%08X\n", entry);
+                }
+            }
+            if (!entry) {
+                /* Fallback: scan for LDR Rx,=0xFFFF + PUSH pattern */
+                for (uint32_t scan = 0; scan < 0x8000; scan += 4) {
+                    uint32_t off = s0_addr - 0x10000000 + scan;
+                    if (off + 8 > VFLASH_RAM_SIZE) break;
+                    uint32_t i0 = *(uint32_t*)(vf->ram + off);
+                    uint32_t i1 = *(uint32_t*)(vf->ram + off + 4);
+                    if ((i0 & 0x0F7F0000) == 0x059F0000 &&
+                        (i1 & 0xFFFF0000) == 0xE92D0000) {
+                        int Rd = (i0 >> 12) & 0xF;
+                        int imm = i0 & 0xFFF;
+                        int U = (i0 >> 23) & 1;
+                        uint32_t lit_addr = off + 8 + (U ? imm : -imm);
+                        if (lit_addr + 4 <= VFLASH_RAM_SIZE) {
+                            uint32_t lit = *(uint32_t*)(vf->ram + lit_addr);
+                            if (lit == 0x0000FFFF || lit == 0xFFFFFFFF) {
+                                entry = s0_addr + scan;
+                                printf("[VFF-EXEC] Entry: LDR R%d,=0x%X + PUSH at 0x%08X\n",
+                                       Rd, lit, entry);
+                                break;
+                            }
                         }
                     }
                 }
