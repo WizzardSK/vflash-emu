@@ -3032,42 +3032,65 @@ static void install_vector_table(VFlash *vf) {
  * VA 0 maps to PA 0x10000000 instead of PA 0.
  * ============================================================ */
 static void install_rtos_irq_chain(VFlash *vf) {
-    /* 1. Switch PA 0 from ROM to low_ram (emulates HW SRAM remap) */
-    vf->rom_remapped = 1;
+    /* Strategy: work WITH the existing ROM/kernel vector chain, don't replace it.
+     *
+     * ROM boot sets up: ROM[0x18] → ROM[0xD44] = 0x1000FF98
+     * Kernel writes to VA 0: vectors that chain to SDRAM[0xFF98] → SDRAM[0xFFB8]
+     *
+     * We just need to:
+     * 1. Ensure SDRAM[0xFF98] = LDR PC,[PC,#0x18] (chain link)
+     * 2. Set SDRAM[0xFFB8] = our IRQ handler address
+     * 3. Install our IRQ handler code in high SDRAM
+     *
+     * Do NOT touch low_ram or rom_remapped — let the kernel own PA 0 vectors.
+     */
 
-    /* 2. Standard ARM vector table in low_ram: LDR PC,[PC,#0x18] at each slot */
-    uint32_t ldr_pc_18 = 0xE59FF018u;
-    for (int i = 0; i < 8; i++)
-        *(uint32_t*)(vf->low_ram + i * 4) = ldr_pc_18;
-
-    /* Pool at 0x20-0x3C: jump targets for each exception */
-    *(uint32_t*)(vf->low_ram + 0x20) = HLE_STUB_BASE + 0 * 20;  /* RESET → HLE */
-    *(uint32_t*)(vf->low_ram + 0x24) = HLE_STUB_BASE + 1 * 20;  /* UNDEF → HLE fatal */
-    *(uint32_t*)(vf->low_ram + 0x28) = HLE_STUB_BASE + 2 * 20;  /* SWI   → HLE */
-    *(uint32_t*)(vf->low_ram + 0x2C) = HLE_STUB_BASE + 3 * 20;  /* PABT  → HLE fatal */
-    *(uint32_t*)(vf->low_ram + 0x30) = HLE_STUB_BASE + 4 * 20;  /* DABT  → HLE fatal */
-    *(uint32_t*)(vf->low_ram + 0x34) = 0;                        /* reserved */
-    *(uint32_t*)(vf->low_ram + 0x38) = 0x1000FF98u;              /* IRQ → SDRAM chain */
-    *(uint32_t*)(vf->low_ram + 0x3C) = HLE_STUB_BASE + 6 * 20;  /* FIQ  → HLE */
-
-    /* 3. Mirror vectors in SDRAM[0x00-0x3C] for MMU configs mapping VA 0 → SDRAM */
-    for (int i = 0; i < 8; i++)
-        *(uint32_t*)(vf->ram + i * 4) = ldr_pc_18;
-    *(uint32_t*)(vf->ram + 0x20) = *(uint32_t*)(vf->low_ram + 0x20);
-    *(uint32_t*)(vf->ram + 0x24) = *(uint32_t*)(vf->low_ram + 0x24);
-    *(uint32_t*)(vf->ram + 0x28) = *(uint32_t*)(vf->low_ram + 0x28);
-    *(uint32_t*)(vf->ram + 0x2C) = *(uint32_t*)(vf->low_ram + 0x2C);
-    *(uint32_t*)(vf->ram + 0x30) = *(uint32_t*)(vf->low_ram + 0x30);
-    *(uint32_t*)(vf->ram + 0x34) = 0;
-    *(uint32_t*)(vf->ram + 0x38) = 0x1000FF98u;
-    *(uint32_t*)(vf->ram + 0x3C) = *(uint32_t*)(vf->low_ram + 0x3C);
-
-    /* 4. SDRAM chain: 0x1000FF98 → LDR PC,[PC,#0x18] → loads 0x1000FFB8 */
+    /* 1. SDRAM chain link: 0x1000FF98 → LDR PC,[PC,#0x18] → loads 0x1000FFB8 */
     *(uint32_t*)(vf->ram + 0xFF98) = 0xE59FF018u;  /* LDR PC,[PC,#0x18] */
-    *(uint32_t*)(vf->ram + 0xFFB8) = 0x10A15CA0u;  /* RTOS IRQ handler */
 
-    printf("[RTOS-VEC] IRQ chain installed: low_ram[0x18]→0x1000FF98→0x10A15CA0\n");
-    printf("[RTOS-VEC] rom_remapped=1 (PA 0 → low_ram)\n");
+    /* 2. Install proper IRQ handler at 0x10FFF100.
+     * Clears: ZEVIO timer status, SoC INTC pending, VIC ACK+EOI.
+     * Then returns to interrupted code via SUBS PC,LR,#4.
+     *
+     * ARM code:
+     *   PUSH  {R0-R3, R12, LR}
+     *   LDR   R0, [PC, #pool0]     ; R0 = 0xB000004C (timer0 status)
+     *   MOV   R1, #1
+     *   STR   R1, [R0]             ; clear timer0 status
+     *   LDR   R0, [PC, #pool1]     ; R0 = 0xB0001020 (SoC INTC clear)
+     *   STR   R1, [R0]             ; clear SoC INTC bit 0
+     *   LDR   R0, [PC, #pool2]     ; R0 = 0xDC000024 (VIC ACK)
+     *   LDR   R2, [R0]             ; R2 = acknowledge IRQ
+     *   LDR   R0, [PC, #pool3]     ; R0 = 0xDC00002C (VIC EOI)
+     *   STR   R2, [R0]             ; write ACK value to EOI
+     *   POP   {R0-R3, R12, LR}
+     *   SUBS  PC, LR, #4           ; return from IRQ
+     *   ; pool data follows
+     */
+    {
+        uint32_t h = 0xFFF100;
+        uint32_t p = h;
+        *(uint32_t*)(vf->ram + p) = 0xE92D500F; p += 4; /* PUSH {R0-R3,R12,LR} */
+        *(uint32_t*)(vf->ram + p) = 0xE59F0024; p += 4; /* LDR R0,[PC,#0x24]→pool0 */
+        *(uint32_t*)(vf->ram + p) = 0xE3A01001; p += 4; /* MOV R1,#1 */
+        *(uint32_t*)(vf->ram + p) = 0xE5801000; p += 4; /* STR R1,[R0] timer clr */
+        *(uint32_t*)(vf->ram + p) = 0xE59F001C; p += 4; /* LDR R0,[PC,#0x1C]→pool1 */
+        *(uint32_t*)(vf->ram + p) = 0xE5801000; p += 4; /* STR R1,[R0] intc clr */
+        *(uint32_t*)(vf->ram + p) = 0xE59F0018; p += 4; /* LDR R0,[PC,#0x18]→pool2 */
+        *(uint32_t*)(vf->ram + p) = 0xE5902000; p += 4; /* LDR R2,[R0] vic ack */
+        *(uint32_t*)(vf->ram + p) = 0xE59F0014; p += 4; /* LDR R0,[PC,#0x14]→pool3 */
+        *(uint32_t*)(vf->ram + p) = 0xE5802000; p += 4; /* STR R2,[R0] vic eoi */
+        *(uint32_t*)(vf->ram + p) = 0xE8BD500F; p += 4; /* POP {R0-R3,R12,LR} */
+        *(uint32_t*)(vf->ram + p) = 0xE25EF004; p += 4; /* SUBS PC,LR,#4 */
+        /* Pool data (each LDR offset calculated from its PC+8) */
+        *(uint32_t*)(vf->ram + p) = 0xB000004C; p += 4; /* pool0: timer0+0x18 status */
+        *(uint32_t*)(vf->ram + p) = 0xB0001020; p += 4; /* pool1: SoC INTC clear */
+        *(uint32_t*)(vf->ram + p) = 0xDC000024; p += 4; /* pool2: VIC ACK */
+        *(uint32_t*)(vf->ram + p) = 0xDC00002C; p += 4; /* pool3: VIC EOI */
+    }
+    *(uint32_t*)(vf->ram + 0xFFB8) = 0x10000000 + 0xFFF100; /* → our IRQ handler */
+
+    printf("[RTOS-VEC] IRQ chain: SDRAM[0xFF98]→SDRAM[0xFFB8]=0x10FFF100 (HLE IRQ handler)\n");
 }
 
 static int vflash_hle_boot(VFlash *vf) {
@@ -4693,6 +4716,14 @@ void vflash_run_frame(VFlash *vf) {
         vf->timer.irq.enable |= 0x01;
     }
 
+    /* Per-frame: keep SDRAM IRQ chain patched (kernel init may overwrite).
+     * ROM chain: ROM[0x18]→ROM[0xD44]=0x1000FF98→SDRAM[0xFF98]→SDRAM[0xFFB8].
+     * Ensure [0xFFB8] always points to our handler. */
+    if (vf->has_rom && vf->boot_phase >= 300) {
+        *(uint32_t*)(vf->ram + 0xFF98) = 0xE59FF018u;
+        *(uint32_t*)(vf->ram + 0xFFB8) = 0x10FFF100u;
+    }
+
     int done = 0;
     int slice_count = 0;
     while (done < TOTAL) {
@@ -4805,11 +4836,14 @@ void vflash_run_frame(VFlash *vf) {
                 if (loop_1e40 == 0) {
                     vf->cpu.cpsr &= ~0xC0;
                     vf->rtc_regs[0x8C >> 2] = 1;
-                    /* Patch IRQ vector to use µMORE dispatch at 0x100873D0
-                     * instead of int_disable at 0x10A15CA0. The vector table
-                     * chain: ROM[0x18]→SDRAM[0xFF98]→SDRAM[0xFFB8]. */
-                    *(uint32_t*)(vf->ram + 0xFFB8) = 0x100873D0;
-                    printf("[SCHED] µMORE init halt — patched IRQ dispatch + enabling IRQ\n");
+                    /* Patch IRQ vector chain — only if RTOS chain not installed.
+                     * When rom_remapped=1, install_rtos_irq_chain already set
+                     * SDRAM[0xFFB8]=0x10A15CA0 (real RTOS handler). Don't clobber. */
+                    if (!vf->has_rom) {
+                        *(uint32_t*)(vf->ram + 0xFFB8) = 0x100873D0;
+                    }
+                    printf("[SCHED] µMORE init halt — %s IRQ dispatch + enabling IRQ\n",
+                           vf->has_rom ? "keeping RTOS chain" : "patched");
                 }
                 loop_1e40++;
                 /* After 500 ticks at halt, µMORE services are stable.
@@ -5240,58 +5274,43 @@ void vflash_run_frame(VFlash *vf) {
                 vf->timer.irq.enable |= 0x01;
                 vf->cpu.cpsr &= ~0x80; /* enable IRQ only (FIQ when kernel is ready) */
                 vf->cpu.r13_irq = 0x10800000;
-                /* Redirect FIQ vector to our custom timer handler.
-                 * FIQ vector at SDRAM[0x1C] does LDR PC,[0x94].
-                 * Overwrite SDRAM[0x94] with our handler address.
-                 * Handler at RAM[0xFFE000] clears timer + returns. */
-                {
-                    /* Simple IRQ handler: clear timer only.
-                     * µMORE IRQ dispatch (0x872A4) crashes on uninitialized tables.
-                     * Task dispatch needs a different approach. */
+                /* Install HLE vector handler + IRQ dispatcher patches.
+                 * SKIP when RTOS chain is active (rom_remapped=1) — the real
+                 * RTOS IRQ handler at 0x10A15CA0 handles everything properly. */
+                if (!vf->has_rom) {
                     uint32_t h = 0xFFE000;
                     uint32_t p = h;
-                    *(uint32_t*)(vf->ram + p) = 0xE92D500F; p += 4; /* PUSH {R0-R3,R12,LR} */
-                    *(uint32_t*)(vf->ram + p) = 0xE59F000C; p += 4; /* LDR R0,[PC,#12] */
-                    *(uint32_t*)(vf->ram + p) = 0xE3A01001; p += 4; /* MOV R1,#1 */
-                    *(uint32_t*)(vf->ram + p) = 0xE5801000; p += 4; /* STR R1,[R0] clear */
-                    *(uint32_t*)(vf->ram + p) = 0xE8BD500F; p += 4; /* POP {R0-R3,R12,LR} */
-                    *(uint32_t*)(vf->ram + p) = 0xE25EF004; p += 4; /* SUBS PC,LR,#4 */
-                    *(uint32_t*)(vf->ram + p) = 0x9001000C; p += 4; /* pool: timer IntClr */
-                    /* Point FIQ vector pool to our handler */
+                    *(uint32_t*)(vf->ram + p) = 0xE92D500F; p += 4;
+                    *(uint32_t*)(vf->ram + p) = 0xE59F000C; p += 4;
+                    *(uint32_t*)(vf->ram + p) = 0xE3A01001; p += 4;
+                    *(uint32_t*)(vf->ram + p) = 0xE5801000; p += 4;
+                    *(uint32_t*)(vf->ram + p) = 0xE8BD500F; p += 4;
+                    *(uint32_t*)(vf->ram + p) = 0xE25EF004; p += 4;
+                    *(uint32_t*)(vf->ram + p) = 0x9001000C; p += 4;
                     *(uint32_t*)(vf->ram + 0x94) = 0x10000000 + h;
-                    /* Overwrite BOTH IRQ and FIQ vectors in SDRAM
-                     * to branch directly to our handler (skip dispatch chain) */
                     {
                         int32_t irq_off = (int32_t)(h - (0x18 + 8)) >> 2;
-                        *(uint32_t*)(vf->ram + 0x18) = 0xEA000000 | (irq_off & 0xFFFFFF); /* B handler */
+                        *(uint32_t*)(vf->ram + 0x18) = 0xEA000000 | (irq_off & 0xFFFFFF);
                         int32_t fiq_off = (int32_t)(h - (0x1C + 8)) >> 2;
-                        *(uint32_t*)(vf->ram + 0x1C) = 0xEA000000 | (fiq_off & 0xFFFFFF); /* B handler */
+                        *(uint32_t*)(vf->ram + 0x1C) = 0xEA000000 | (fiq_off & 0xFFFFFF);
                     }
-                    /* Force timer to IRQ (not FIQ) */
                     vf->timer.irq.fiq_sel = 0;
                     printf("[IRQ] Direct vector → handler at 0x%08X\n", 0x10000000 + h);
-                }
-                /* Fix µMORE IRQ dispatcher: populate dispatch table entries.
-                 * µMORE handler at 0x100873D0 reads [0x100857B8] for handler addr.
-                 * Point it to our timer handler so dispatch works properly.
-                 * Also keep SDRAM[0xFF98] redirect as fallback. */
-                {
-                    /* Populate dispatch table with our timer handler */
                     *(uint32_t*)(vf->ram + 0x857B8) = 0x10FFF040;
-                    /* Also redirect SDRAM[0xFF98] as insurance */
                     int32_t b_off = (int32_t)(0xFFF040 - (0xFF98 + 8)) >> 2;
                     *(uint32_t*)(vf->ram + 0xFF98) = 0xEA000000 | (b_off & 0xFFFFFF);
-                    *(uint32_t*)(vf->ram + 0xFFF080) = 0xE1B0F00E; /* MOVS PC,LR */
+                    *(uint32_t*)(vf->ram + 0xFFF080) = 0xE1B0F00E;
+                    uint32_t w = 0xFFF040;
+                    *(uint32_t*)(vf->ram+w)=0xE92D500F; w+=4;
+                    *(uint32_t*)(vf->ram+w)=0xE59F000C; w+=4;
+                    *(uint32_t*)(vf->ram+w)=0xE3A01001; w+=4;
+                    *(uint32_t*)(vf->ram+w)=0xE5801000; w+=4;
+                    *(uint32_t*)(vf->ram+w)=0xE8BD500F; w+=4;
+                    *(uint32_t*)(vf->ram+w)=0xE25EF004; w+=4;
+                    *(uint32_t*)(vf->ram+w)=0x9001000C; w+=4;
+                } else {
+                    printf("[IRQ] ROM boot — skipping HLE vector patches (SDRAM chain active)\n");
                 }
-                /* IRQ wrapper at 0xFFF040 */
-                uint32_t w = 0xFFF040;
-                *(uint32_t*)(vf->ram+w)=0xE92D500F; w+=4;
-                *(uint32_t*)(vf->ram+w)=0xE59F000C; w+=4;
-                *(uint32_t*)(vf->ram+w)=0xE3A01001; w+=4;
-                *(uint32_t*)(vf->ram+w)=0xE5801000; w+=4;
-                *(uint32_t*)(vf->ram+w)=0xE8BD500F; w+=4;
-                *(uint32_t*)(vf->ram+w)=0xE25EF004; w+=4;
-                *(uint32_t*)(vf->ram+w)=0x9001000C; w+=4;
                 printf("[KERN] Timer + IRQ enabled, kernel at 0x%08X\n", pc);
                 printf("[KERN] Heap: [0x359660]=%08X [0x3596B0]=%08X\n",
                        *(uint32_t*)(vf->ram + 0x359660),

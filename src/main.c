@@ -194,6 +194,28 @@ int main(int argc, char **argv) {
             if (keys[SDL_SCANCODE_C])      buttons |= VFLASH_BTN_GREEN;
             if (keys[SDL_SCANCODE_V])      buttons |= VFLASH_BTN_BLUE;
             if (keys[SDL_SCANCODE_RETURN]) buttons |= VFLASH_BTN_ENTER;
+        } else {
+            /* Headless auto-input: simulate button presses to progress
+             * past title screens and menus.
+             * Schedule: Enter at 3s, 5s, 8s; Red at 10s, 15s, 20s;
+             * then cycle Enter+Red every 10s. */
+            uint32_t sec = SDL_GetTicks() / 1000;
+            if (sec >= 3 && sec < 4)  buttons |= VFLASH_BTN_ENTER;
+            if (sec >= 5 && sec < 6)  buttons |= VFLASH_BTN_ENTER;
+            if (sec >= 8 && sec < 9)  buttons |= VFLASH_BTN_ENTER;
+            if (sec >= 10 && sec < 11) buttons |= VFLASH_BTN_RED;
+            if (sec >= 15 && sec < 16) buttons |= VFLASH_BTN_RED;
+            if (sec >= 20 && sec < 21) buttons |= VFLASH_BTN_ENTER;
+            if (sec >= 25 && sec < 26) buttons |= VFLASH_BTN_RED;
+            if (sec >= 30 && sec < 31) buttons |= VFLASH_BTN_ENTER;
+            if (sec >= 35 && sec < 36) buttons |= VFLASH_BTN_RED;
+            if (sec >= 40) {
+                /* Cycle Enter/Red every 5 seconds */
+                uint32_t phase = (sec - 40) / 5;
+                uint32_t in_phase = (sec - 40) % 5;
+                if (in_phase == 0)
+                    buttons |= (phase % 2) ? VFLASH_BTN_RED : VFLASH_BTN_ENTER;
+            }
         }
         vflash_set_input(vf, buttons);
 
