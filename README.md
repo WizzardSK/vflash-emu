@@ -98,10 +98,29 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **Per-slice IRQ delivery** | ✅ Check IRQ after each JIT slice for CPSR windows |
 | **Render processing** | ✅ VFF tile layers rendering (sky/ground/road visible) |
 | **PTX display** | ✅ 8bpp with palette via native render FB pipeline (RGB565) |
-| **RTOS IRQ vector chain** | ✅ low_ram[0x18]→SDRAM[0xFF98]→0x10A15CA0 (VIC ACK/EOI) |
-| **ROM boot kernel detection** | ✅ MMU+PC in kernel → boot_phase=300 auto-detect |
-| **sec[1] sprite watchpoint** | ✅ Memory read trap for decompressor PC capture |
-| **Headless mode** | ✅ SDL_QUIT ignored, CD scan skipped, VFLASH_LOG env var |
+| **RTOS IRQ vector chain** | ✅ SDRAM[0xFF98]→0x10FFF200 HLE handler (timer+INTC+VIC) |
+| **HLE IRQ handler** | ✅ Clears ZEVIO timer, SoC INTC, VIC ACK/vector/EOI |
+| **ROM boot kernel detection** | ✅ MMU+PC in kernel → bp300, timed bp300→800→900 |
+| **sec[1] sprite watchpoint** | ✅ Memory read trap at 0x1067A000 (2.8MB, Spider-Man) |
+| **VFF entry table load** | ✅ Dispatch table loaded from CD (8KB after sec[0]) |
+| **VFF scene init scan** | 🔧 Finds dispatch table literal in sec[0], backward PUSH search |
+| **Headless mode** | ✅ SDL_QUIT ignored, auto-input, VFLASH_LOG env var |
+
+### ROM Boot Flow (new)
+
+```
+ROM[0x00] → flash remap → SDRAM cal (0xB8000Axx, ~6 frames)
+  → memcpy 589KB → BSS clear → MMU enable (TTB=0x100A8000)
+  → scheduler (0x10010234) → task dispatch
+  [auto-detect: MMU on + PC in kernel → bp=300]
+  → IRQ chain installed: ROM[0x18]→SDRAM[0xFF98]→0x10FFF200
+  → HLE IRQ handler: ZEVIO timer + SoC INTC + VIC ACK/vec/EOI
+  [timed: frame 30 → bp=800, game launch at 0x10C16CC0]
+  → BOOT.BIN game init → NULL trap catches missing vtables
+  → bp=900, game engine idle loop at 0x109FC1B8
+  → VFF scene data loaded (sec[0]+sec[1]+sec[2] from CD)
+  → VFF scene init: entry scan for dispatch table population (WIP)
+```
 
 ### Remaining for gameplay
 
@@ -114,6 +133,13 @@ photo atlases for Knowledge World tutorial, NOT scene backgrounds.
 **Sprite compression**: sec[1] data uses custom compression (not zlib/LZ77/LZW).
 44 bytes + compressed body per sprite entry. Decompression routine not yet identified
 in BOOT.BIN ARM code. Resource table: 59 entries (55 sprites + 4 metadata).
+Memory watchpoint active on sec[1] region (0x1067A000-0x1093E000 for Spider-Man)
+— will capture decompressor PC once VFF scene init populates render entities.
+
+**VFF scene init blocker**: Scene init function in sec[0] references dispatch table
+(0x104E5000) as literal pool. Backward scan for PUSH prologue fails because game
+BSS clear overwrites function prologue bytes before scan executes. Fix: run scene
+init immediately after CD load (before BSS clear), or protect sec[0] from BSS clear.
 
 **Render draw path**: render_processing (0x10A89100) is called every game loop
 iteration but returns early. The function checks render context flags at
@@ -299,8 +325,15 @@ ROM[0x00] → flash copy → flash remap (0x118)
 | Game loop code missing | 0x109D1CE0 was empty | Reload 704KB from BOOT.BIN CD |
 | Phase 101 overwrites bp | boot_phase 800→300 race | Guard with boot_phase < 800 |
 | PC escape to flash ROM | Render writes to 0xB80007xx | DC MMIO intercept + per-slice redirect |
-| IRQ vector not reaching RTOS | Timer stub at 0x10FFF040 skipped scheduler | install_rtos_irq_chain: low_ram→0xFF98→0x10A15CA0 |
+| IRQ vector not reaching handler | Timer stub at 0x10FFF040 skipped scheduler | SDRAM chain: ROM[0x18]→0xFF98→0x10FFF200 HLE handler |
+| IRQ handler missing VIC vector | EOI without vector# left IRQ pending | Added VIC vector read (0xDC000028) between ACK and EOI |
+| Handler address collision | 0xFFF100 overlapped with task struct | Moved handler to 0xFFF200 |
+| Timer status wrong address | Pool had 0xB000004C (wrong offset) | Fixed to 0xB0000024 (timer base + 0x18) |
+| HLE patches clobbered chain | SDRAM[0xFFB8] overwritten by init halt | Guard with has_rom, per-frame chain refresh |
 | ROM boot had no boot_phase | Kernel reached but detection missed | Auto-detect: MMU on + PC in scheduler = bp300 |
+| bp300→800 kernel crash | Per-slice bp800 ran before game setup | Atomic: set bp800 + game launch in same post-frame |
+| VFF-EXEC wrong entry | init_cb was utility stub (15 steps) | Scan sec[0] for dispatch table literal reference |
+| VFF entry table not loaded | Dispatch table at sec[0] boundary | Load extra 8KB from CD after sec[0] |
 | PTX splash blocked headless | cdrom_read_file hung in headless mode | Skip PTX/gallery/scan when has_rom |
 | SDL_QUIT killed headless | Process exited after 1 frame | Ignore SDL_QUIT in headless mode |
 | CPSR mode corruption | Mode bits = 0x00 (invalid) | Per-frame sanity check → force SVC |
