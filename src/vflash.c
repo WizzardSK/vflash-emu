@@ -6959,8 +6959,9 @@ void vflash_run_frame(VFlash *vf) {
      * Jump to 0x109D1CA8 (buffer clear + display setup) instead of
      * directly to game loop. This lets the game set up its own
      * framebuffer and render state before entering the main loop. */
-    if (vf->has_rom && vf->boot_phase == 800 &&
-        vf->frame_count >= 100 && vf->frame_count <= 200) {
+    if (vf->has_rom && vf->boot_phase >= 800 &&
+        vf->frame_count >= 35 && vf->frame_count <= 200) {
+        printf("[VFF-GATE] bp=%d frame=%lu rom=%d\n", vf->boot_phase, (unsigned long)vf->frame_count, vf->has_rom);
         /* Set asset loading counters to > 7 (game waits for this) */
         *(uint32_t*)(vf->ram + 0xB05A18) = 8;  /* counter1 */
         *(uint32_t*)(vf->ram + 0xB05A1C) = 8;  /* counter2 */
@@ -7008,14 +7009,24 @@ void vflash_run_frame(VFlash *vf) {
          * Find entry by scanning for first ARM function prologue (PUSH/STMDB).
          * Called with R0=1 (init), R1=0xFFFF (all scenes). */
         {
-            /* Scan sec[0] for first STMDB SP!, {regs} (E92Dxxxx) prologue */
-            uint32_t s0_addr = 0x104E2000; /* default sec[0] load address */
-            uint32_t s0_size = 0x20000;    /* default scan range */
-            if (vff_entry) {
-                /* entry_table from VFF header → sec[0] end */
-                s0_addr = vff_entry - (vff_entry - 0x104E2000);
-                /* Rough: use first 16KB for prologue scan */
+            /* Scan sec[0] for first STMDB SP!, {regs} (E92Dxxxx) prologue.
+             * sec[0] load address from VFF: entry table at vff_entry points
+             * into sec[0]. For Spider-Man: sec[0] at 0x10374000. Use vff_entry
+             * or scan from sec[0] base (first section in VFF after header). */
+            uint32_t s0_addr = vf->sec1_base ? (vf->sec1_base - 0x200000) : 0x104E2000;
+            /* Better: re-read VFF header to get sec[0] address */
+            if (vf->cd && vf->cd->is_open) {
+                CDEntry ve2;
+                if (cdrom_find_file_any(vf->cd, "MAIN.VFF", &ve2)) {
+                    uint8_t vh2[0x60];
+                    cdrom_read_file(vf->cd, &ve2, vh2, 0, 0x60);
+                    if (vh2[0]=='v' && vh2[1]=='f') {
+                        s0_addr = *(uint32_t*)(vh2 + 0x30);
+                        if (s0_addr < 0x10000000) s0_addr = 0x104E2000;
+                    }
+                }
             }
+            uint32_t s0_size = 0x200000; /* scan up to 2MB */
             /* Scan for scene entry: LDR Rx, =0xFFFF followed by PUSH.
              * The scene init function starts with LDR R12, =0xFFFF; PUSH {regs}
              * and is called with R0=1 (init), R1=scene_id. */
