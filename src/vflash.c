@@ -4851,15 +4851,8 @@ void vflash_run_frame(VFlash *vf) {
                 printf("[ROM-BOOT] Kernel at PC=%08X — boot_phase=300, IRQ chain + timer installed\n", pc);
             }
 
-            /* ROM boot: advance 300→800 after kernel has run for 20 frames.
-             * The HLE B. detection doesn't work with active IRQ delivery.
-             * After 20 frames the scheduler + tasks are initialized. */
-            if (vf->has_rom && vf->boot_phase == 300 && vf->frame_count > 30) {
-                vf->boot_phase = 800;
-                install_rtos_irq_chain(vf);
-                printf("[ROM-BOOT] boot_phase 300→800 (timed), frame=%lu\n",
-                       (unsigned long)vf->frame_count);
-            }
+            /* ROM boot 300→800: handled in post-frame AUTO-LAUNCH section
+             * to avoid kernel running at bp800 without game task set up. */
 
             /* µMORE init halt at 0x109D1E40: B . with FIQ disabled.
              * Force FIQ enable so timer interrupt can dispatch tasks. */
@@ -5969,6 +5962,21 @@ void vflash_run_frame(VFlash *vf) {
         (vf->timer.irq.status & 1)) {
         /* Timer just fired (irq_pending cleared by handler, status still set).
          * Alternatively, trigger on every frame after boot_phase 800. */
+    }
+    /* ROM boot: advance 300→800 after kernel has run for 30 frames.
+     * Set bp=800 AND launch game task atomically to avoid kernel crash. */
+    if (vf->has_rom && vf->boot_phase == 300 && vf->frame_count >= 30) {
+        vf->boot_phase = 800;
+        install_rtos_irq_chain(vf);
+        printf("[ROM-BOOT] boot_phase 300→800 (timed), frame=%lu\n",
+               (unsigned long)vf->frame_count);
+        /* Set PC directly to game entry — the per-frame bp==800 code
+         * below will create the TCB and game state on the same frame. */
+        vf->cpu.r[15] = 0x10C16CC0; /* game task entry */
+        vf->cpu.cpsr = 0x00000013;  /* SVC, IRQ enabled */
+        vf->cpu.r[13] = 0x10FFD000 + 0x20000 - 4; /* stack */
+        vf->cpu.r[14] = 0x10FFF000; /* return to idle */
+        vf->cpu.null_trap_enabled = 1; /* catch NULL function calls */
     }
     /* Per-frame scheduler tick — ensure game task is in ready list.
      * Only active during boot_phase 800 (before game loop takes over at 900). */
