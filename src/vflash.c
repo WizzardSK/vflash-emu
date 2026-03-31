@@ -3067,30 +3067,56 @@ static void install_rtos_irq_chain(VFlash *vf) {
      *   SUBS  PC, LR, #4           ; return from IRQ
      *   ; pool data follows
      */
+    /* IRQ handler at 0x10FFF200: clear timer, SoC INTC, VIC ACK+vector+EOI.
+     *
+     *   PUSH  {R0-R3, R12, LR}      ; save regs
+     *   LDR   R0, =0xB0000024       ; timer0 status
+     *   MOV   R1, #1
+     *   STR   R1, [R0]              ; clear timer0 IRQ
+     *   LDR   R0, =0xB0001020       ; SoC INTC clear
+     *   STR   R1, [R0]              ; clear INTC bit 0
+     *   LDR   R0, =0xDC000024       ; VIC ACK
+     *   LDR   R2, [R0]              ; R2 = ACK value
+     *   LDR   R0, =0xDC000028       ; VIC vector (MUST read to set vector#)
+     *   LDR   R3, [R0]              ; R3 = vector# (triggers vic.vector set)
+     *   LDR   R0, =0xDC00002C       ; VIC EOI
+     *   STR   R3, [R0]              ; write vector# to EOI → clears irq_active
+     *   POP   {R0-R3, R12, LR}
+     *   SUBS  PC, LR, #4            ; return from IRQ
+     */
     {
-        uint32_t h = 0xFFF100;
+        uint32_t h = 0xFFF200;
         uint32_t p = h;
-        *(uint32_t*)(vf->ram + p) = 0xE92D500F; p += 4; /* PUSH {R0-R3,R12,LR} */
-        *(uint32_t*)(vf->ram + p) = 0xE59F0024; p += 4; /* LDR R0,[PC,#0x24]→pool0 */
-        *(uint32_t*)(vf->ram + p) = 0xE3A01001; p += 4; /* MOV R1,#1 */
-        *(uint32_t*)(vf->ram + p) = 0xE5801000; p += 4; /* STR R1,[R0] timer clr */
-        *(uint32_t*)(vf->ram + p) = 0xE59F001C; p += 4; /* LDR R0,[PC,#0x1C]→pool1 */
-        *(uint32_t*)(vf->ram + p) = 0xE5801000; p += 4; /* STR R1,[R0] intc clr */
-        *(uint32_t*)(vf->ram + p) = 0xE59F0018; p += 4; /* LDR R0,[PC,#0x18]→pool2 */
-        *(uint32_t*)(vf->ram + p) = 0xE5902000; p += 4; /* LDR R2,[R0] vic ack */
-        *(uint32_t*)(vf->ram + p) = 0xE59F0014; p += 4; /* LDR R0,[PC,#0x14]→pool3 */
-        *(uint32_t*)(vf->ram + p) = 0xE5802000; p += 4; /* STR R2,[R0] vic eoi */
-        *(uint32_t*)(vf->ram + p) = 0xE8BD500F; p += 4; /* POP {R0-R3,R12,LR} */
-        *(uint32_t*)(vf->ram + p) = 0xE25EF004; p += 4; /* SUBS PC,LR,#4 */
-        /* Pool data (each LDR offset calculated from its PC+8) */
-        *(uint32_t*)(vf->ram + p) = 0xB000004C; p += 4; /* pool0: timer0+0x18 status */
-        *(uint32_t*)(vf->ram + p) = 0xB0001020; p += 4; /* pool1: SoC INTC clear */
-        *(uint32_t*)(vf->ram + p) = 0xDC000024; p += 4; /* pool2: VIC ACK */
-        *(uint32_t*)(vf->ram + p) = 0xDC00002C; p += 4; /* pool3: VIC EOI */
+        *(uint32_t*)(vf->ram + p) = 0xE92D500F; p += 4; /* +00: PUSH {R0-R3,R12,LR} */
+        *(uint32_t*)(vf->ram + p) = 0xE59F0030; p += 4; /* +04: LDR R0,[PC,#0x30]→pool0 */
+        *(uint32_t*)(vf->ram + p) = 0xE3A01001; p += 4; /* +08: MOV R1,#1 */
+        *(uint32_t*)(vf->ram + p) = 0xE5801000; p += 4; /* +0C: STR R1,[R0] timer clr */
+        *(uint32_t*)(vf->ram + p) = 0xE59F0028; p += 4; /* +10: LDR R0,[PC,#0x28]→pool1 */
+        *(uint32_t*)(vf->ram + p) = 0xE5801000; p += 4; /* +14: STR R1,[R0] intc clr */
+        *(uint32_t*)(vf->ram + p) = 0xE59F0024; p += 4; /* +18: LDR R0,[PC,#0x24]→pool2 */
+        *(uint32_t*)(vf->ram + p) = 0xE5902000; p += 4; /* +1C: LDR R2,[R0] vic ack */
+        *(uint32_t*)(vf->ram + p) = 0xE59F0020; p += 4; /* +20: LDR R0,[PC,#0x20]→pool3 */
+        *(uint32_t*)(vf->ram + p) = 0xE5903000; p += 4; /* +24: LDR R3,[R0] vic vector */
+        *(uint32_t*)(vf->ram + p) = 0xE59F001C; p += 4; /* +28: LDR R0,[PC,#0x1C]→pool4 */
+        *(uint32_t*)(vf->ram + p) = 0xE5803000; p += 4; /* +2C: STR R3,[R0] vic eoi */
+        *(uint32_t*)(vf->ram + p) = 0xE8BD500F; p += 4; /* +30: POP {R0-R3,R12,LR} */
+        *(uint32_t*)(vf->ram + p) = 0xE25EF004; p += 4; /* +34: SUBS PC,LR,#4 */
+        /* Pool data — offsets calculated from each LDR's PC+8:
+         * +04: PC+8=h+0C, +0x30=h+3C → pool0
+         * +10: PC+8=h+18, +0x28=h+40 → pool1
+         * +18: PC+8=h+20, +0x24=h+44 → pool2
+         * +20: PC+8=h+28, +0x20=h+48 → pool3
+         * +28: PC+8=h+30, +0x1C=h+4C → pool4 */
+        *(uint32_t*)(vf->ram + p) = 0;          p += 4; /* +38: padding */
+        *(uint32_t*)(vf->ram + p) = 0xB0000024; p += 4; /* +3C: pool0 timer0 status */
+        *(uint32_t*)(vf->ram + p) = 0xB0001020; p += 4; /* +40: pool1 SoC INTC clear */
+        *(uint32_t*)(vf->ram + p) = 0xDC000024; p += 4; /* +44: pool2 VIC ACK */
+        *(uint32_t*)(vf->ram + p) = 0xDC000028; p += 4; /* +48: pool3 VIC vector */
+        *(uint32_t*)(vf->ram + p) = 0xDC00002C; p += 4; /* +4C: pool4 VIC EOI */
     }
-    *(uint32_t*)(vf->ram + 0xFFB8) = 0x10000000 + 0xFFF100; /* → our IRQ handler */
+    *(uint32_t*)(vf->ram + 0xFFB8) = 0x10FFF200;
 
-    printf("[RTOS-VEC] IRQ chain: SDRAM[0xFF98]→SDRAM[0xFFB8]=0x10FFF100 (HLE IRQ handler)\n");
+    printf("[RTOS-VEC] IRQ chain: SDRAM[0xFF98]→SDRAM[0xFFB8]=0x10FFF200 (HLE IRQ handler)\n");
 }
 
 static int vflash_hle_boot(VFlash *vf) {
@@ -4721,7 +4747,7 @@ void vflash_run_frame(VFlash *vf) {
      * Ensure [0xFFB8] always points to our handler. */
     if (vf->has_rom && vf->boot_phase >= 300) {
         *(uint32_t*)(vf->ram + 0xFF98) = 0xE59FF018u;
-        *(uint32_t*)(vf->ram + 0xFFB8) = 0x10FFF100u;
+        *(uint32_t*)(vf->ram + 0xFFB8) = 0x10FFF200u;
     }
 
     int done = 0;
@@ -4823,6 +4849,16 @@ void vflash_run_frame(VFlash *vf) {
                 /* Unmask IRQ in CPSR */
                 vf->cpu.cpsr &= ~0xC0;
                 printf("[ROM-BOOT] Kernel at PC=%08X — boot_phase=300, IRQ chain + timer installed\n", pc);
+            }
+
+            /* ROM boot: advance 300→800 after kernel has run for 20 frames.
+             * The HLE B. detection doesn't work with active IRQ delivery.
+             * After 20 frames the scheduler + tasks are initialized. */
+            if (vf->has_rom && vf->boot_phase == 300 && vf->frame_count > 30) {
+                vf->boot_phase = 800;
+                install_rtos_irq_chain(vf);
+                printf("[ROM-BOOT] boot_phase 300→800 (timed), frame=%lu\n",
+                       (unsigned long)vf->frame_count);
             }
 
             /* µMORE init halt at 0x109D1E40: B . with FIQ disabled.

@@ -486,6 +486,34 @@ int arm9_step(ARM9 *cpu) {
         uint32_t i = r32(cpu, inst_addr);
         PC = inst_addr + 8;
 
+        /* IRQ vector chain trace: log what CPU fetches/executes at 0x18 */
+        if (inst_addr == 0x18 && (CPSR & 0x1F) == 0x12) { /* IRQ mode */
+            static int irq_vec_trace = 0;
+            if (irq_vec_trace < 5) {
+                /* Simulate what LDR PC,[PC,#0xD24] would load */
+                uint32_t pool_va = 0x18 + 8 + 0xD24; /* = 0xD44 */
+                uint32_t pool_val = cpu->mem_read32(cpu->mem_ctx, pool_va);
+                printf("[IRQ-VEC-TRACE] PC=0x18 insn=%08X pool[0x%X]=%08X LR=%08X CPSR=%08X\n",
+                       i, pool_va, pool_val, cpu->r[14], CPSR);
+                irq_vec_trace++;
+            }
+        }
+        /* Also trace first instruction after vector jump */
+        if (inst_addr >= 0x1000FF90 && inst_addr <= 0x1000FFD0 && (CPSR & 0x1F) == 0x12) {
+            static int chain_trace = 0;
+            if (chain_trace < 5) {
+                printf("[IRQ-CHAIN] PC=%08X insn=%08X\n", inst_addr, i);
+                chain_trace++;
+            }
+        }
+        if (inst_addr >= 0x10FFF200 && inst_addr <= 0x10FFF240) {
+            static int handler_trace = 0;
+            if (handler_trace < 5) {
+                printf("[IRQ-HANDLER] PC=%08X insn=%08X CPSR=%08X\n", inst_addr, i, CPSR);
+                handler_trace++;
+            }
+        }
+
         /* Game init trace: log BL calls and returns */
         /* NULL pointer trap: when game code (LR in BOOT.BIN) calls through
          * a NULL pointer into BSS, auto-return to skip the call.
