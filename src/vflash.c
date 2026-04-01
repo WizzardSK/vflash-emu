@@ -289,6 +289,7 @@ struct VFlash {
     int      boot_phase; /* Boot flow phase tracking */
     int      render_budget; /* Instructions remaining in render pipeline (0=unlimited) */
     int      restore_vtable_pending; /* Restore vtable after render_init */
+    int      bss_protect_off; /* Temporarily disable BSS zeroing protection (VFF-EXEC) */
     JitContext *jit;                 /* JIT compiler context */
     uint8_t *rtos_backup;           /* Backup of RTOS code area for restore */
     uint32_t native_alloc_lr; /* Track native alloc return address for logging */
@@ -1660,7 +1661,7 @@ static void mem_write32(void *ctx, uint32_t addr, uint32_t val) {
         /* Protect code+data (0x10090000-0x10BF0000) from BSS zeroing. */
         if (val == 0 && roff >= 0x90000 && roff < 0xBF0000 &&
             !(roff >= 0xBBEAE0 && roff < 0xBE3C40) &&
-            vf->boot_phase >= 800) {
+            vf->boot_phase >= 800 && !vf->bss_protect_off) {
             return; /* silently block */
         }
         *(uint32_t*)(vf->ram + roff) = val;
@@ -3792,6 +3793,7 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
             if (budget_log < 5)
                 printf("[RENDER-BUDGET] Expired at PC=%08X, forcing return\n", addr);
             budget_log++;
+            vf->bss_protect_off = 0; /* Re-enable BSS protection */
             cpu->r[0] = 0;
             cpu->r[15] = 0x109D1CEC;
             cpu->r[13] = 0x10B8DA90;
@@ -4034,8 +4036,29 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     }
     if (vf->boot_phase >= 800 &&
         (addr == 0x10ABCB24 || addr == 0x10A8EBCC ||
-         addr == 0x10A909FC || addr == 0x10AA5AA0)) {
-        cpu->r[0] = 0;
+         addr == 0x10A909FC)) {
+        /* Preserve R0 — these functions return their input or a derived handle. */
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* HLE AA5AA0: returns a "scene node" object with valid vtable.
+     * The caller dereferences [result][0x40] as a function pointer (virtual call).
+     * Return a dummy object at 0x10FFD400 with vtable at 0x10FFD500.
+     * Vtable entries point to safe stub at 0x10FFD600 (MOV PC, LR). */
+    if (vf->boot_phase >= 800 && addr == 0x10AA5AA0) {
+        /* Set up safe vtable stub (once) */
+        static int vtable_init = 0;
+        if (!vtable_init) {
+            /* MOV PC, LR (E1A0F00E) at stub address */
+            *(uint32_t*)(vf->ram + 0xFFD600) = 0xE1A0F00E; /* MOV PC, LR */
+            /* Vtable at 0xFFD500: 32 entries all pointing to stub */
+            for (int vi = 0; vi < 32; vi++)
+                *(uint32_t*)(vf->ram + 0xFFD500 + vi * 4) = 0x10FFD600;
+            /* Dummy object at 0xFFD400: [0] = vtable ptr */
+            *(uint32_t*)(vf->ram + 0xFFD400) = 0x10FFD500;
+            vtable_init = 1;
+        }
+        cpu->r[0] = 0x10FFD400;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
@@ -4080,10 +4103,11 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
                    addr, cpu->r[0], cpu->r[1], cpu->r[2], cpu->r[14]);
             prop_log++;
         }
-        /* Actually store R1 into the object if R0 is a valid HLE object.
-         * The setter functions store values at specific offsets in the object.
-         * Map function address to object field offset: */
-        if (cpu->r[0] >= 0x10000000 && cpu->r[0] < 0x10000000 + VFLASH_RAM_SIZE) {
+        /* Store R1 into the object ONLY if R0 points to an allocated object,
+         * NOT to the stack. Stack property objects overlap with the caller's
+         * local variables (e.g., height=240 overwrites loop counter at [SP+0x18]). */
+        if (cpu->r[0] >= 0x10000000 && cpu->r[0] < 0x10000000 + VFLASH_RAM_SIZE &&
+            !(cpu->r[0] >= 0x10B80000 && cpu->r[0] < 0x10B90000)) { /* exclude stack region */
             uint32_t obj_off = cpu->r[0] - 0x10000000;
             /* Each 10AF3xxx function sets a different field. Map by function address.
              * Offset derived from function ordering: 10AF3ED0,3EF4,3F18,3F3C,3F60,3F84,3FA8 */
@@ -4101,7 +4125,8 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
             if (field_off && obj_off + field_off + 4 <= VFLASH_RAM_SIZE)
                 *(uint32_t*)(vf->ram + obj_off + field_off) = cpu->r[1];
         }
-        cpu->r[0] = 0;
+        /* Preserve R0 — property setters return the object pointer, not 0.
+         * Setting R0=0 breaks caller chains that pass objects through. */
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
@@ -4115,7 +4140,7 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
                    addr, cpu->r[0], cpu->r[1], cpu->r[14]);
             abb_log++;
         }
-        cpu->r[0] = 0;
+        /* Preserve R0 — callers chain the returned object pointer */
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
@@ -4503,6 +4528,7 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
                 vf2->ram[0xBE4BA0] = 1;
             }
         }
+        vf2->bss_protect_off = 1; /* Allow writes during render execution */
         vf2->render_budget = 50000000; /* 50M — let engine finish a full frame */
         return 0;
     }
@@ -7038,6 +7064,7 @@ void vflash_run_frame(VFlash *vf) {
                 uint32_t save_regs[16];
                 memcpy(save_regs, vf->cpu.r, sizeof(save_regs));
                 uint32_t save_cpsr = vf->cpu.cpsr;
+                vf->bss_protect_off = 1;
                 for (int hi = 0; btn_handlers[hi]; hi++) {
                     vf->cpu.r[15] = btn_handlers[hi];
                     vf->cpu.r[14] = 0x10FFF000;
@@ -7056,6 +7083,7 @@ void vflash_run_frame(VFlash *vf) {
                 }
                 memcpy(vf->cpu.r, save_regs, sizeof(save_regs));
                 vf->cpu.cpsr = save_cpsr;
+                vf->bss_protect_off = 0;
             }
             vf->lcd.upbase = 0x10BBEAE0;
             if (!vf->dc_vblank_cb)
@@ -7082,6 +7110,7 @@ void vflash_run_frame(VFlash *vf) {
                 vf->cpu.r[15] = 0x109D1648;
                 vf->cpu.r[14] = 0x10FFF000;
                 vf->cpu.cpsr = 0x000000D3;
+                vf->bss_protect_off = 1;
                 int budget = 50000;
                 while (budget > 0 && vf->cpu.r[15] != 0x10FFF000) {
                     arm9_step(&vf->cpu);
@@ -7090,6 +7119,7 @@ void vflash_run_frame(VFlash *vf) {
                     if (vpc >= 0xB8000000u || (vpc < 0x10000000u && vpc > 0x1000u))
                         break;
                 }
+                vf->bss_protect_off = 0;
                 memcpy(vf->cpu.r, save_regs, sizeof(save_regs));
                 vf->cpu.cpsr = save_cpsr;
             }
@@ -7509,6 +7539,7 @@ void vflash_run_frame(VFlash *vf) {
                 vf->cpu.r[3] = 0;
                 printf("[VFF-EXEC] Calling init at %08X with R0=%08X (dispatch table)\n",
                        entry, vf->cpu.r[0]);
+                vf->bss_protect_off = 1; /* Allow zero-writes during init execution */
                 vf->cpu.r[12] = 0;
                 vf->cpu.r[15] = entry;
                 vf->cpu.r[14] = 0x10FFF000;
@@ -7564,6 +7595,7 @@ void vflash_run_frame(VFlash *vf) {
                     arm9_step(&vf->cpu);
                     if (vf->cpu.r[15] == 0x10FFF000) break;
                 }
+                vf->bss_protect_off = 0; /* Re-enable BSS protection */
                 printf("[VFF-EXEC] Scene init: %d steps R0=%08X%s\n", si, vf->cpu.r[0],
                        loop_pc ? " (STUCK)" : si >= 5000000 ? " (TIMEOUT)" : "");
                 if (loop_pc)
@@ -7616,6 +7648,7 @@ void vflash_run_frame(VFlash *vf) {
                 int total_cb_steps = 0;
                 int cb_called = 0;
                 /* Scan dispatch table for callback pointers and call each one */
+                vf->bss_protect_off = 1;
                 if (dt_off + 0x1000 < VFLASH_RAM_SIZE) {
                     for (uint32_t di = 0; di < 0xDA0; di += 4) {
                         uint32_t v = *(uint32_t*)(vf->ram + dt_off + di);
@@ -7650,6 +7683,7 @@ void vflash_run_frame(VFlash *vf) {
                         }
                     }
                 }
+                vf->bss_protect_off = 0;
                 printf("[VFF-EXEC] Called %d scene callbacks (%d steps)\n",
                        cb_called, total_cb_steps);
                 printf("[VFF-SCENE] Entity callback: %d steps\n", si);
@@ -7999,6 +8033,7 @@ void vflash_run_frame(VFlash *vf) {
                     uint32_t save_regs2[16]; uint32_t save_cpsr2;
                     memcpy(save_regs2, vf->cpu.r, sizeof(save_regs2));
                     save_cpsr2 = vf->cpu.cpsr;
+                    vf->bss_protect_off = 1;
                     for (uint32_t di = 0; di < 0xDA0; di += 4) {
                         uint32_t v = *(uint32_t*)(vf->ram + dt_base_off + di);
                         /* Callback pointers are in VFF sec[0] code area or BOOT.BIN */
@@ -8025,6 +8060,7 @@ void vflash_run_frame(VFlash *vf) {
                             cb_total++;
                         }
                     }
+                    vf->bss_protect_off = 0;
                     memcpy(vf->cpu.r, save_regs2, sizeof(save_regs2));
                     vf->cpu.cpsr = save_cpsr2;
                     printf("[VFF-EXEC2] Re-ran %d scene callbacks (%d total steps)\n",
@@ -8740,6 +8776,7 @@ void vflash_run_frame(VFlash *vf) {
         vf->cpu.r[15] = vf->dc_vblank_cb;
         vf->cpu.r[14] = 0x10FFF000; /* return to idle */
         vf->cpu.cpsr = 0x00000013;  /* SVC, IRQ enabled */
+        vf->bss_protect_off = 1;
         int vbl_budget = 50000;
         while (vbl_budget > 0 && vf->cpu.r[15] != 0x10FFF000 &&
                vf->cpu.r[15] != 0x10FFF00C) {
@@ -8755,6 +8792,7 @@ void vflash_run_frame(VFlash *vf) {
             }
         }
         /* Restore CPU state (callback may have changed registers) */
+        vf->bss_protect_off = 0;
         vf->cpu.r[15] = save_pc;
         vf->cpu.r[14] = save_lr;
         vf->cpu.cpsr = save_cpsr;
