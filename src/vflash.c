@@ -298,6 +298,7 @@ struct VFlash {
     uint32_t saved_game_entry;
     uint32_t saved_game_stack;
     uint32_t saved_game_stack_sz;
+    uint32_t vff_entry;        /* VFF dispatch table address (set by VFF-EXEC) */
     uint32_t fiq_saved_r8_12[5]; /* r[8]-r[12] saved before FIQ mode switch */
     uint32_t dc_vblank_cb;       /* Display controller VBlank callback (from 0xB80007C0) */
     uint32_t dc_irq_handler;     /* Display controller IRQ handler (from 0xB8000784) */
@@ -4508,14 +4509,28 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
                 }
             }
         }
-        /* Build display list from HLE alloc entities */
+        /* Build display list from VFF scene init dispatch table.
+         * The init function at 104BC818 populated [0x10645000 + i*4] with
+         * 20 render object pointers (vtable=0x10643998). */
         if (*(uint32_t*)(vf2->ram + 0xBE3D24) == 0) {
             uint32_t arr = 0xB90000;
             int n = 0;
-            for (uint32_t ea = 0x080000; ea < 0x0C0000 && n < 100; ea += 64) {
-                if (*(uint32_t*)(vf2->ram+ea) == 0x10310800) {
-                    *(uint32_t*)(vf2->ram+arr+n*4) = 0x10000000+ea;
+            /* First: collect from VFF dispatch table (primary source) */
+            uint32_t dt_base = vf2->vff_entry ? vf2->vff_entry - 0x10000000 : 0x645000;
+            for (int i = 0; i < 20 && n < 100; i++) {
+                uint32_t obj = *(uint32_t*)(vf2->ram + dt_base + i * 4);
+                if (obj >= 0x10000000 && obj < 0x11000000) {
+                    *(uint32_t*)(vf2->ram + arr + n * 4) = obj;
                     n++;
+                }
+            }
+            /* Fallback: scan old HLE alloc region for dummy-vtable objects */
+            if (n == 0) {
+                for (uint32_t ea = 0x080000; ea < 0x0C0000 && n < 100; ea += 64) {
+                    if (*(uint32_t*)(vf2->ram+ea) == 0x10310800) {
+                        *(uint32_t*)(vf2->ram+arr+n*4) = 0x10000000+ea;
+                        n++;
+                    }
                 }
             }
             if (n > 0) {
@@ -4526,6 +4541,12 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
                 *(uint32_t*)(vf2->ram+0xBE3D38) = 0x10000000+arr+n*4;
                 *(uint32_t*)(vf2->ram+0xBE3D40) = 0;
                 vf2->ram[0xBE4BA0] = 1;
+                static int dl_log = 0;
+                if (dl_log < 3) {
+                    printf("[RENDER-DL] Built display list: %d objects from %s\n",
+                           n, n > 0 ? "VFF dispatch table" : "HLE alloc scan");
+                    dl_log++;
+                }
             }
         }
         vf2->bss_protect_off = 1; /* Allow writes during render execution */
@@ -7346,6 +7367,7 @@ void vflash_run_frame(VFlash *vf) {
                 if (vhdr[0]=='v' && vhdr[1]=='f') {
                     uint32_t nsec = *(uint32_t*)(vhdr + 0x2C);
                     vff_entry = *(uint32_t*)(vhdr + 0x10);
+                    vf->vff_entry = vff_entry; /* save for frame driver */
                     vff_init_cb = *(uint32_t*)(vhdr + 0x20);
                     printf("[VFF] entry=0x%08X init_cb=0x%08X nsec=%d\n",
                            vff_entry, vff_init_cb, nsec);
@@ -8801,6 +8823,173 @@ void vflash_run_frame(VFlash *vf) {
             printf("[VBLANK] Fired callback 0x%08X (budget left: %d)\n",
                    vf->dc_vblank_cb, vbl_budget);
             vbl_log++;
+        }
+    }
+
+    /* ================================================================
+     * C-SIDE FRAME DRIVER: call per-layer render callbacks directly.
+     * The native render pipeline (10B265E8) depends on deep RTOS state
+     * that we can't fully HLE. Instead, iterate the 20 layer entries in
+     * the layer descriptor table (0x10643998, stride 0x40) and call
+     * their per-layer render functions from sec[0] game code.
+     * ================================================================ */
+    if (vf->boot_phase >= 900 && vf->vff_entry &&
+        !(vf->saved_game_entry >= 0x10C00000 && vf->saved_game_entry < 0x10E00000)) {
+        static int frame_drv_count = 0;
+        /* Run frame driver: first try direct render function call,
+         * then fall back to per-layer callbacks */
+        if (frame_drv_count < 10 || (vf->frame_count % 30 == 0 && frame_drv_count < 30)) {
+            uint32_t dt_off = vf->vff_entry - 0x10000000;
+            /* Layer descriptor table: vtable of first render object */
+            uint32_t first_obj = *(uint32_t*)(vf->ram + dt_off);
+            uint32_t layer_table = 0;
+            if (first_obj >= 0x10000000 && first_obj < 0x11000000)
+                layer_table = *(uint32_t*)(vf->ram + (first_obj - 0x10000000));
+
+            if (layer_table >= 0x10000000 && layer_table < 0x11000000) {
+                uint32_t lt_off = layer_table - 0x10000000;
+                uint32_t save_regs[16];
+                uint32_t save_cpsr = vf->cpu.cpsr;
+                memcpy(save_regs, vf->cpu.r, sizeof(save_regs));
+                vf->bss_protect_off = 1;
+
+                /* Phase 1: Try calling the game's main render function directly.
+                 * 10B265E8 is the RTOS render engine entry that iterates
+                 * render objects. Give it a large budget. */
+                if (frame_drv_count < 3 &&
+                    *(uint32_t*)(vf->ram + 0xB265E8) != 0) {
+                    /* Populate render context with our display list */
+                    uint32_t arr = 0xB90000;
+                    int n = 0;
+                    for (int i = 0; i < 20; i++) {
+                        uint32_t o = *(uint32_t*)(vf->ram + dt_off + i * 4);
+                        if (o >= 0x10000000 && o < 0x11000000)
+                            *(uint32_t*)(vf->ram + arr + (n++) * 4) = o;
+                    }
+                    if (n > 0) {
+                        *(uint32_t*)(vf->ram + 0xBE3D24) = 0x10000000 + arr;
+                        *(uint32_t*)(vf->ram + 0xBE3D28) = 100;
+                        *(uint32_t*)(vf->ram + 0xBE3D2C) = (uint32_t)n;
+                        *(uint32_t*)(vf->ram + 0xBE3D38) = 0x10000000 + arr + n * 4;
+                    }
+                    vf->cpu.r[0] = 0x10BE3C40; /* render context ptr */
+                    vf->cpu.r[15] = 0x10B265E8;
+                    vf->cpu.r[14] = 0x10FFF000;
+                    vf->cpu.r[13] = 0x10B8D000;
+                    vf->cpu.cpsr = 0x000000D3;
+                    int rsteps = 0;
+                    for (int si = 0; si < 5000000; si++) {
+                        arm9_step(&vf->cpu);
+                        uint32_t npc = vf->cpu.r[15];
+                        if (npc == 0x10FFF000 || npc < 4 ||
+                            (npc > 0x11000000 && npc < 0x80000000)) break;
+                        rsteps++;
+                    }
+                    /* Check framebuffer */
+                    int rfb = 0;
+                    for (uint32_t fi = 0; fi < 320*240*2; fi += 2)
+                        if (*(uint16_t*)(vf->ram + 0xBBEAE0 + fi)) { rfb++; if (rfb > 100) break; }
+                    printf("[FRAME-DRV] Render engine 10B265E8: %d steps, fb=%d pixels\n", rsteps, rfb);
+                    /* Restore state for layer callbacks */
+                    memcpy(vf->cpu.r, save_regs, sizeof(save_regs));
+                    vf->cpu.cpsr = save_cpsr;
+                }
+
+                /* Phase 2: Per-layer callbacks */
+                int layers_called = 0, total_steps = 0;
+                for (int layer = 0; layer < 20; layer++) {
+                    /* Get render object for this layer */
+                    uint32_t obj = *(uint32_t*)(vf->ram + dt_off + layer * 4);
+                    if (obj < 0x10000000 || obj >= 0x11000000) continue;
+
+                    /* Per-layer callbacks in the layer table (stride 0x40):
+                     * +0x18: per-layer "update" function (reads scene state)
+                     * +0x28: per-layer "prepare" function
+                     * +0x38: per-layer "render" function
+                     * Call update first, then render, to match original pipeline order. */
+                    uint32_t entry_off = lt_off + (uint32_t)layer * 0x40;
+                    if (entry_off + 0x40 > VFLASH_RAM_SIZE) continue;
+
+                    static const int cb_offsets[] = {0x18, 0x28, 0x38, -1};
+                    int layer_steps = 0;
+                    for (int ci = 0; cb_offsets[ci] >= 0; ci++) {
+                        uint32_t cb = *(uint32_t*)(vf->ram + entry_off + cb_offsets[ci]);
+                        if (cb < 0x10100000 || cb >= 0x10600000) continue;
+                        uint32_t cb_off = cb - 0x10000000;
+                        if (cb_off + 4 > VFLASH_RAM_SIZE) continue;
+                        if (*(uint32_t*)(vf->ram + cb_off) == 0) continue;
+
+                        vf->cpu.r[0] = obj;
+                        vf->cpu.r[1] = (uint32_t)layer;
+                        vf->cpu.r[2] = 0x10BBEAE0;
+                        vf->cpu.r[3] = (uint32_t)vf->frame_count;
+                        vf->cpu.r[15] = cb;
+                        vf->cpu.r[14] = 0x10FFF000;
+                        vf->cpu.r[13] = 0x10B8D000;
+                        vf->cpu.cpsr = 0x000000D3;
+
+                        int budget = 500000;
+                        for (int si = 0; si < budget; si++) {
+                            arm9_step(&vf->cpu);
+                            uint32_t npc = vf->cpu.r[15];
+                            if (npc == 0x10FFF000 || npc < 4 ||
+                                (npc > 0x11000000 && npc < 0x80000000)) break;
+                            layer_steps++;
+                        }
+                    }
+                    total_steps += layer_steps;
+                    layers_called++;
+                    if (frame_drv_count < 2 && layer_steps > 10)
+                        printf("[FRAME-DRV] layer %d: steps=%d (entry @+%03X)\n",
+                               layer, layer_steps, (unsigned)(entry_off - lt_off));
+                }
+
+                memcpy(vf->cpu.r, save_regs, sizeof(save_regs));
+                vf->cpu.cpsr = save_cpsr;
+                vf->bss_protect_off = 0;
+
+                /* Check if anything was drawn to framebuffer */
+                int fb_nz = 0;
+                for (uint32_t fi = 0; fi < 320*240*2; fi += 2) {
+                    if (*(uint16_t*)(vf->ram + 0xBBEAE0 + fi)) { fb_nz++; if (fb_nz > 50) break; }
+                }
+
+                if (frame_drv_count < 5 || fb_nz > 0) {
+                    printf("[FRAME-DRV] %d layers called, %d steps, fb=%d non-zero pixels\n",
+                           layers_called, total_steps, fb_nz);
+                }
+                /* Scan other potential render targets for activity */
+                if (frame_drv_count < 2) {
+                    static const struct { uint32_t off; const char *name; } scan[] = {
+                        {0x1B8000, "sec2"}, {0x240000, "0x240K"}, {0x300000, "0x300K"},
+                        {0x400000, "0x400K"}, {0x680000, "alloc1"}, {0x700000, "alloc2"},
+                        {0xB90000, "renderDL"}, {0xBE3000, "renderCtx"}, {0}
+                    };
+                    for (int si = 0; scan[si].off; si++) {
+                        int nz = 0;
+                        for (uint32_t t = scan[si].off; t < scan[si].off + 0x10000 && t < VFLASH_RAM_SIZE; t += 4)
+                            if (*(uint32_t*)(vf->ram + t)) nz++;
+                        if (nz > 0)
+                            printf("[RAM-SCAN] %s @0x%06X: %d non-zero dwords (of 16K)\n",
+                                   scan[si].name, scan[si].off, nz);
+                    }
+                }
+                if (fb_nz > 50) {
+                    /* Framebuffer has content! Blit RGB565 to display */
+                    uint16_t *src = (uint16_t*)(vf->ram + 0xBBEAE0);
+                    for (int y = 0; y < 240; y++) {
+                        for (int x = 0; x < 320; x++) {
+                            uint16_t px = src[y * 320 + x];
+                            uint8_t r = (px >> 11) << 3;
+                            uint8_t g = ((px >> 5) & 0x3F) << 2;
+                            uint8_t b = (px & 0x1F) << 3;
+                            vf->framebuf[y * 320 + x] = (r << 16) | (g << 8) | b;
+                        }
+                    }
+                    vf->vid.fb_dirty = 1;
+                }
+                frame_drv_count++;
+            }
         }
     }
 
