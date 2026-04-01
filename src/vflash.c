@@ -6924,82 +6924,51 @@ void vflash_run_frame(VFlash *vf) {
                 for (int x = 0; x < 320; x++)
                     rfb[y*320+x] = sky;
             }
-            /* High-res tilemap renderer.
-             * Block 0 values = tile block indices. For each pixel (x,y),
-             * read block index from block 0, then sample the actual pixel
-             * from the referenced block at (x,y), apply palette.
-             * If the index exceeds block count, use block 0 value as
-             * direct palette index (fallback). Render 5 block columns
-             * side-by-side (blocks 1-5) if tilemap approach fails. */
+            /* Scene renderer with bilinear upscale.
+             * Build 64×240 scene buffer from sec[2] block 0 with palette,
+             * then bilinear interpolate to 320×240 for smooth output. */
             {
+                /* Build 64×240 ARGB scene from block 0 with tilemap lookup */
+                static uint32_t scene64[64*240];
                 int nblocks = (int)(s2size / 0x3C00);
-                if (nblocks < 2) nblocks = 2;
-                /* Strategy 1: Use block 0 as tilemap into blocks 1-N.
-                 * For each (x,y), block0[x,y] = N → pixel = block[N][x,y] */
-                int tilemap_hits = 0;
                 for (int sy = 0; sy < 240; sy++) {
                     for (int sx = 0; sx < 64; sx++) {
-                        uint8_t blk_idx = vf->ram[s2off + sy*64 + sx];
+                        uint8_t b0val = vf->ram[s2off + sy*64 + sx];
                         uint8_t pv;
-                        if (blk_idx > 0 && blk_idx < nblocks) {
-                            /* Read pixel from referenced block */
-                            pv = vf->ram[s2off + blk_idx * 0x3C00 + sy*64 + sx];
-                            tilemap_hits++;
+                        /* Try tilemap: use block 0 value as index into blocks 1-N */
+                        if (b0val > 0 && b0val < nblocks) {
+                            pv = vf->ram[s2off + b0val * 0x3C00 + sy*64 + sx];
+                            if (pv < 2) pv = b0val; /* fallback to direct value */
                         } else {
-                            /* Use block 0 value directly as palette index */
-                            pv = blk_idx;
+                            pv = b0val;
                         }
-                        if (pv < 2) continue;
-                        uint16_t c565;
-                        if (vf->ptx_has_pal) {
-                            uint32_t argb = vf->ptx_pal[pv];
-                            uint8_t cr=(argb>>16)&0xFF, cg=(argb>>8)&0xFF, cb=argb&0xFF;
-                            c565 = ((cr>>3)<<11)|((cg>>2)<<5)|(cb>>3);
+                        if (pv < 2) {
+                            scene64[sy*64+sx] = 0; /* transparent */
+                        } else if (vf->ptx_has_pal) {
+                            scene64[sy*64+sx] = vf->ptx_pal[pv];
                         } else {
-                            c565 = ((pv>>3)<<11)|((pv>>2)<<5)|(pv>>3);
+                            scene64[sy*64+sx] = 0xFF000000|(pv<<16)|(pv<<8)|pv;
                         }
-                        /* Scale 64→320 (5× horizontal) */
-                        int dx = sx * 320 / 64;
-                        int dw = (sx+1) * 320 / 64 - dx;
-                        for (int px = 0; px < dw && dx+px < 320; px++)
-                            rfb[sy*320 + dx + px] = c565;
                     }
                 }
-                /* Strategy 2: If tilemap had many hits, also render
-                 * blocks 1-5 side-by-side at native 64px resolution
-                 * (320 = 5 × 64), overwriting the scaled tilemap. */
-                if (nblocks >= 6) {
-                    int has_content = 0;
-                    for (int bi = 1; bi <= 5; bi++) {
-                        uint32_t boff = s2off + bi * 0x3C00;
-                        if (boff + 0x3C00 > VFLASH_RAM_SIZE) break;
-                        int bnz = 0;
-                        for (int c = 0; c < 256; c++)
-                            if (vf->ram[boff + c]) bnz++;
-                        if (bnz > 30) has_content++;
-                    }
-                    if (has_content >= 3) {
-                        /* Render blocks 1-5 as 5 columns of 64px each = 320px */
-                        for (int bi = 1; bi <= 5 && bi < nblocks; bi++) {
-                            uint32_t boff = s2off + bi * 0x3C00;
-                            if (boff + 0x3C00 > VFLASH_RAM_SIZE) break;
-                            int x_off = (bi - 1) * 64;
-                            for (int y = 0; y < 240; y++) {
-                                for (int x = 0; x < 64 && x_off + x < 320; x++) {
-                                    uint8_t pv = vf->ram[boff + y*64 + x];
-                                    if (pv < 2) continue;
-                                    uint16_t c565;
-                                    if (vf->ptx_has_pal) {
-                                        uint32_t argb = vf->ptx_pal[pv];
-                                        uint8_t cr=(argb>>16)&0xFF, cg=(argb>>8)&0xFF, cb=argb&0xFF;
-                                        c565 = ((cr>>3)<<11)|((cg>>2)<<5)|(cb>>3);
-                                    } else {
-                                        c565 = ((pv>>3)<<11)|((pv>>2)<<5)|(pv>>3);
-                                    }
-                                    rfb[y*320 + x_off + x] = c565;
-                                }
-                            }
-                        }
+                /* Bilinear upscale 64×240 → 320×240 */
+                for (int dy = 0; dy < 240; dy++) {
+                    for (int dx = 0; dx < 320; dx++) {
+                        /* Map screen X to source X with sub-pixel precision */
+                        int sx_fp = dx * 63 * 256 / 319; /* 8.8 fixed point */
+                        int sx0 = sx_fp >> 8;
+                        int sx1 = sx0 < 63 ? sx0 + 1 : sx0;
+                        int fx = sx_fp & 0xFF; /* fractional part 0-255 */
+                        uint32_t c0 = scene64[dy*64+sx0];
+                        uint32_t c1 = scene64[dy*64+sx1];
+                        if (c0 == 0 && c1 == 0) continue; /* both transparent */
+                        if (c0 == 0) c0 = c1;
+                        if (c1 == 0) c1 = c0;
+                        /* Lerp RGB channels */
+                        uint8_t r = (uint8_t)(((c0>>16)&0xFF)*(255-fx)/255 + ((c1>>16)&0xFF)*fx/255);
+                        uint8_t g = (uint8_t)(((c0>>8)&0xFF)*(255-fx)/255 + ((c1>>8)&0xFF)*fx/255);
+                        uint8_t b = (uint8_t)((c0&0xFF)*(255-fx)/255 + (c1&0xFF)*fx/255);
+                        rfb[dy*320+dx] = ((r>>3)<<11)|((g>>2)<<5)|(b>>3);
                     }
                 }
             }
