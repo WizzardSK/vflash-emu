@@ -6924,11 +6924,31 @@ void vflash_run_frame(VFlash *vf) {
                 for (int x = 0; x < 320; x++)
                     rfb[y*320+x] = sky;
             }
-            /* Render block 0 as 64×240 scene, scaled to 320×240 */
-            if (s2off + 64*240 <= VFLASH_RAM_SIZE) {
+            /* High-res tilemap renderer.
+             * Block 0 values = tile block indices. For each pixel (x,y),
+             * read block index from block 0, then sample the actual pixel
+             * from the referenced block at (x,y), apply palette.
+             * If the index exceeds block count, use block 0 value as
+             * direct palette index (fallback). Render 5 block columns
+             * side-by-side (blocks 1-5) if tilemap approach fails. */
+            {
+                int nblocks = (int)(s2size / 0x3C00);
+                if (nblocks < 2) nblocks = 2;
+                /* Strategy 1: Use block 0 as tilemap into blocks 1-N.
+                 * For each (x,y), block0[x,y] = N → pixel = block[N][x,y] */
+                int tilemap_hits = 0;
                 for (int sy = 0; sy < 240; sy++) {
                     for (int sx = 0; sx < 64; sx++) {
-                        uint8_t pv = vf->ram[s2off + sy*64 + sx];
+                        uint8_t blk_idx = vf->ram[s2off + sy*64 + sx];
+                        uint8_t pv;
+                        if (blk_idx > 0 && blk_idx < nblocks) {
+                            /* Read pixel from referenced block */
+                            pv = vf->ram[s2off + blk_idx * 0x3C00 + sy*64 + sx];
+                            tilemap_hits++;
+                        } else {
+                            /* Use block 0 value directly as palette index */
+                            pv = blk_idx;
+                        }
                         if (pv < 2) continue;
                         uint16_t c565;
                         if (vf->ptx_has_pal) {
@@ -6938,10 +6958,48 @@ void vflash_run_frame(VFlash *vf) {
                         } else {
                             c565 = ((pv>>3)<<11)|((pv>>2)<<5)|(pv>>3);
                         }
+                        /* Scale 64→320 (5× horizontal) */
                         int dx = sx * 320 / 64;
                         int dw = (sx+1) * 320 / 64 - dx;
                         for (int px = 0; px < dw && dx+px < 320; px++)
                             rfb[sy*320 + dx + px] = c565;
+                    }
+                }
+                /* Strategy 2: If tilemap had many hits, also render
+                 * blocks 1-5 side-by-side at native 64px resolution
+                 * (320 = 5 × 64), overwriting the scaled tilemap. */
+                if (nblocks >= 6) {
+                    int has_content = 0;
+                    for (int bi = 1; bi <= 5; bi++) {
+                        uint32_t boff = s2off + bi * 0x3C00;
+                        if (boff + 0x3C00 > VFLASH_RAM_SIZE) break;
+                        int bnz = 0;
+                        for (int c = 0; c < 256; c++)
+                            if (vf->ram[boff + c]) bnz++;
+                        if (bnz > 30) has_content++;
+                    }
+                    if (has_content >= 3) {
+                        /* Render blocks 1-5 as 5 columns of 64px each = 320px */
+                        for (int bi = 1; bi <= 5 && bi < nblocks; bi++) {
+                            uint32_t boff = s2off + bi * 0x3C00;
+                            if (boff + 0x3C00 > VFLASH_RAM_SIZE) break;
+                            int x_off = (bi - 1) * 64;
+                            for (int y = 0; y < 240; y++) {
+                                for (int x = 0; x < 64 && x_off + x < 320; x++) {
+                                    uint8_t pv = vf->ram[boff + y*64 + x];
+                                    if (pv < 2) continue;
+                                    uint16_t c565;
+                                    if (vf->ptx_has_pal) {
+                                        uint32_t argb = vf->ptx_pal[pv];
+                                        uint8_t cr=(argb>>16)&0xFF, cg=(argb>>8)&0xFF, cb=argb&0xFF;
+                                        c565 = ((cr>>3)<<11)|((cg>>2)<<5)|(cb>>3);
+                                    } else {
+                                        c565 = ((pv>>3)<<11)|((pv>>2)<<5)|(pv>>3);
+                                    }
+                                    rfb[y*320 + x_off + x] = c565;
+                                }
+                            }
+                        }
                     }
                 }
             }
