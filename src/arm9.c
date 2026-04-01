@@ -2,6 +2,7 @@
 #include "cp15.h"
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 #define PC   cpu->r[15]
 #define SP   cpu->r[13]
@@ -122,6 +123,363 @@ static uint32_t do_sbc(ARM9 *cpu,uint32_t a,uint32_t b,int s){
     uint64_t r=(uint64_t)a-b-(1-C_FLAG); uint32_t res=(uint32_t)r;
     if(s){SET_N(res>>31);SET_Z(res==0);SET_C((uint64_t)a>=(uint64_t)b+(1-C_FLAG));SET_V(((a^b)>>31)&&((a^res)>>31));}
     return res;
+}
+
+/* ===== VFP (CP10/CP11) Emulation ===== */
+
+static inline float  vfp_s_get(ARM9 *cpu, int reg) { return cpu->vfp_s[reg & 31]; }
+static inline void   vfp_s_set(ARM9 *cpu, int reg, float v) { cpu->vfp_s[reg & 31] = v; }
+static inline double vfp_d_get(ARM9 *cpu, int reg) {
+    union { float f[2]; double d; } u;
+    u.f[0] = cpu->vfp_s[(reg & 15) * 2];
+    u.f[1] = cpu->vfp_s[(reg & 15) * 2 + 1];
+    return u.d;
+}
+static inline void   vfp_d_set(ARM9 *cpu, int reg, double v) {
+    union { float f[2]; double d; } u;
+    u.d = v;
+    cpu->vfp_s[(reg & 15) * 2]     = u.f[0];
+    cpu->vfp_s[(reg & 15) * 2 + 1] = u.f[1];
+}
+static inline uint32_t vfp_s_bits(ARM9 *cpu, int reg) {
+    union { float f; uint32_t u; } t; t.f = cpu->vfp_s[reg & 31]; return t.u;
+}
+static inline void vfp_s_from_bits(ARM9 *cpu, int reg, uint32_t bits) {
+    union { float f; uint32_t u; } t; t.u = bits; cpu->vfp_s[reg & 31] = t.f;
+}
+
+/* Execute VFP CDP (data processing) — returns 1 if handled */
+static int vfp_cdp(ARM9 *cpu, uint32_t insn) {
+    int cp = (insn >> 8) & 0xF;
+    int is_double = (cp == 11);
+    int p = (insn >> 23) & 1;
+    int q = (insn >> 21) & 1;
+    int r = (insn >> 20) & 1;
+    int s = (insn >> 6) & 1;
+
+    if (!is_double) {
+        /* Single-precision CP10 */
+        int d  = ((insn >> 12) & 0xF) * 2 + ((insn >> 22) & 1);  /* Sd = Vd:D */
+        int n  = ((insn >> 16) & 0xF) * 2 + ((insn >> 7) & 1);   /* Sn = Vn:N */
+        int m  = (insn & 0xF) * 2 + ((insn >> 5) & 1);            /* Sm = Vm:M */
+
+        float fd = vfp_s_get(cpu, d);
+        float fn = vfp_s_get(cpu, n);
+        float fm = vfp_s_get(cpu, m);
+
+        if (!p) {
+            switch ((q << 1) | r) {
+            case 0: /* VMLA */  vfp_s_set(cpu, d, fd + fn * fm); break;
+            case 1: /* VMLS */  vfp_s_set(cpu, d, fd - fn * fm); break;
+            case 2: /* VNMLS */ vfp_s_set(cpu, d, -(fd - fn * fm)); break;
+            case 3: /* VNMLA */ vfp_s_set(cpu, d, -(fd + fn * fm)); break;
+            }
+            if (s) { /* with negate: swap sense */
+                /* Already handled by cases above */
+            }
+        } else if (p && !q) {
+            if (!r && !s)      vfp_s_set(cpu, d, fn * fm);     /* VMUL */
+            else if (!r && s)  vfp_s_set(cpu, d, -(fn * fm));  /* VNMUL */
+            else if (r && !s)  vfp_s_set(cpu, d, fn + fm);     /* VADD */
+            else               vfp_s_set(cpu, d, fn - fm);     /* VSUB */
+        } else if (p && q && !r) {
+            vfp_s_set(cpu, d, fn / fm);  /* VDIV */
+        } else if (p && q && r) {
+            /* Extension: VMOV, VABS, VNEG, VSQRT, VCMP, VCVT */
+            int opc2 = (insn >> 16) & 0xF;
+            switch (opc2) {
+            case 0: /* VMOV / VCPY */
+                if (!s) vfp_s_set(cpu, d, fm);                 /* VMOV Sd, Sm */
+                else    vfp_s_set(cpu, d, fabsf(fm));           /* VABS */
+                break;
+            case 1:
+                if (!s) vfp_s_set(cpu, d, -fm);                /* VNEG */
+                else    vfp_s_set(cpu, d, sqrtf(fm));           /* VSQRT */
+                break;
+            case 4: case 5: { /* VCMP / VCMPE */
+                float a = fn;
+                float b = (opc2 == 5 && !s) ? 0.0f : fm;
+                uint32_t nzcv = 0;
+                if (isnan(a) || isnan(b))      nzcv = 0x30000000u; /* C=1,V=1 = unordered */
+                else if (a == b)               nzcv = 0x60000000u; /* Z=1,C=1 */
+                else if (a < b)                nzcv = 0x80000000u; /* N=1 */
+                else                           nzcv = 0x20000000u; /* C=1 */
+                cpu->vfp_fpscr = (cpu->vfp_fpscr & 0x0FFFFFFFu) | nzcv;
+                break;
+            }
+            case 7: { /* VCVT float↔int */
+                if (!s) {
+                    /* VCVT.F32.S32 or VCVT.F32.U32 */
+                    uint32_t bits = vfp_s_bits(cpu, m);
+                    if ((insn >> 7) & 1) /* unsigned */
+                        vfp_s_set(cpu, d, (float)bits);
+                    else
+                        vfp_s_set(cpu, d, (float)(int32_t)bits);
+                } else {
+                    /* VCVT.U32.F32 or VCVT.S32.F32 (round toward zero) */
+                    if ((insn >> 16) & 1) { /* unsigned (VCVT.U32) - opc2 bit0 */
+                        uint32_t res = (fm >= 0 && fm < 4294967296.0f) ? (uint32_t)fm : 0;
+                        vfp_s_from_bits(cpu, d, res);
+                    } else { /* signed (VCVT.S32) */
+                        int32_t res = (int32_t)fm;
+                        vfp_s_from_bits(cpu, d, (uint32_t)res);
+                    }
+                }
+                break;
+            }
+            case 8: { /* VCVT between single and double */
+                if (is_double) {
+                    /* double to single */
+                    vfp_s_set(cpu, d, (float)vfp_d_get(cpu, m));
+                } else {
+                    /* single to double */
+                    vfp_d_set(cpu, d / 2, (double)fm);
+                }
+                break;
+            }
+            default:
+                return 0; /* unhandled */
+            }
+        } else {
+            return 0;
+        }
+    } else {
+        /* Double-precision CP11 */
+        int d  = ((insn >> 12) & 0xF) | (((insn >> 22) & 1) << 4);  /* Dd */
+        int n  = ((insn >> 16) & 0xF) | (((insn >> 7) & 1) << 4);   /* Dn */
+        int m  = (insn & 0xF) | (((insn >> 5) & 1) << 4);            /* Dm */
+
+        double fd = vfp_d_get(cpu, d);
+        double fn = vfp_d_get(cpu, n);
+        double fm = vfp_d_get(cpu, m);
+
+        if (!p) {
+            switch ((q << 1) | r) {
+            case 0: vfp_d_set(cpu, d, fd + fn * fm); break;  /* VMLA */
+            case 1: vfp_d_set(cpu, d, fd - fn * fm); break;  /* VMLS */
+            case 2: vfp_d_set(cpu, d, -(fd - fn * fm)); break;
+            case 3: vfp_d_set(cpu, d, -(fd + fn * fm)); break;
+            }
+        } else if (p && !q) {
+            if (!r && !s)      vfp_d_set(cpu, d, fn * fm);
+            else if (!r && s)  vfp_d_set(cpu, d, -(fn * fm));
+            else if (r && !s)  vfp_d_set(cpu, d, fn + fm);
+            else               vfp_d_set(cpu, d, fn - fm);
+        } else if (p && q && !r) {
+            vfp_d_set(cpu, d, fn / fm);
+        } else if (p && q && r) {
+            int opc2 = (insn >> 16) & 0xF;
+            switch (opc2) {
+            case 0:
+                if (!s) vfp_d_set(cpu, d, fm);
+                else    vfp_d_set(cpu, d, fabs(fm));
+                break;
+            case 1:
+                if (!s) vfp_d_set(cpu, d, -fm);
+                else    vfp_d_set(cpu, d, sqrt(fm));
+                break;
+            case 4: case 5: {
+                double a = fn, b = (opc2 == 5 && !s) ? 0.0 : fm;
+                uint32_t nzcv = 0;
+                if (isnan(a) || isnan(b))  nzcv = 0x30000000u;
+                else if (a == b)           nzcv = 0x60000000u;
+                else if (a < b)            nzcv = 0x80000000u;
+                else                       nzcv = 0x20000000u;
+                cpu->vfp_fpscr = (cpu->vfp_fpscr & 0x0FFFFFFFu) | nzcv;
+                break;
+            }
+            case 7: {
+                if (!s) {
+                    uint32_t bits = vfp_s_bits(cpu, m * 2);
+                    if ((insn >> 7) & 1)
+                        vfp_d_set(cpu, d, (double)bits);
+                    else
+                        vfp_d_set(cpu, d, (double)(int32_t)bits);
+                } else {
+                    if ((insn >> 16) & 1) {
+                        uint32_t res = (fm >= 0 && fm < 4294967296.0) ? (uint32_t)fm : 0;
+                        vfp_s_from_bits(cpu, d * 2, res);
+                    } else {
+                        vfp_s_from_bits(cpu, d * 2, (uint32_t)(int32_t)fm);
+                    }
+                }
+                break;
+            }
+            case 8: {
+                /* VCVT.F32.F64 or VCVT.F64.F32 */
+                if (is_double) {
+                    vfp_s_set(cpu, d, (float)vfp_d_get(cpu, m));
+                } else {
+                    vfp_d_set(cpu, d, (double)vfp_s_get(cpu, m * 2));
+                }
+                break;
+            }
+            default: return 0;
+            }
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Execute VFP MCR/MRC (register transfer) — returns 1 if handled */
+static int vfp_mcr_mrc(ARM9 *cpu, uint32_t insn) {
+    int l = (insn >> 20) & 1;   /* MRC=1, MCR=0 */
+    int cp = (insn >> 8) & 0xF;
+    int opc1 = (insn >> 21) & 7;
+    int rd = (insn >> 12) & 0xF;
+    int crn = (insn >> 16) & 0xF;
+
+    if (opc1 == 7) {
+        /* VMRS / VMSR — VFP system register transfer */
+        int reg = crn; /* specifies which system register */
+        if (l) {
+            /* VMRS: read VFP system reg to ARM reg */
+            uint32_t val;
+            switch (reg) {
+            case 0: val = 0x41011090; break;  /* FPSID: VFPv2, ARM, rev 0 */
+            case 1: val = cpu->vfp_fpscr; break;
+            case 6: val = 0x00000000; break;  /* MVFR1 */
+            case 7: val = 0x00000000; break;  /* MVFR0 */
+            case 8: val = cpu->vfp_fpexc; break;
+            default: val = 0; break;
+            }
+            if (rd == 15) {
+                /* VMRS R15 (APSR_nzcv): copy FPSCR flags to CPSR */
+                CPSR = (CPSR & 0x0FFFFFFFu) | (cpu->vfp_fpscr & 0xF0000000u);
+            } else {
+                cpu->r[rd] = val;
+            }
+        } else {
+            /* VMSR: write ARM reg to VFP system reg */
+            uint32_t val = cpu->r[rd];
+            switch (reg) {
+            case 1: cpu->vfp_fpscr = val; break;
+            case 8: cpu->vfp_fpexc = val; break;
+            default: break;
+            }
+        }
+        return 1;
+    }
+
+    /* VMOV between ARM and single-precision VFP reg */
+    if (opc1 == 0 && ((insn >> 5) & 7) == 0) {
+        int sn = crn * 2 + ((insn >> 7) & 1); /* Sn */
+        if (l) {
+            /* VMOV Rd, Sn — VFP to ARM */
+            cpu->r[rd] = vfp_s_bits(cpu, sn);
+        } else {
+            /* VMOV Sn, Rd — ARM to VFP */
+            vfp_s_from_bits(cpu, sn, cpu->r[rd]);
+        }
+        return 1;
+    }
+
+    return 0; /* not handled */
+}
+
+/* Execute VFP LDC/STC (load/store) — returns 1 if handled */
+static int vfp_ldc_stc(ARM9 *cpu, uint32_t insn) {
+    int cp = (insn >> 8) & 0xF;
+    int is_double = (cp == 11);
+    int p = (insn >> 24) & 1;
+    int u = (insn >> 23) & 1;
+    int w = (insn >> 21) & 1;
+    int l = (insn >> 20) & 1;
+    int rn = (insn >> 16) & 0xF;
+    int offset = (insn & 0xFF) * 4;
+    uint32_t base = cpu->r[rn];
+    if (rn == 15) base = PC - 4; /* PC-relative: inst+8 adjusted by pipeline, -4 for current */
+
+    if (!is_double) {
+        /* Single-precision: VLDR/VSTR or VLDM/VSTM */
+        int sd = ((insn >> 12) & 0xF) * 2 + ((insn >> 22) & 1);
+
+        if (p && !w) {
+            /* VLDR / VSTR (immediate offset, no writeback) */
+            uint32_t addr = u ? base + offset : base - offset;
+            if (l) {
+                vfp_s_from_bits(cpu, sd, r32(cpu, addr));
+            } else {
+                w32(cpu, addr, vfp_s_bits(cpu, sd));
+            }
+        } else {
+            /* VLDM / VSTM (multiple) */
+            int count = insn & 0xFF;
+            uint32_t addr = base;
+            if (!u) addr = base - count * 4;  /* decrement */
+            if (p && u) addr += 4;             /* IB */
+            for (int i = 0; i < count && (sd + i) < 32; i++) {
+                if (l) {
+                    vfp_s_from_bits(cpu, sd + i, r32(cpu, addr));
+                } else {
+                    w32(cpu, addr, vfp_s_bits(cpu, sd + i));
+                }
+                addr += 4;
+            }
+            if (w) {
+                if (u) cpu->r[rn] = base + count * 4;
+                else   cpu->r[rn] = base - count * 4;
+            }
+        }
+    } else {
+        /* Double-precision: VLDR/VSTR or VLDM/VSTM */
+        int dd = ((insn >> 12) & 0xF) | (((insn >> 22) & 1) << 4);
+
+        if (p && !w) {
+            /* VLDR / VSTR (immediate offset) */
+            uint32_t addr = u ? base + offset : base - offset;
+            if (l) {
+                vfp_s_from_bits(cpu, dd * 2, r32(cpu, addr));
+                vfp_s_from_bits(cpu, dd * 2 + 1, r32(cpu, addr + 4));
+            } else {
+                w32(cpu, addr, vfp_s_bits(cpu, dd * 2));
+                w32(cpu, addr + 4, vfp_s_bits(cpu, dd * 2 + 1));
+            }
+        } else {
+            /* VLDM / VSTM (count = word count, 2 per double) */
+            int wcount = insn & 0xFF;
+            int dcount = wcount / 2;
+            uint32_t addr = base;
+            if (!u) addr = base - wcount * 4;
+            if (p && u) addr += 4;
+            for (int i = 0; i < dcount && (dd + i) * 2 + 1 < 32; i++) {
+                if (l) {
+                    vfp_s_from_bits(cpu, (dd + i) * 2, r32(cpu, addr));
+                    vfp_s_from_bits(cpu, (dd + i) * 2 + 1, r32(cpu, addr + 4));
+                } else {
+                    w32(cpu, addr, vfp_s_bits(cpu, (dd + i) * 2));
+                    w32(cpu, addr + 4, vfp_s_bits(cpu, (dd + i) * 2 + 1));
+                }
+                addr += 8;
+            }
+            if (w) {
+                if (u) cpu->r[rn] = base + wcount * 4;
+                else   cpu->r[rn] = base - wcount * 4;
+            }
+        }
+    }
+    return 1;
+}
+
+/* VMOV between two ARM registers and a double VFP register */
+static int vfp_mrrc_mcrr(ARM9 *cpu, uint32_t insn) {
+    int l = (insn >> 20) & 1;
+    int rd2 = (insn >> 16) & 0xF;  /* Rt2 (high word) */
+    int rd  = (insn >> 12) & 0xF;  /* Rt  (low word) */
+    int m   = insn & 0xF;          /* Dm  */
+
+    if (l) {
+        /* VMOV Rd, Rd2, Dm — double to two ARM */
+        cpu->r[rd]  = vfp_s_bits(cpu, m * 2);
+        cpu->r[rd2] = vfp_s_bits(cpu, m * 2 + 1);
+    } else {
+        /* VMOV Dm, Rd, Rd2 — two ARM to double */
+        vfp_s_from_bits(cpu, m * 2, cpu->r[rd]);
+        vfp_s_from_bits(cpu, m * 2 + 1, cpu->r[rd2]);
+    }
+    return 1;
 }
 
 static void exec_arm(ARM9 *cpu, uint32_t insn) {
@@ -340,14 +698,36 @@ static void exec_arm(ARM9 *cpu, uint32_t insn) {
         if(w) cpu->r[rn]=u?base+(uint32_t)(cnt*4):base-(uint32_t)(cnt*4);
         return;
     }
-    /* MCR/MRC — Coprocessor register transfer (CP15) */
+    /* MCRR/MRRC — Coprocessor double register transfer (VFP: VMOV Dm, Rd, Rn) */
+    if ((insn & 0x0FE00000) == 0x0C400000) {
+        int cp = (insn >> 8) & 0xF;
+        if (cp == 10 || cp == 11) { if (vfp_mrrc_mcrr(cpu, insn)) return; }
+    }
+    /* LDC/STC — Coprocessor data transfer (VFP: VLDR/VSTR/VLDM/VSTM) */
+    if ((insn & 0x0E000000) == 0x0C000000 && !((insn & 0x0F000010) == 0x0E000010)) {
+        int cp = (insn >> 8) & 0xF;
+        if (cp == 10 || cp == 11) { if (vfp_ldc_stc(cpu, insn)) return; }
+    }
+    /* CDP — Coprocessor data processing (VFP: VADD/VMUL/etc.) */
+    if ((insn & 0x0F000010) == 0x0E000000) {
+        int cp = (insn >> 8) & 0xF;
+        if (cp == 10 || cp == 11) { if (vfp_cdp(cpu, insn)) return; }
+    }
+    /* MCR/MRC — Coprocessor register transfer */
     if((insn&0x0F000010)==0x0E000010){
         int l=(insn>>20)&1, crn=(insn>>16)&0xF, rd=(insn>>12)&0xF;
         int cp=(insn>>8)&0xF, op2=(insn>>5)&7, crm=insn&0xF;
         if(cp==15){
             if(l) cpu->r[rd]=cp15_read(&cpu->cp15,(uint32_t)crn,(uint32_t)crm,(uint32_t)op2);
             else  cp15_write(&cpu->cp15,(uint32_t)crn,(uint32_t)crm,(uint32_t)op2,cpu->r[rd]);
-        } else fprintf(stderr,"[ARM9] MCR/MRC unknown CP%d\n",cp);
+        } else if (cp == 10 || cp == 11) {
+            if (vfp_mcr_mrc(cpu, insn)) return;
+            fprintf(stderr,"[VFP] Unhandled MCR/MRC: 0x%08X PC=0x%08X\n",insn,PC-8);
+        } else {
+            static int unk_cp_log = 0;
+            if (unk_cp_log++ < 5)
+                fprintf(stderr,"[ARM9] MCR/MRC unknown CP%d insn=0x%08X PC=0x%08X\n",cp,insn,PC-8);
+        }
         return;
     }
 

@@ -237,6 +237,25 @@ int main(int argc, char **argv) {
         }
 
     render:
+        /* Auto-screenshot in headless mode after game starts */
+        if (headless) {
+            static int screenshot_done = 0;
+            if (!screenshot_done && fps_count >= 200) {
+                uint32_t *fb = vflash_get_framebuffer(vf);
+                FILE *pf = fopen("/tmp/vflash_screen.ppm", "wb");
+                if (pf) {
+                    fprintf(pf, "P6\n320 240\n255\n");
+                    for (int i = 0; i < 320*240; i++) {
+                        uint32_t p = fb[i];
+                        uint8_t rgb[3] = {(p>>16)&0xFF, (p>>8)&0xFF, p&0xFF};
+                        fwrite(rgb, 1, 3, pf);
+                    }
+                    fclose(pf);
+                    printf("[SCREENSHOT] Saved /tmp/vflash_screen.ppm (frame %d)\n", fps_count);
+                }
+                screenshot_done = 1;
+            }
+        }
         /* Render */
         if (!headless && win) {
             SDL_UpdateTexture(tex, NULL,

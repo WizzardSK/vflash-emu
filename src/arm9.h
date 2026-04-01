@@ -60,6 +60,11 @@ struct ARM9 {
      * Returns 1 if handled (skip instruction execution), 0 to continue. */
     int      (*hle_intercept)(void *ctx, uint32_t addr);
     void     *hle_ctx;
+
+    /* VFP (Vector Floating-Point) coprocessor state — CP10/CP11 */
+    float    vfp_s[32];     /* S0-S31 single-precision registers */
+    uint32_t vfp_fpscr;     /* Floating-Point Status and Control Register */
+    uint32_t vfp_fpexc;     /* Floating-Point Exception Register */
 };
 typedef struct ARM9 ARM9;
 

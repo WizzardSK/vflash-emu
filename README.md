@@ -35,22 +35,23 @@ Background voice/SFX audio plays automatically from WAV files on disc.
 
 ## Status
 
-**Scene rendering + JIT: 37 FPS** — Desert landscape with 10 parallax layers,
-circular viewport mask from VFF sec[2] tilemap, per-layer color tinting (sky/mesa/
-vegetation/road), vertical box filtering, parallax scrolling with arrow keys.
+**Game scene rendering with palette colors** — VFF sec[2] tilemap rendered to RGB565
+framebuffer via C-side compositor. Palette extracted from sec[0] embedded data.
+BSS trampoline fix routes game's entity dispatch (0x109D1A24 `MOV PC,R2`) through
+ARM trampolines at BSS addresses, connecting the RTOS render pipeline to our draw code.
 ARM926EJ-S → x86_64 JIT compiler (9000+ blocks). µMORE v4.0 RTOS boots, game task
 launched via HLE FIQ + Nucleus TCB. 1.4MB game code relocated from BOOT.BIN CD.
 
-**VFF format fully decoded**: sec[0]=ARM scene script, sec[1]=compressed sprites
-(custom format), sec[2]=tilemap + raw 8bpp tile pixels. Tile data is UNCOMPRESSED
-in sec[2] at offset 0x88000 (29 tiles, 512px wide, verified 100% byte match).
-PTX files = Knowledge World photo atlases (car parts tutorial), not scene backgrounds.
+**VFF scene rendering pipeline**: sec[2] block 0 (64×240, 8bpp) rendered as scene with
+XBGR1555 palette from sec[0]. 126-214 tile blocks per game. Circular viewport mask
+from block 0 rows 0-55. Tested: SpongeBob shows recognizable colored scene (red/green/
+yellow Bikini Bottom), Scooby-Doo shows blue sky + brown terrain, Spider-Man shows
+city structures in grayscale. Shared renderer runs for all games (BOOT.BIN + relocated).
 
-BOOT.BIN 5A5A5A5A relocation reverse-engineered: ROM generates a 4096-entry lookup
-table with `value = (idx << 20) | 0x0DF2`, indices sequential from +0x4000 with
-wrap to +0x0260. Post-init data section matches 100% with runtime dump from working
-session. BOOT.BIN games (Incredibles) run from 0x10C0xxxx with native init flow,
-JIT IRQ yield on MSR CPSR, LCD DMA status at 0xC0000084, and DC register emulation.
+**VFF format decoded**: sec[0]=ARM scene code (352KB-1.6MB), sec[1]=compressed sprites
+(custom format, not zlib), sec[2]=tilemap blocks (64×240 each, 8bpp) + raw tile strips
+at +0x88000 (512px wide). Tile blocks contain actual game graphics (buildings, terrain,
+characters). VFF entry point is code address, NOT dispatch table.
 
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spider-Man.
 
@@ -102,8 +103,11 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **HLE IRQ handler** | ✅ Clears ZEVIO timer, SoC INTC, VIC ACK/vector/EOI |
 | **ROM boot kernel detection** | ✅ MMU+PC in kernel → bp300, timed bp300→800→900 |
 | **sec[1] sprite watchpoint** | ✅ Memory read trap at 0x1067A000 (2.8MB, Spider-Man) |
-| **VFF entry table load** | ✅ Dispatch table loaded from CD (8KB after sec[0]) |
-| **VFF scene init scan** | 🔧 Finds dispatch table literal in sec[0], backward PUSH search |
+| **BSS render trampolines** | ✅ B31DC4→draw, B1FC5C→ret, B8DB00→ret (entity dispatch) |
+| **C-side scene renderer** | ✅ sec[2] block 0 → RGB565 FB with palette (all games) |
+| **Embedded palette search** | ✅ XBGR1555 from sec[0] end (SpongeBob: 129 colors) |
+| **VFF section tracking** | ✅ sec0/sec1/sec2 base+size stored per-game |
+| **Universal render path** | ✅ Shared renderer outside is_bootbin (fixes Scooby/Spider-Man) |
 | **Headless mode** | ✅ SDL_QUIT ignored, auto-input, VFLASH_LOG env var |
 
 ### ROM Boot Flow (new)

@@ -302,9 +302,13 @@ struct VFlash {
     uint32_t dc_irq_handler;     /* Display controller IRQ handler (from 0xB8000784) */
     uint32_t dc_regs[64];        /* Display controller regs 0xB8000100-0xB80001FF */
 
-    /* VFF sec[1] watchpoint: track compressed sprite data region */
-    uint32_t sec1_base;          /* VA of sec[1] load address (from VFF header) */
-    uint32_t sec1_size;          /* sec[1] size in bytes */
+    /* VFF section tracking */
+    uint32_t sec0_base;          /* VA of sec[0] (ARM code) */
+    uint32_t sec0_size;
+    uint32_t sec1_base;          /* VA of sec[1] (compressed sprites) */
+    uint32_t sec1_size;
+    uint32_t sec2_base;          /* VA of sec[2] (tilemap data) */
+    uint32_t sec2_size;
     int      sec1_wp_log;        /* watchpoint log throttle */
 
     uint32_t  framebuf[VFLASH_SCREEN_W * VFLASH_SCREEN_H];
@@ -6757,6 +6761,7 @@ void vflash_run_frame(VFlash *vf) {
         if (vf->boot_phase >= 900) {
             int escaped = (pc >= 0xB8000000u) ||
                           (pc < 0x10000000u && pc > 0x1000u) ||
+                          (pc < 0x100u) || /* NULL/reset vector = crashed */
                           (pc >= 0x11000000u && pc < 0xB8000000u) ||
                           (pc < 0x10090000 && pc >= 0x10000000) ||
                           (pc > 0x10F00000 && pc < 0x11000000 &&
@@ -6849,76 +6854,6 @@ void vflash_run_frame(VFlash *vf) {
              * FUN_10AB1950 (entity draw) only renders when bit 25 changes.
              * Without this, tile rendering is skipped entirely. */
             *(uint32_t*)(vf->ram + 0xB65A00) = 0x02000000;
-            /* HLE entity: create a test draw function + entity + list.
-             * Proves the entity→vtable→draw pipeline works end-to-end.
-             * Draw function fills render FB with red pixels. */
-            {
-                /* ARM draw function at 0x10FFE100: fill FB with red */
-                uint32_t f = 0xFFE100;
-                *(uint32_t*)(vf->ram+f+0x00) = 0xE92D4030; /* PUSH {R4,R5,LR} */
-                *(uint32_t*)(vf->ram+f+0x04) = 0xE59F4018; /* LDR R4, =fb */
-                *(uint32_t*)(vf->ram+f+0x08) = 0xE3A02000; /* MOV R2, #0 */
-                *(uint32_t*)(vf->ram+f+0x0C) = 0xE59F3014; /* LDR R3, =color */
-                /* loop: */
-                *(uint32_t*)(vf->ram+f+0x10) = 0xE4843004; /* STR R3,[R4],#4 */
-                *(uint32_t*)(vf->ram+f+0x14) = 0xE2822001; /* ADD R2,#1 */
-                *(uint32_t*)(vf->ram+f+0x18) = 0xE3520C96; /* CMP R2,#0x9600 */
-                *(uint32_t*)(vf->ram+f+0x1C) = 0xBAFFFFFB; /* BLT loop */
-                *(uint32_t*)(vf->ram+f+0x20) = 0xE8BD8030; /* POP {R4,R5,PC} */
-                *(uint32_t*)(vf->ram+f+0x24) = 0x10BBEAE0; /* pool: FB addr */
-                *(uint32_t*)(vf->ram+f+0x28) = 0x07E007E0; /* pool: green RGB565 */
-                /* Vtable at 0x10FFE200 */
-                *(uint32_t*)(vf->ram+0xFFE200) = 0x10FFE100;
-                *(uint32_t*)(vf->ram+0xFFE204) = 0x10FFE100;
-                *(uint32_t*)(vf->ram+0xFFE208) = 0x10FFE100; /* [2]=draw */
-                /* Entity at 0x10FFE300: [0]=vtable */
-                *(uint32_t*)(vf->ram+0xFFE300) = 0x10FFE200;
-                /* Element array at 0x10FFE2F0 */
-                *(uint32_t*)(vf->ram+0xFFE2F0) = 0x10FFE300;
-                /* Entity list container at 0x10BE3CA4 */
-                *(uint32_t*)(vf->ram+0xBE3CA4) = 0x10FFE2F0; /* start */
-                *(uint32_t*)(vf->ram+0xBE3CB4) = 4;           /* stride */
-                *(uint32_t*)(vf->ram+0xBE3CB8) = 0x10FFE2F4; /* end */
-                printf("[HLE-ENTITY] Test draw entity installed\n");
-            }
-            /* Early PTX palette extraction for render FB blit */
-            if (!vf->ptx_has_pal && vf->ptx_count > 0 && vf->cd) {
-                CDEntry *pe = &vf->ptx_list[0];
-                uint8_t hdr[16];
-                cdrom_read_file(vf->cd, pe, hdr, 0, 16);
-                uint32_t bpp = *(uint32_t*)(hdr + 0x0C);
-                if (bpp == 8) {
-                    uint32_t pw = *(uint16_t*)(hdr + 0x08);
-                    uint32_t ph = *(uint16_t*)(hdr + 0x0A);
-                    vf->ptx_stride = pw;
-                    uint32_t pal_off = *(uint32_t*)hdr + pw * ph;
-                    uint8_t pal_buf[512];
-                    if (cdrom_read_file(vf->cd, pe, pal_buf, pal_off, 512) == 512) {
-                        for (int i = 0; i < 256; i++) {
-                            uint16_t p = *(uint16_t*)(pal_buf + i*2);
-                            uint8_t r5=p&0x1F,g5=(p>>5)&0x1F,b5=(p>>10)&0x1F;
-                            vf->ptx_pal[i]=0xFF000000|((r5<<3|r5>>2)<<16)|
-                                ((g5<<3|g5>>2)<<8)|(b5<<3|b5>>2);
-                        }
-                        vf->ptx_has_pal = 1;
-                        printf("[PTX-PAL] Early palette extracted (%dx%d)\n", pw, ph);
-                    }
-                }
-            }
-            /* Set framebuffer bank addresses in DC registers 0x140-0x14C.
-             * Ghidra: fb_resolver reads [0xB8000140 + bank*4] to get FB address.
-             * Game video init normally writes these via switch function. */
-            vf->dc_regs[0x40/4] = 0x10BBEAE0; /* bank 0: main render FB */
-            vf->dc_regs[0x44/4] = 0x10BBEAE0; /* bank 1 */
-            vf->dc_regs[0x48/4] = 0x10BBEAE0; /* bank 2 */
-            vf->dc_regs[0x4C/4] = 0x10BBEAE0; /* bank 3 */
-            /* Initialize render device struct at 0x10BBD500 (DAT_10ae9674).
-             * Ghidra: FUN_10ab9650 reads [+0xC]=fb_base, [+0x14]=format,
-             * [+0x18]=width, [+0x1C]=height. Without this, render has no target. */
-            *(uint32_t*)(vf->ram + 0xBBD500 + 0x0C) = 0;          /* FB bank index (0-3) */
-            *(uint16_t*)(vf->ram + 0xBBD500 + 0x14) = 0x0000;     /* pixel format */
-            *(uint32_t*)(vf->ram + 0xBBD500 + 0x18) = 320;        /* width */
-            *(uint32_t*)(vf->ram + 0xBBD500 + 0x1C) = 240;        /* height */
         } else {
             /* BOOT.BIN game: call per-frame display setup from relocated code.
              * 0x109D1648 writes VIC (0xDC000xxx) and DC (0xB80007xx) registers
@@ -6955,11 +6890,139 @@ void vflash_run_frame(VFlash *vf) {
         }
     }
 
+    /* === Shared rendering setup (runs for ALL games at bp>=800) === */
+    if (vf->has_rom && vf->boot_phase >= 800) {
+
+        /* BSS trampolines for render pipeline */
+        {
+            *(uint32_t*)(vf->ram + 0xB31DC4) = 0xE51FF004; /* LDR PC,[PC,#-4] */
+            *(uint32_t*)(vf->ram + 0xB31DC8) = 0x10FFE100; /* → draw stub */
+            *(uint32_t*)(vf->ram + 0xB1FC5C) = 0xE3A00000; /* MOV R0,#0 */
+            *(uint32_t*)(vf->ram + 0xB1FC60) = 0xE1A0F00E; /* MOV PC,LR */
+            *(uint32_t*)(vf->ram + 0xB8DB00) = 0xE3A00000; /* MOV R0,#0 */
+            *(uint32_t*)(vf->ram + 0xB8DB04) = 0xE1A0F00E; /* MOV PC,LR */
+            static int tramp_log = 0;
+            if (!tramp_log) {
+                printf("[HLE-TRAMP] BSS trampolines installed\n");
+                tramp_log = 1;
+            }
+        }
+        /* ARM draw stub at 0x10FFE100 (just return — C code does rendering) */
+        *(uint32_t*)(vf->ram + 0xFFE100) = 0xE1A0F00E; /* MOV PC,LR */
+
+        /* C-side scene renderer: sec[2] block 0 → RGB565 FB */
+        {
+            uint16_t *rfb = (uint16_t*)(vf->ram + 0xBBEAE0);
+            uint32_t s2off = vf->sec2_base ? (vf->sec2_base - 0x10000000) : 0x174000;
+            uint32_t s2size = vf->sec2_size ? vf->sec2_size : 0x1D9000;
+            /* Sky gradient background */
+            for (int y = 0; y < 240; y++) {
+                uint8_t r_sky = (uint8_t)(40 + y * 20 / 240);
+                uint8_t g_sky = (uint8_t)(80 + y * 40 / 240);
+                uint8_t b_sky = (uint8_t)(160 + y * 60 / 240);
+                uint16_t sky = ((r_sky>>3)<<11) | ((g_sky>>2)<<5) | (b_sky>>3);
+                for (int x = 0; x < 320; x++)
+                    rfb[y*320+x] = sky;
+            }
+            /* Render block 0 as 64×240 scene, scaled to 320×240 */
+            if (s2off + 64*240 <= VFLASH_RAM_SIZE) {
+                for (int sy = 0; sy < 240; sy++) {
+                    for (int sx = 0; sx < 64; sx++) {
+                        uint8_t pv = vf->ram[s2off + sy*64 + sx];
+                        if (pv < 2) continue;
+                        uint16_t c565;
+                        if (vf->ptx_has_pal) {
+                            uint32_t argb = vf->ptx_pal[pv];
+                            uint8_t cr=(argb>>16)&0xFF, cg=(argb>>8)&0xFF, cb=argb&0xFF;
+                            c565 = ((cr>>3)<<11)|((cg>>2)<<5)|(cb>>3);
+                        } else {
+                            c565 = ((pv>>3)<<11)|((pv>>2)<<5)|(pv>>3);
+                        }
+                        int dx = sx * 320 / 64;
+                        int dw = (sx+1) * 320 / 64 - dx;
+                        for (int px = 0; px < dw && dx+px < 320; px++)
+                            rfb[sy*320 + dx + px] = c565;
+                    }
+                }
+            }
+            static int scene_log = 0;
+            if (!scene_log) {
+                printf("[HLE-SCENE] sec[2]=0x%X size=0x%X blocks=%d → RGB565 FB\n",
+                       s2off, s2size, (int)(s2size / 0x3C00));
+                scene_log = 1;
+            }
+            (void)s2size;
+        }
+
+        /* Extract palette from sec[0] end area */
+        if (!vf->ptx_has_pal && vf->sec0_base && vf->sec0_size) {
+            uint32_t ss = (vf->sec0_base - 0x10000000) + vf->sec0_size - 0x4000;
+            uint32_t se = (vf->sec0_base - 0x10000000) + vf->sec0_size;
+            for (uint32_t off = ss; off < se && !vf->ptx_has_pal; off += 4) {
+                uint16_t *pal = (uint16_t*)(vf->ram + off);
+                int nz = 0, smooth = 0;
+                for (int i = 0; i < 256; i++) if (pal[i]) nz++;
+                if (nz < 50) continue;
+                for (int i = 1; i < 256; i++) {
+                    int r1=pal[i-1]&0x1F, g1=(pal[i-1]>>5)&0x1F, b1=(pal[i-1]>>10)&0x1F;
+                    int r2=pal[i]&0x1F, g2=(pal[i]>>5)&0x1F, b2=(pal[i]>>10)&0x1F;
+                    if (abs(r1-r2)+abs(g1-g2)+abs(b1-b2) < 10) smooth++;
+                }
+                if (smooth > 100) {
+                    for (int i = 0; i < 256; i++) {
+                        uint16_t p = pal[i];
+                        uint8_t r5=p&0x1F, g5=(p>>5)&0x1F, b5=(p>>10)&0x1F;
+                        vf->ptx_pal[i] = 0xFF000000 | ((r5<<3|r5>>2)<<16) |
+                            ((g5<<3|g5>>2)<<8) | (b5<<3|b5>>2);
+                    }
+                    vf->ptx_has_pal = 1;
+                    printf("[VFF-PAL] Palette at RAM+0x%X (%d entries, %d smooth)\n", off, nz, smooth);
+                    break;
+                }
+            }
+        }
+        /* PTX palette fallback */
+        if (!vf->ptx_has_pal && vf->ptx_count > 0 && vf->cd) {
+            CDEntry *pe = &vf->ptx_list[0];
+            uint8_t hdr[16];
+            cdrom_read_file(vf->cd, pe, hdr, 0, 16);
+            if (*(uint32_t*)(hdr + 0x0C) == 8) {
+                uint32_t pw = *(uint16_t*)(hdr + 0x08);
+                uint32_t ph = *(uint16_t*)(hdr + 0x0A);
+                uint32_t pal_off = *(uint32_t*)hdr + pw * ph;
+                uint8_t pal_buf[512];
+                if (cdrom_read_file(vf->cd, pe, pal_buf, pal_off, 512) == 512) {
+                    for (int i = 0; i < 256; i++) {
+                        uint16_t p = *(uint16_t*)(pal_buf + i*2);
+                        uint8_t r5=p&0x1F, g5=(p>>5)&0x1F, b5=(p>>10)&0x1F;
+                        vf->ptx_pal[i]=0xFF000000|((r5<<3|r5>>2)<<16)|
+                            ((g5<<3|g5>>2)<<8)|(b5<<3|b5>>2);
+                    }
+                    vf->ptx_has_pal = 1;
+                    printf("[PTX-PAL] Palette from PTX (%dx%d)\n", pw, ph);
+                }
+            }
+        }
+
+        /* DC register setup */
+        vf->dc_regs[0x40/4] = 0x10BBEAE0;
+        vf->dc_regs[0x44/4] = 0x10BBEAE0;
+        vf->dc_regs[0x48/4] = 0x10BBEAE0;
+        vf->dc_regs[0x4C/4] = 0x10BBEAE0;
+        *(uint32_t*)(vf->ram + 0xBBD500 + 0x0C) = 0;
+        *(uint16_t*)(vf->ram + 0xBBD500 + 0x14) = 0x0000;
+        *(uint32_t*)(vf->ram + 0xBBD500 + 0x18) = 320;
+        *(uint32_t*)(vf->ram + 0xBBD500 + 0x1C) = 240;
+        vf->lcd.upbase = 0x10BBEAE0;
+        vf->lcd.control = 0x082D;
+    }
+
     /* Force game pre-loop after init gets stuck.
+
      * Jump to 0x109D1CA8 (buffer clear + display setup) instead of
      * directly to game loop. This lets the game set up its own
      * framebuffer and render state before entering the main loop. */
-    if (vf->has_rom && vf->boot_phase >= 800 &&
+    if (vf->has_rom && vf->boot_phase == 800 &&
         vf->frame_count >= 35 && vf->frame_count <= 200) {
         printf("[VFF-GATE] bp=%d frame=%lu rom=%d\n", vf->boot_phase, (unsigned long)vf->frame_count, vf->has_rom);
         /* Set asset loading counters to > 7 (game waits for this) */
@@ -6991,12 +7054,18 @@ void vflash_run_frame(VFlash *vf) {
                             int rd = cdrom_read_file(vf->cd, &ve,
                                         vf->ram + (dst - 0x10000000), foff, ssz);
                             printf("[VFF] sec[%d] %dKB → %08X (load_addr)\n", si, rd/1024, dst);
-                            /* Track sec[1] for memory watchpoint */
-                            if (si == 1) {
+                            /* Track VFF sections */
+                            if (si == 0) {
+                                vf->sec0_base = dst;
+                                vf->sec0_size = ssz;
+                            } else if (si == 1) {
                                 vf->sec1_base = dst;
                                 vf->sec1_size = ssz;
                                 printf("[VFF] sec[1] watchpoint: %08X-%08X (%dKB)\n",
                                        dst, dst + ssz, ssz/1024);
+                            } else if (si == 2) {
+                                vf->sec2_base = dst;
+                                vf->sec2_size = ssz;
                             }
                         }
                         foff += ssz;
@@ -7144,10 +7213,18 @@ void vflash_run_frame(VFlash *vf) {
                 uint32_t spc=vf->cpu.r[15], ssp=vf->cpu.r[13];
                 uint32_t slr=vf->cpu.r[14], scp=vf->cpu.cpsr;
                 vf->cpu.r[0] = 1; vf->cpu.r[1] = 0xFFFF;
+                vf->cpu.r[2] = 0;
+                vf->cpu.r[3] = 0;  /* scene index = 0 (low byte used as index) */
+                vf->cpu.r[12] = 0;
                 vf->cpu.r[15] = entry;
                 vf->cpu.r[14] = 0x10FFF000;
                 vf->cpu.r[13] = 0x10B8D000;
                 vf->cpu.cpsr = 0x000000D3;
+                /* Set up scene context at [SP+0xC]: function reads LDRH [ptr+1] for max_scenes.
+                 * Point to a small struct with max_scenes > 0 so init proceeds. */
+                uint32_t ctx_addr = 0xB8D100; /* safe RAM area for context */
+                *(uint16_t*)(vf->ram + ctx_addr + 1) = 100; /* max_scenes = 100 */
+                *(uint32_t*)(vf->ram + 0xB8D00C) = 0x10000000 + ctx_addr; /* [SP+0xC] = ctx ptr */
                 int si;
                 for (si = 0; si < 5000000; si++) {
                     arm9_step(&vf->cpu);
@@ -7649,6 +7726,30 @@ void vflash_run_frame(VFlash *vf) {
                                 ((r<<3|r>>2)<<16) | ((g<<2|g>>4)<<8) | (b<<3|b>>2);
                         }
                     vf->vid.fb_dirty = 1;
+                    /* Save screenshot of game-rendered FB */
+                    static int game_fb_save = 0;
+                    if (game_fb_save < 3) {
+                        char path[64];
+                        snprintf(path, sizeof(path), "/tmp/vflash_gamefb_%d.bmp", game_fb_save);
+                        FILE *sf = fopen(path, "wb");
+                        if (sf) {
+                            int w=320,h=240,rs=w*3,pad2=(4-rs%4)%4,isz=(rs+pad2)*h;
+                            uint8_t hd[54]={0}; hd[0]='B';hd[1]='M';
+                            *(uint32_t*)(hd+2)=54+isz; *(uint32_t*)(hd+10)=54;
+                            *(uint32_t*)(hd+14)=40; *(int32_t*)(hd+18)=w;
+                            *(int32_t*)(hd+22)=-h; *(uint16_t*)(hd+26)=1;
+                            *(uint16_t*)(hd+28)=24; *(uint32_t*)(hd+34)=isz;
+                            fwrite(hd,1,54,sf);
+                            for(int y2=0;y2<h;y2++){for(int x2=0;x2<w;x2++){
+                                uint32_t px=vf->framebuf[y2*w+x2];
+                                uint8_t rgb[3]={px&0xFF,(px>>8)&0xFF,(px>>16)&0xFF};
+                                fwrite(rgb,1,3,sf);}
+                                uint8_t z[4]={0};if(pad2)fwrite(z,1,pad2,sf);}
+                            fclose(sf);
+                            printf("[GAME-FB] Saved screenshot to %s\n", path);
+                        }
+                        game_fb_save++;
+                    }
                 }
             }
         }
