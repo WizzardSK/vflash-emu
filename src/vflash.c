@@ -3953,9 +3953,9 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
      * 10AB98DC (set properties), 10ABCB24 (register), 10A8EBCC (finalize).
      * HLE: bump-allocate a zeroed object and return it. */
     if (vf->boot_phase >= 800 && addr == 0x10AADCB8) {
-        static uint32_t scene_obj_bump = 0x4A0000; /* past pool alloc area */
+        static uint32_t scene_obj_bump = 0x680000; /* safe region between sec[0] end and sec[1] */
         uint32_t obj_sz = 0x100; /* 256 bytes per render object */
-        if (scene_obj_bump + obj_sz < 0x500000) {
+        if (scene_obj_bump + obj_sz < 0x780000) {
             uint32_t ptr = 0x10000000 + scene_obj_bump;
             memset(vf->ram + scene_obj_bump, 0, obj_sz);
             /* Set minimal vtable-like structure so caller can use the object */
@@ -3982,11 +3982,11 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
      * 10AA0FC0/10AA0FC8: property getter/setter pair
      * 10A9082C/10A909FC: render state functions */
     if (vf->boot_phase >= 800 && addr == 0x10A3D9E4) {
-        static uint32_t rbuf_bump = 0x500000;
+        static uint32_t rbuf_bump = 0x700000; /* safe region: 0x700000-0x7C0000 */
         uint32_t size = cpu->r[0];
         if (size == 0) size = 256;
         if (size > 0x10000) size = 0x10000;
-        if (rbuf_bump + size < 0x600000) {
+        if (rbuf_bump + size < 0x7C0000) {
             uint32_t ptr = 0x10000000 + rbuf_bump;
             memset(vf->ram + rbuf_bump, 0, size);
             rbuf_bump = (rbuf_bump + size + 15) & ~15u;
@@ -4034,9 +4034,39 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     }
     if (vf->boot_phase >= 800 &&
         (addr == 0x10ABCB24 || addr == 0x10A8EBCC ||
-         addr == 0x10A9082C || addr == 0x10A909FC ||
-         addr == 0x10AA0FC0 || addr == 0x10AA0FC8 || addr == 0x10AA5AA0)) {
+         addr == 0x10A909FC || addr == 0x10AA5AA0)) {
         cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* HLE 10A9082C (render state/scene handle creator).
+     * Called from scene init with R0=mode, R1=descriptor_ptr.
+     * Returns handle that width/height getters query.
+     * Store R1 (descriptor ptr) in a static to retrieve later. */
+    if (vf->boot_phase >= 800 && addr == 0x10A9082C) {
+        static uint32_t last_desc = 0;
+        last_desc = cpu->r[1];
+        /* Return R1 as the "handle" so callers can use it */
+        cpu->r[0] = cpu->r[1];
+        static int sc_log = 0;
+        if (sc_log < 20) {
+            printf("[HLE-SCENE-HDL] 10A9082C R0=%08X R1=%08X → handle=%08X\n",
+                   cpu->r[0], cpu->r[1], cpu->r[1]);
+            sc_log++;
+        }
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* HLE RTOS dimension getters (10AA0FC0=width, 10AA0FC8=height).
+     * Called from scene init to get layer dimensions. Return screen size
+     * so render callbacks have valid dimensions to work with. */
+    if (vf->boot_phase >= 800 && addr == 0x10AA0FC0) {
+        cpu->r[0] = 320; /* width */
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    if (vf->boot_phase >= 800 && addr == 0x10AA0FC8) {
+        cpu->r[0] = 240; /* height */
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
@@ -4100,10 +4130,10 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     /* HLE pool allocator (FUN_10A8EF1C): R0=alloc_context, R1=pool.
      * Returns individual pool elements. Each call returns next 64-byte slot. */
     if (addr == 0x10A8EF1C && ((VFlash*)ctx)->boot_phase >= 800) {
-        static uint32_t scene_bump = 0x420000;
+        static uint32_t scene_bump = 0x0C0000; /* safe region: 0x0C0000-0x160000 */
         VFlash *vf2 = (VFlash*)ctx;
         uint32_t slot_sz = 64; /* individual pool element size */
-        if (scene_bump + slot_sz < 0x4A0000) {
+        if (scene_bump + slot_sz < 0x160000) {
             uint32_t ptr = 0x10000000 + scene_bump;
             memset(vf2->ram + scene_bump, 0, slot_sz);
             scene_bump = (scene_bump + slot_sz + 15) & ~15u;
@@ -4291,10 +4321,18 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         uint32_t len = cpu->r[2];
         if (dst < VFLASH_RAM_SIZE && src < VFLASH_RAM_SIZE &&
             dst + len <= VFLASH_RAM_SIZE && src + len <= VFLASH_RAM_SIZE && len < 0x100000) {
-            /* Protect relocated game+render code from BSS clear overwrite */
+            /* Protect game code areas from BSS clear overwrite */
             if (dst >= 0x9D0000 && dst < 0xB30000) {
                 cpu->r[15] = cpu->r[14] & ~3u;
                 return 1;
+            }
+            /* Also protect VFF sec[0] (game code) if loaded */
+            if (vf2->sec0_base > 0x10000000) {
+                uint32_t s0off = vf2->sec0_base - 0x10000000;
+                if (dst >= s0off && dst < s0off + vf2->sec0_size) {
+                    cpu->r[15] = cpu->r[14] & ~3u;
+                    return 1;
+                }
             }
             memmove(vf2->ram + dst, vf2->ram + src, len);
             cpu->r[15] = cpu->r[14] & ~3u;
@@ -4333,6 +4371,18 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
                            0x10000000+dst, len);
                 cpu->r[15] = cpu->r[14] & ~3u;
                 return 1;
+            }
+            /* Protect VFF sec[0] from being zeroed */
+            if (val == 0 && vf2->sec0_base > 0x10000000) {
+                uint32_t s0off = vf2->sec0_base - 0x10000000;
+                if (dst >= s0off && dst < s0off + vf2->sec0_size) {
+                    static int prot_log2 = 0;
+                    if (prot_log2++ < 3)
+                        printf("[MEMSET-PROTECT] Blocked zero of sec[0] %08X+%X\n",
+                               0x10000000+dst, len);
+                    cpu->r[15] = cpu->r[14] & ~3u;
+                    return 1;
+                }
             }
             memset(vf2->ram + dst, (int)val, len);
             cpu->r[15] = cpu->r[14] & ~3u;
@@ -4387,45 +4437,19 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
             *(uint32_t*)(vf2->ram + 0xBE3C50) = ((fc-1) << 8) | flags; /* ctx[4] different */
         }
         vf2->ram[0xBE3C60] = 1; /* render state byte */
-        /* HLE: blit VFF tile data as 4bpp to render FB.
-         * Compressed tiles at dispatch table +0x2C, dims at desc +0x14.
-         * Not properly decompressed but shows tile structure. */
+        /* Clear render FB — native render pipeline will populate it.
+         * Previous HLE blit read from 0x500800 (game code, NOT data). */
         {
             uint16_t *fb = (uint16_t*)(vf2->ram + 0xBBEAE0);
-            /* Read 9 layers from dispatch table */
-            static const uint16_t layer_pal[] = {
-                0xF800,0x07E0,0x001F,0xFFE0,0xF81F,0x07FF,0xFC00,0x83E0,0xFD20
-            };
-            memset(fb, 0, 320*240*2);
-            for (int li = 0; li < 9; li++) {
-                uint32_t dt_off = 0x500800 + li * 0x30;
-                uint32_t desc_ptr = *(uint32_t*)(vf2->ram + dt_off + 0x14);
-                uint32_t data_ptr = *(uint32_t*)(vf2->ram + dt_off + 0x2C);
-                if (desc_ptr < 0x10000000 || data_ptr < 0x10000000) continue;
-                uint32_t doff = desc_ptr - 0x10000000;
-                uint16_t tw = *(uint16_t*)(vf2->ram + doff + 0x14);
-                uint16_t th = *(uint16_t*)(vf2->ram + doff + 0x16);
-                if (tw == 0 || th == 0 || tw > 1024 || th > 512) continue;
-                uint32_t src = data_ptr - 0x10000000;
-                /* Blit as 4bpp with layer color */
-                uint16_t color = layer_pal[li];
-                int y_off = li * 26; /* stack layers vertically */
-                for (int y = 0; y < (int)th && y + y_off < 240; y++) {
-                    for (int x = 0; x < 320 && x < (int)tw; x++) {
-                        int sx = x * tw / 320;
-                        uint32_t byte_idx = (y * tw + sx) / 2;
-                        if (src + byte_idx >= VFLASH_RAM_SIZE) break;
-                        uint8_t b = vf2->ram[src + byte_idx];
-                        uint8_t nib = (sx & 1) ? (b & 0xF) : (b >> 4);
-                        if (nib > 0 && nib < 12) {
-                            /* Modulate layer color by nibble intensity */
-                            uint8_t r = ((color>>11)&0x1F) * nib / 11;
-                            uint8_t g = ((color>>5)&0x3F) * nib / 11;
-                            uint8_t bl = (color&0x1F) * nib / 11;
-                            fb[(y+y_off)*320+x] = (r<<11)|(g<<5)|bl;
-                        }
-                    }
-                }
+            /* Fill with sky gradient so we can see what the native
+             * render engine draws on top */
+            for (int y = 0; y < 240; y++) {
+                uint8_t r = (uint8_t)(40 + y * 30 / 240);
+                uint8_t g = (uint8_t)(80 + y * 60 / 240);
+                uint8_t b = (uint8_t)(140 + y * 80 / 240);
+                uint16_t sky = ((r>>3)<<11)|((g>>2)<<5)|(b>>3);
+                for (int x = 0; x < 320; x++)
+                    fb[y*320+x] = sky;
             }
         }
         /* PTX artwork over tile layers (blended) */
@@ -4463,7 +4487,7 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         if (*(uint32_t*)(vf2->ram + 0xBE3D24) == 0) {
             uint32_t arr = 0xB90000;
             int n = 0;
-            for (uint32_t ea = 0x320000; ea < 0x390000 && n < 100; ea += 64) {
+            for (uint32_t ea = 0x080000; ea < 0x0C0000 && n < 100; ea += 64) {
                 if (*(uint32_t*)(vf2->ram+ea) == 0x10310800) {
                     *(uint32_t*)(vf2->ram+arr+n*4) = 0x10000000+ea;
                     n++;
@@ -4540,10 +4564,10 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         }
         /* HLE draw: when vtable[2] is called with valid entity ptr,
          * draw a colored marker directly to display framebuffer */
-        if (slot == 2 && cpu->r[0] >= 0x10320000 && cpu->r[0] < 0x10380000) {
+        if (slot == 2 && cpu->r[0] >= 0x10080000 && cpu->r[0] < 0x100C0000) {
             VFlash *vf2 = (VFlash*)ctx;
             uint32_t ent = cpu->r[0] - 0x10000000;
-            int idx = (ent - 0x320000) / 64;
+            int idx = (ent - 0x080000) / 64;
             int x = (idx * 37) % 300 + 10;
             int y = (idx * 23) % 220 + 10;
             /* Draw colored marker to ARGB32 framebuffer */
@@ -4584,12 +4608,12 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
      * Let the caller (VFF scene code) set whatever vtable it wants.
      * Native alloc gets stuck in uninitialized game heap. */
     if (addr == 0x10A775E0 && ((VFlash*)ctx)->boot_phase >= 800) {
-        static uint32_t native_bump = 0x390000; /* separate from HLE alloc area */
+        static uint32_t native_bump = 0x0A0000; /* safe region: 0x0A0000-0x0C0000 */
         uint32_t size = cpu->r[0];
         if (size == 0) size = 64;
         if (size > 0x10000) size = 0x10000;
         VFlash *vf2 = (VFlash*)ctx;
-        if (native_bump + size < 0x400000) {
+        if (native_bump + size < 0x0C0000) {
             uint32_t ptr = 0x10000000 + native_bump;
             memset(vf2->ram + native_bump, 0, size);
             static int na_log = 0;
@@ -4608,9 +4632,9 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     }
     if (addr == 0x10A77648 &&
         ((VFlash*)ctx)->boot_phase >= 800) {
-        static uint32_t bump = 0x320000;
+        static uint32_t bump = 0x080000; /* safe region: 0x080000-0x0A0000 */
         uint32_t size = cpu->r[0];
-        if (size > 0 && size < 0x10000 && bump + size < 0x380000) {
+        if (size > 0 && size < 0x10000 && bump + size < 0x0A0000) {
             uint32_t ptr = 0x10000000 + bump;
             VFlash *va = (VFlash*)ctx;
             memset(va->ram + bump, 0, size);
@@ -7102,11 +7126,20 @@ void vflash_run_frame(VFlash *vf) {
         /* ARM draw stub at 0x10FFE100 (just return — C code does rendering) */
         *(uint32_t*)(vf->ram + 0xFFE100) = 0xE1A0F00E; /* MOV PC,LR */
 
-        /* C-side scene renderer: sec[2] block 0 → RGB565 FB */
-        {
+        /* C-side scene renderer: DISABLED.
+         * Was reading sec[2]+0x88000 as 8bpp pixel strips but this data
+         * is actually tilemap indices (low entropy). The HLE blit at
+         * 0x10A89100 was also reading from 0x500800 (game code, not data).
+         * Both produced garbled output. Let native render pipeline handle display. */
+        if (0 && vf->boot_phase >= 900) {
             uint16_t *rfb = (uint16_t*)(vf->ram + 0xBBEAE0);
             uint32_t s2off = vf->sec2_base ? (vf->sec2_base - 0x10000000) : 0x174000;
             uint32_t s2size = vf->sec2_size ? vf->sec2_size : 0x1D9000;
+            uint32_t tile_off = s2off + 0x88000; /* raw tile strips start */
+            uint32_t tile_size = s2size > 0x88000 ? s2size - 0x88000 : 0;
+            int nstrips = (int)(tile_size / 0x3C00);
+            int strip_w = 64;
+            int strips_visible = 320 / strip_w; /* 5 strips fill screen */
             /* Sky gradient background */
             for (int y = 0; y < 240; y++) {
                 uint8_t r_sky = (uint8_t)(40 + y * 20 / 240);
@@ -7116,68 +7149,83 @@ void vflash_run_frame(VFlash *vf) {
                 for (int x = 0; x < 320; x++)
                     rfb[y*320+x] = sky;
             }
-            /* Scene renderer with bilinear upscale.
-             * Build 64×240 scene buffer from sec[2] block 0 with palette,
-             * then bilinear interpolate to 320×240 for smooth output. */
-            {
-                /* Build 64×240 ARGB scene from block 0 with tilemap lookup */
-                static uint32_t scene64[64*240];
-                int nblocks = (int)(s2size / 0x3C00);
-                /* Block 0 rows 0-55 = viewport mask (not pixels). Skip them.
-                 * Map source rows 56-239 (184 rows) → scene rows 0-239. */
-                int src_start = 56;
-                int src_rows = 240 - src_start; /* 184 source rows */
-                for (int dy = 0; dy < 240; dy++) {
-                    int sy = src_start + dy * src_rows / 240;
-                    if (sy >= 240) sy = 239;
-                    for (int sx = 0; sx < 64; sx++) {
-                        uint8_t b0val = vf->ram[s2off + sy*64 + sx];
-                        uint8_t pv;
-                        /* Try tilemap: use block 0 value as index into blocks 1-N */
-                        if (b0val > 0 && b0val < nblocks) {
-                            pv = vf->ram[s2off + b0val * 0x3C00 + sy*64 + sx];
-                            if (pv < 2) pv = b0val; /* fallback to direct value */
+            /* Render visible strips. scroll_strip selects starting strip. */
+            static int scroll_strip = 0;
+            for (int si = 0; si < strips_visible && (scroll_strip + si) < nstrips; si++) {
+                uint32_t base = tile_off + (uint32_t)(scroll_strip + si) * 0x3C00;
+                if (base + 0x3C00 > s2off + s2size) break;
+                int sx0 = si * strip_w;
+                for (int y = 0; y < 240; y++) {
+                    for (int x = 0; x < strip_w; x++) {
+                        uint32_t poff = base + (uint32_t)(y * strip_w + x);
+                        if (poff >= VFLASH_RAM_SIZE) continue;
+                        uint8_t idx = vf->ram[poff];
+                        if (idx == 0) continue; /* transparent → keep sky */
+                        uint16_t c565;
+                        if (vf->ptx_has_pal) {
+                            /* ptx_pal is ARGB8888, convert to RGB565 */
+                            uint32_t argb = vf->ptx_pal[idx];
+                            uint8_t r8 = (argb >> 16) & 0xFF;
+                            uint8_t g8 = (argb >> 8) & 0xFF;
+                            uint8_t b8 = argb & 0xFF;
+                            c565 = ((r8>>3)<<11) | ((g8>>2)<<5) | (b8>>3);
                         } else {
-                            pv = b0val;
+                            /* Grayscale fallback: index → gray level */
+                            uint8_t g = (uint8_t)(idx * 3); /* scale for visibility */
+                            c565 = ((g>>3)<<11) | ((g>>2)<<5) | (g>>3);
                         }
-                        if (pv < 2) {
-                            scene64[sy*64+sx] = 0; /* transparent */
-                        } else if (vf->ptx_has_pal) {
-                            scene64[sy*64+sx] = vf->ptx_pal[pv];
-                        } else {
-                            scene64[sy*64+sx] = 0xFF000000|(pv<<16)|(pv<<8)|pv;
-                        }
-                    }
-                }
-                /* Bilinear upscale 64×240 → 320×240 */
-                for (int dy = 0; dy < 240; dy++) {
-                    for (int dx = 0; dx < 320; dx++) {
-                        /* Map screen X to source X with sub-pixel precision */
-                        int sx_fp = dx * 63 * 256 / 319; /* 8.8 fixed point */
-                        int sx0 = sx_fp >> 8;
-                        int sx1 = sx0 < 63 ? sx0 + 1 : sx0;
-                        int fx = sx_fp & 0xFF; /* fractional part 0-255 */
-                        uint32_t c0 = scene64[dy*64+sx0];
-                        uint32_t c1 = scene64[dy*64+sx1];
-                        if (c0 == 0 && c1 == 0) continue; /* both transparent */
-                        if (c0 == 0) c0 = c1;
-                        if (c1 == 0) c1 = c0;
-                        /* Lerp RGB channels */
-                        uint8_t r = (uint8_t)(((c0>>16)&0xFF)*(255-fx)/255 + ((c1>>16)&0xFF)*fx/255);
-                        uint8_t g = (uint8_t)(((c0>>8)&0xFF)*(255-fx)/255 + ((c1>>8)&0xFF)*fx/255);
-                        uint8_t b = (uint8_t)((c0&0xFF)*(255-fx)/255 + (c1&0xFF)*fx/255);
-                        rfb[dy*320+dx] = ((r>>3)<<11)|((g>>2)<<5)|(b>>3);
+                        rfb[y*320 + sx0 + x] = c565;
                     }
                 }
             }
             static int scene_log = 0;
-            if (!scene_log) {
-                printf("[HLE-SCENE] sec[2]=0x%X size=0x%X blocks=%d → RGB565 FB\n",
-                       s2off, s2size, (int)(s2size / 0x3C00));
-                scene_log = 1;
+            if (scene_log < 3) {
+                if (!scene_log) {
+                    printf("[HLE-SCENE] sec[2]=0x%X tile_off=+0x88000 strips=%d → RGB565 FB\n",
+                           s2off, nstrips);
+                    /* Debug: dump first 32 bytes of each of first 5 strips */
+                    for (int di = 0; di < 5 && di < nstrips; di++) {
+                        uint32_t dbase = tile_off + (uint32_t)di * 0x3C00;
+                        printf("[TILE-DBG] strip %d:", di);
+                        for (int db = 0; db < 32 && dbase+db < VFLASH_RAM_SIZE; db++)
+                            printf(" %02X", vf->ram[dbase+db]);
+                        printf("\n");
+                    }
+                    /* Also dump first non-zero strip */
+                    for (int di = 0; di < nstrips; di++) {
+                        uint32_t dbase = tile_off + (uint32_t)di * 0x3C00;
+                        if (dbase + 4 > VFLASH_RAM_SIZE) break;
+                        uint32_t w0 = *(uint32_t*)(vf->ram + dbase);
+                        if (w0 != 0 && w0 != 0x25252525) {
+                            printf("[TILE-DBG] first interesting strip %d:", di);
+                            for (int db = 0; db < 32; db++)
+                                printf(" %02X", vf->ram[dbase+db]);
+                            printf("\n");
+                            break;
+                        }
+                    }
+                }
+                if (scene_log == 2) {
+                    /* Save scene screenshot as PPM after a few render frames */
+                    FILE *sf = fopen("/tmp/vflash_scene.ppm", "wb");
+                    if (sf) {
+                        fprintf(sf, "P6\n320 240\n255\n");
+                        for (int i = 0; i < 320*240; i++) {
+                            uint16_t px = rfb[i];
+                            uint8_t r8 = ((px >> 11) & 0x1F) << 3;
+                            uint8_t g8 = ((px >> 5) & 0x3F) << 2;
+                            uint8_t b8 = (px & 0x1F) << 3;
+                            uint8_t rgb[3] = {r8, g8, b8};
+                            fwrite(rgb, 1, 3, sf);
+                        }
+                        fclose(sf);
+                        printf("[HLE-SCENE] Screenshot saved to /tmp/vflash_scene.ppm\n");
+                    }
+                }
+                scene_log++;
             }
             (void)s2size;
-        }
+        } /* bp>=900 scene renderer */
 
         /* Extract palette from sec[0] end area */
         if (!vf->ptx_has_pal && vf->sec0_base && vf->sec0_size) {
@@ -7608,7 +7656,7 @@ void vflash_run_frame(VFlash *vf) {
                 /* Log entity vtable values after scene callback */
                 printf("[VFF-SCENE] Entity data after callback:\n");
                 int real_vt = 0, dummy_vt = 0, data_vt = 0;
-                for (uint32_t ea = 0x320000; ea < 0x400000; ea += 64) {
+                for (uint32_t ea = 0x080000; ea < 0x160000; ea += 64) {
                     uint32_t v = *(uint32_t*)(vf->ram + ea);
                     if (v == 0) continue;
                     if (v == 0x10310800) { dummy_vt++; continue; }
@@ -7626,9 +7674,9 @@ void vflash_run_frame(VFlash *vf) {
                 }
                 printf("[VFF-SCENE] vtables: %d real, %d dummy, %d data\n",
                        real_vt, dummy_vt, data_vt);
-                /* Only restore dummy vtable on HLE alloc area (0x320000-0x390000).
-                 * Leave native alloc area (0x390000+) alone — may have real vtables. */
-                for (uint32_t ea = 0x320000; ea < 0x390000; ea += 0x10) {
+                /* Only restore dummy vtable on HLE alloc area.
+                 * Leave native alloc area alone — may have real vtables. */
+                for (uint32_t ea = 0x080000; ea < 0x0A0000; ea += 0x10) {
                     uint32_t v = *(uint32_t*)(vf->ram + ea);
                     if (v != 0 && v != 0x10310800) {
                         *(uint32_t*)(vf->ram + ea) = 0x10310800;
@@ -7896,7 +7944,7 @@ void vflash_run_frame(VFlash *vf) {
                      * Native deserializer (FUN_10acd65c) has too many RTOS deps.
                      * Resource table: 6-word entries (24 bytes each).
                      * Format: [type, flags, desc_ptr, next_type, next_size, next_id] */
-                    uint32_t bump = 0x420000;
+                    uint32_t bump = 0x0C0000; /* safe region */
                     int sprites = 0, tiles = 0;
                     for (uint32_t pos = restab; pos + 24 <= restab + 0x2000; pos += 24) {
                         uint32_t w0 = *(uint32_t*)(vf->ram + pos);      /* type/count */
@@ -7911,7 +7959,7 @@ void vflash_run_frame(VFlash *vf) {
                         if (w2 < 0x10000000 || w2 >= 0x11000000) continue;
                         uint32_t desc_off = w2 - 0x10000000;
                         /* Create object based on type field (w3) */
-                        if (w3 == 1 && bump + 0xC4 < 0x4A0000) {
+                        if (w3 == 1 && bump + 0xC4 < 0x160000) {
                             /* Type 1: Sprite object (0xC4 bytes) */
                             uint32_t obj = bump;
                             memset(vf->ram + obj, 0, 0xC4);
@@ -7924,7 +7972,7 @@ void vflash_run_frame(VFlash *vf) {
                             vf->ram[obj + 0x08] = 1;
                             bump = (bump + 0xC4 + 15) & ~15u;
                             sprites++;
-                        } else if (w3 == 2 && bump + 0x104 < 0x4A0000) {
+                        } else if (w3 == 2 && bump + 0x104 < 0x160000) {
                             /* Type 2: Tile layer (0x104 bytes) */
                             uint32_t obj = bump;
                             memset(vf->ram + obj, 0, 0x104);
@@ -8150,18 +8198,20 @@ void vflash_run_frame(VFlash *vf) {
                     }
                 }
             }
-            /* Render VFF scene from tile pixel data.
-             * Tiles are stored UNCOMPRESSED in sec[2] at offset 0x88000
-             * (RAM address 0x10240000 = sec[2] base 0x101B8000 + 0x88000).
-             * 29 tiles, all 512px wide, varying heights (4-1024 rows).
-             * Sprites in sec[1] are compressed (custom format, not yet decoded). */
-            int ent_count = 0;
+            /* VFF scene renderer: DISABLED — data at 0x500800 is game code,
+             * not a dispatch table. sec[2]+0x88000 is tilemap indices, not pixels.
+             * Let native render pipeline handle display. */
+            int ent_count = 1; /* pretend we rendered → skip broken paths below */
+            int nz = 1001; /* skip tile scan */
+            int dt_valid = 0;
+            /* All tile/dispatch-table scanning and rendering DISABLED.
+             * Data at 0x500800 is game code, sec[2]+0x88000 is tilemap indices. */
+            goto skip_broken_renderers;
             uint32_t tile_off = 0x1B8000 + 0x88000; /* sec[2] + tile data offset */
-            int nz = 0;
+            nz = 0;
             for (uint32_t ti = 0; ti < 512*256 && ti + tile_off < VFLASH_RAM_SIZE; ti++)
                 if (vf->ram[tile_off + ti]) nz++;
-            /* Also try dispatch table tile data (compressed but renderable) */
-            int dt_valid = 0;
+            dt_valid = 0;
             {
                 uint32_t dt0 = *(uint32_t*)(vf->ram + 0x500800);
                 if (dt0 >= 0x10000000 && dt0 < 0x11000000) dt_valid = 1;
@@ -8650,6 +8700,7 @@ void vflash_run_frame(VFlash *vf) {
             } else {
                 ent_count = 0;
             }
+            skip_broken_renderers:
             vf->vid.fb_dirty = 1;
             static int ptx_log = 0;
             if (!ptx_log) {
