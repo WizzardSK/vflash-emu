@@ -3597,8 +3597,11 @@ VFlash* vflash_create(const char *disc_path) {
     vf->cpu.hle_intercept  = hle_service_intercept;
     vf->cpu.hle_ctx        = vf;
 
-    /* Initialize JIT compiler */
-    vf->jit = jit_create(vf);
+    /* Initialize JIT compiler (disable with VFLASH_NOJIT=1) */
+    if (!getenv("VFLASH_NOJIT"))
+        vf->jit = jit_create(vf);
+    else
+        printf("[JIT] Disabled by VFLASH_NOJIT\n");
 
     /* Try to load boot ROM (70004.bin) — enables real boot instead of HLE */
     {
@@ -3893,6 +3896,195 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
     /* Skip RTOS mutex lock/unlock (crash on NULL mutex in HLE env) */
     if (addr == 0x10AB32C0 || addr == 0x10AB3304 || addr == 0x10AB3348 ||
         addr == 0x10AB3060 || addr == 0x10AB30A0) {
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* HLE interrupt flag swap (0x10A14D84): disables IRQ/FIQ, returns old flags.
+     * Native code: MRS→AND→ASR→MSR. Safe to run natively but HLE is faster.
+     * Called from render engine task function (0x10A0870C) via mutex path. */
+    if (addr == 0x10A14D84 && vf->boot_phase >= 800) {
+        uint32_t old_flags = (cpu->cpsr >> 6) & 3;
+        /* Input R0 = new flags (shifted left 6 by caller to set I/F bits) */
+        cpu->r[0] = old_flags;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* HLE render engine task function (0x10A0870C): checks engine state,
+     * looks up render objects in array at 0x10AD5E80.
+     * Without initialized RTOS, the arrays are empty → fails with error codes.
+     * HLE: return 0 (success) and let the caller proceed. */
+    if (addr == 0x10A0870C && vf->boot_phase >= 800) {
+        static int re_log = 0;
+        if (re_log < 5) {
+            printf("[HLE-RENDER-TASK] 10A0870C(R0=%d) → 0 LR=%08X\n",
+                   cpu->r[0], cpu->r[14]);
+            re_log++;
+        }
+        cpu->r[0] = 0; /* success */
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* HLE render engine init functions called from 0x10A0D990.
+     * These iterate over arrays to init/reset render state.
+     * With uninitialized RTOS, counts are 0 so they're no-ops anyway,
+     * but intercepting saves cycles in the VFF-EXEC step budget. */
+    if (vf->boot_phase >= 800 &&
+        (addr == 0x10A09920 || addr == 0x10A0AF68 || addr == 0x10A0A9B8 ||
+         addr == 0x10A09834 || addr == 0x10A0AB2C || addr == 0x10A08304)) {
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* HLE render error/cleanup (0x10A0EFF4, 0x10A0F074).
+     * Error handler and post-processing — skip to avoid RTOS dependencies. */
+    if (vf->boot_phase >= 800 &&
+        (addr == 0x10A0EFF4 || addr == 0x10A0F074)) {
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* HLE uninitialized RTOS render object allocator.
+     * Scene init at 104BC644 calls BL 10AADCB8, which is supposed to be
+     * a render context allocator. But 10AADCB8 is uninitialized data
+     * ({0x10C0C008, 0, 4} repeating) — RTOS was supposed to populate it.
+     * Also catch other RTOS functions called from scene init loops:
+     * 10A3D9E4 (alloc with size), 10AB0210 (init object),
+     * 10AB98DC (set properties), 10ABCB24 (register), 10A8EBCC (finalize).
+     * HLE: bump-allocate a zeroed object and return it. */
+    if (vf->boot_phase >= 800 && addr == 0x10AADCB8) {
+        static uint32_t scene_obj_bump = 0x4A0000; /* past pool alloc area */
+        uint32_t obj_sz = 0x100; /* 256 bytes per render object */
+        if (scene_obj_bump + obj_sz < 0x500000) {
+            uint32_t ptr = 0x10000000 + scene_obj_bump;
+            memset(vf->ram + scene_obj_bump, 0, obj_sz);
+            /* Set minimal vtable-like structure so caller can use the object */
+            *(uint32_t*)(vf->ram + scene_obj_bump + 0) = 0x10310800; /* dummy vtable */
+            *(uint32_t*)(vf->ram + scene_obj_bump + 4) = 1;         /* initialized flag */
+            scene_obj_bump = (scene_obj_bump + obj_sz + 15) & ~15u;
+            cpu->r[0] = ptr;
+        } else {
+            cpu->r[0] = 0;
+        }
+        static int ro_log = 0;
+        if (ro_log < 5) {
+            printf("[HLE-SCENE-OBJ] 10AADCB8 → %08X\n", cpu->r[0]);
+            ro_log++;
+        }
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* HLE RTOS functions called from scene init loop.
+     * These are render engine utility functions that need RTOS context.
+     * 10A3D9E4: allocate render buffer (R0=size) → return alloc'd ptr
+     * 10AB0210: initialize render object
+     * 10AB98DC: set render properties
+     * 10AA0FC0/10AA0FC8: property getter/setter pair
+     * 10A9082C/10A909FC: render state functions */
+    if (vf->boot_phase >= 800 && addr == 0x10A3D9E4) {
+        static uint32_t rbuf_bump = 0x500000;
+        uint32_t size = cpu->r[0];
+        if (size == 0) size = 256;
+        if (size > 0x10000) size = 0x10000;
+        if (rbuf_bump + size < 0x600000) {
+            uint32_t ptr = 0x10000000 + rbuf_bump;
+            memset(vf->ram + rbuf_bump, 0, size);
+            rbuf_bump = (rbuf_bump + size + 15) & ~15u;
+            cpu->r[0] = ptr;
+        } else {
+            cpu->r[0] = 0;
+        }
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* HLE 10AB0210 (render object init): R0=object, R1=dispatch_table, R2=sub_entry.
+     * Stores dispatch table base at object+0x04 so subsequent lookups work. */
+    if (vf->boot_phase >= 800 && addr == 0x10AB0210) {
+        uint32_t obj = cpu->r[0], dt = cpu->r[1], sub = cpu->r[2];
+        if (obj >= 0x10000000 && obj < 0x10000000 + VFLASH_RAM_SIZE) {
+            uint32_t ooff = obj - 0x10000000;
+            *(uint32_t*)(vf->ram + ooff + 0x04) = dt;  /* dispatch table base */
+            *(uint32_t*)(vf->ram + ooff + 0x08) = sub;  /* sub-entry offset/ptr */
+            static int ab_log = 0;
+            if (ab_log < 10) {
+                printf("[HLE-INIT] 10AB0210 obj=%08X dt=%08X sub=%08X\n", obj, dt, sub);
+                ab_log++;
+            }
+        }
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* HLE 10AB98DC (set properties): R0=sub_buf, R1=dt, R2=parent_obj, R3=sub_buf.
+     * Links sub-buffer to parent render object. */
+    if (vf->boot_phase >= 800 && addr == 0x10AB98DC) {
+        uint32_t sub = cpu->r[0], dt = cpu->r[1], parent = cpu->r[2];
+        if (parent >= 0x10000000 && parent < 0x10000000 + VFLASH_RAM_SIZE) {
+            uint32_t poff = parent - 0x10000000;
+            *(uint32_t*)(vf->ram + poff + 0x0C) = sub;  /* sub-buffer ptr */
+        }
+        if (sub >= 0x10000000 && sub < 0x10000000 + VFLASH_RAM_SIZE) {
+            uint32_t soff = sub - 0x10000000;
+            *(uint32_t*)(vf->ram + soff + 0x00) = parent; /* back-pointer */
+            *(uint32_t*)(vf->ram + soff + 0x04) = dt;     /* dispatch table */
+        }
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    if (vf->boot_phase >= 800 &&
+        (addr == 0x10ABCB24 || addr == 0x10A8EBCC ||
+         addr == 0x10A9082C || addr == 0x10A909FC ||
+         addr == 0x10AA0FC0 || addr == 0x10AA0FC8 || addr == 0x10AA5AA0)) {
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* HLE render object setup functions (10AFxxxx range).
+     * These set properties on render context objects allocated above.
+     * Log R0 (object ptr) and R1 (value) to decode layer structure. */
+    if (vf->boot_phase >= 800 && addr >= 0x10AF3E00 && addr <= 0x10AF4300) {
+        static int prop_log = 0;
+        if (prop_log < 200) {
+            printf("[HLE-PROP] %08X R0=%08X R1=%08X R2=%08X LR=%08X\n",
+                   addr, cpu->r[0], cpu->r[1], cpu->r[2], cpu->r[14]);
+            prop_log++;
+        }
+        /* Actually store R1 into the object if R0 is a valid HLE object.
+         * The setter functions store values at specific offsets in the object.
+         * Map function address to object field offset: */
+        if (cpu->r[0] >= 0x10000000 && cpu->r[0] < 0x10000000 + VFLASH_RAM_SIZE) {
+            uint32_t obj_off = cpu->r[0] - 0x10000000;
+            /* Each 10AF3xxx function sets a different field. Map by function address.
+             * Offset derived from function ordering: 10AF3ED0,3EF4,3F18,3F3C,3F60,3F84,3FA8 */
+            uint32_t field_off = 0;
+            if      (addr == 0x10AF3ED0) field_off = 0x08; /* timeout/delay */
+            else if (addr == 0x10AF3EF4) field_off = 0x0C; /* param2 (color/mode?) */
+            else if (addr == 0x10AF3F18) field_off = 0x10; /* param3 (width-related?) */
+            else if (addr == 0x10AF3F3C) field_off = 0x14; /* param4 (height-related?) */
+            else if (addr == 0x10AF3F60) field_off = 0x18; /* param5 (0 = no scroll?) */
+            else if (addr == 0x10AF3F84) field_off = 0x1C; /* param6 (0 = no scroll?) */
+            else if (addr == 0x10AF3FA8) field_off = 0x20; /* color mask (0xFF00FFFF-like) */
+            else if (addr == 0x10AF40D0) field_off = 0x24; /* mode/flags */
+            else if (addr == 0x10AF41C8) field_off = 0x28; /* post-setup */
+            else if (addr == 0x10AF4200) field_off = 0x2C; /* data pointer? */
+            if (field_off && obj_off + field_off + 4 <= VFLASH_RAM_SIZE)
+                *(uint32_t*)(vf->ram + obj_off + field_off) = cpu->r[1];
+        }
+        cpu->r[0] = 0;
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
+    /* HLE render object wrappers (10ABBxxx).
+     * These initialize/configure render pipeline stages. */
+    if (vf->boot_phase >= 800 &&
+        (addr == 0x10ABB218 || addr == 0x10ABB2D8)) {
+        static int abb_log = 0;
+        if (abb_log < 20) {
+            printf("[HLE-ABB] %08X R0=%08X R1=%08X LR=%08X\n",
+                   addr, cpu->r[0], cpu->r[1], cpu->r[14]);
+            abb_log++;
+        }
         cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
@@ -7206,13 +7398,28 @@ void vflash_run_frame(VFlash *vf) {
                     }
                 }
             }
-            /* Fallback: try init_cb from header */
+            /* Fallback: try init_cb from header.
+             * init_cb may point to a resume address (middle of a loop), not
+             * the real function entry. Scan forward for the next PUSH {regs,LR}
+             * prologue to find the actual function start. */
             if (!entry && vff_init_cb >= 0x10000000 && vff_init_cb < 0x10000000 + VFLASH_RAM_SIZE) {
                 uint32_t cb_off = vff_init_cb - 0x10000000;
-                uint32_t cb_insn = *(uint32_t*)(vf->ram + cb_off);
-                if (cb_insn != 0) {
-                    entry = vff_init_cb;
-                    printf("[VFF-EXEC] Fallback to init_cb: 0x%08X\n", entry);
+                /* Scan forward from init_cb for PUSH prologue (E92Dxxxx with LR bit) */
+                for (uint32_t fwd = 0; fwd < 0x100; fwd += 4) {
+                    uint32_t probe = *(uint32_t*)(vf->ram + cb_off + fwd);
+                    if ((probe & 0xFFFF0000) == 0xE92D0000 && (probe & 0x4000)) {
+                        entry = vff_init_cb + fwd;
+                        printf("[VFF-EXEC] init_cb %08X → found PUSH prologue at +%X = %08X\n",
+                               vff_init_cb, fwd, entry);
+                        break;
+                    }
+                }
+                if (!entry) {
+                    uint32_t cb_insn = *(uint32_t*)(vf->ram + cb_off);
+                    if (cb_insn != 0) {
+                        entry = vff_init_cb;
+                        printf("[VFF-EXEC] Fallback to init_cb: 0x%08X (no PUSH found)\n", entry);
+                    }
                 }
             }
             if (!entry) {
@@ -7245,9 +7452,15 @@ void vflash_run_frame(VFlash *vf) {
             if (first_i != 0) {
                 uint32_t spc=vf->cpu.r[15], ssp=vf->cpu.r[13];
                 uint32_t slr=vf->cpu.r[14], scp=vf->cpu.cpsr;
-                vf->cpu.r[0] = 1; vf->cpu.r[1] = 0xFFFF;
+                /* R0 = dispatch table base pointer (the init function writes
+                 * scene objects into this table using R0 as base address).
+                 * R1 = scene mask (0xFFFF = all scenes). */
+                vf->cpu.r[0] = vff_entry ? vff_entry : 0x10500800;
+                vf->cpu.r[1] = 0xFFFF;
                 vf->cpu.r[2] = 0;
-                vf->cpu.r[3] = 0;  /* scene index = 0 (low byte used as index) */
+                vf->cpu.r[3] = 0;
+                printf("[VFF-EXEC] Calling init at %08X with R0=%08X (dispatch table)\n",
+                       entry, vf->cpu.r[0]);
                 vf->cpu.r[12] = 0;
                 vf->cpu.r[15] = entry;
                 vf->cpu.r[14] = 0x10FFF000;
@@ -7260,15 +7473,16 @@ void vflash_run_frame(VFlash *vf) {
                 *(uint32_t*)(vf->ram + 0xB8D00C) = 0x10000000 + ctx_addr; /* [SP+0xC] = ctx ptr */
                 int si;
                 /* Track last N BL calls to find where init gets stuck */
-                #define VFF_TRACE_N 32
+                #define VFF_TRACE_N 64
                 static uint32_t bl_pc[VFF_TRACE_N], bl_target[VFF_TRACE_N];
+                static uint32_t bl_r0[VFF_TRACE_N]; /* R0 at BL site */
                 int bl_idx = 0;
                 uint32_t last_pc = 0, loop_pc = 0;
                 int loop_count = 0;
                 /* Track loop entry: if PC returns to same address many times, it's looping */
                 uint32_t loop_marker = 0;
                 int loop_hits = 0;
-                for (si = 0; si < 5000000; si++) {
+                for (si = 0; si < 20000000; si++) {
                     uint32_t pc = vf->cpu.r[15];
                     /* Detect stuck-in-loop: same PC visited many times */
                     if (pc == last_pc) {
@@ -7285,12 +7499,13 @@ void vflash_run_frame(VFlash *vf) {
                             int32_t off = ((int32_t)(insn << 8)) >> 6;
                             bl_pc[bl_idx % VFF_TRACE_N] = pc;
                             bl_target[bl_idx % VFF_TRACE_N] = pc + 8 + off;
+                            bl_r0[bl_idx % VFF_TRACE_N] = vf->cpu.r[0];
                             bl_idx++;
                             /* Track if the FIRST BL in the pattern repeats */
                             if (!loop_marker && bl_idx > 5) loop_marker = pc;
                             if (pc == loop_marker) {
                                 loop_hits++;
-                                if (loop_hits > 200) {
+                                if (loop_hits > 500) {
                                     printf("[VFF-EXEC] Loop detected: PC=%08X repeated %d times, breaking\n",
                                            pc, loop_hits);
                                     break;
@@ -7306,13 +7521,14 @@ void vflash_run_frame(VFlash *vf) {
                 if (loop_pc)
                     printf("[VFF-EXEC] Stuck at PC=%08X (loop)\n", loop_pc);
                 /* Print last BL calls before stuck/timeout */
-                if (si >= 5000000 || loop_pc) {
+                if (si >= 20000000 || loop_pc || loop_hits > 500) {
                     int n = bl_idx < VFF_TRACE_N ? bl_idx : VFF_TRACE_N;
                     int start = bl_idx < VFF_TRACE_N ? 0 : bl_idx - VFF_TRACE_N;
-                    printf("[VFF-EXEC] Last %d BL calls:\n", n);
+                    printf("[VFF-EXEC] Last %d BL calls (of %d total):\n", n, bl_idx);
                     for (int ti = 0; ti < n; ti++) {
                         int idx = (start + ti) % VFF_TRACE_N;
-                        printf("  [%d] PC=%08X → BL %08X\n", ti, bl_pc[idx], bl_target[idx]);
+                        printf("  [%d] PC=%08X → BL %08X R0=%08X\n",
+                               ti, bl_pc[idx], bl_target[idx], bl_r0[idx]);
                     }
                 }
                 /* Check what was written to scene table */
