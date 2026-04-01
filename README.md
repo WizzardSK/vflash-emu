@@ -140,10 +140,11 @@ in BOOT.BIN ARM code. Resource table: 59 entries (55 sprites + 4 metadata).
 Memory watchpoint active on sec[1] region (0x1067A000-0x1093E000 for Spider-Man)
 — will capture decompressor PC once VFF scene init populates render entities.
 
-**VFF scene init blocker**: Scene init function in sec[0] references dispatch table
-(0x104E5000) as literal pool. Backward scan for PUSH prologue fails because game
-BSS clear overwrites function prologue bytes before scan executes. Fix: run scene
-init immediately after CD load (before BSS clear), or protect sec[0] from BSS clear.
+**VFF scene init blocker**: Init callback loops infinitely — RTOS functions return -7
+(NU_UNAVAILABLE) without proper Nucleus task/heap context. Scooby init at 0x104BC890
+loops through render engine at 0x10A0D990-0x10A0DAB4, calling mutex/alloc functions
+that fail. Fix: HLE the specific RTOS function returning -7, or RE sec[2] format
+directly from sec[0] ARM code in Ghidra.
 
 **Render draw path**: render_processing (0x10A89100) is called every game loop
 iteration but returns early. The function checks render context flags at
