@@ -4703,13 +4703,13 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
 
         /* (chain logging moved above) */
 
-        /* Default: return safe stub address */
+        /* Default: return safe stub (MOV R0,#0; BX LR) */
         {
             VFlash *vfp = (VFlash *)ctx;
             *(uint32_t*)(vfp->ram + 0xFFE080) = 0xE3A00000; /* MOV R0,#0 */
             *(uint32_t*)(vfp->ram + 0xFFE084) = 0xE12FFF1E; /* BX LR */
         }
-        cpu->r[0] = 0x10FFE080; /* safe stub address */
+        cpu->r[0] = 0;
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
@@ -7259,11 +7259,62 @@ void vflash_run_frame(VFlash *vf) {
                 *(uint16_t*)(vf->ram + ctx_addr + 1) = 100; /* max_scenes = 100 */
                 *(uint32_t*)(vf->ram + 0xB8D00C) = 0x10000000 + ctx_addr; /* [SP+0xC] = ctx ptr */
                 int si;
+                /* Track last N BL calls to find where init gets stuck */
+                #define VFF_TRACE_N 32
+                static uint32_t bl_pc[VFF_TRACE_N], bl_target[VFF_TRACE_N];
+                int bl_idx = 0;
+                uint32_t last_pc = 0, loop_pc = 0;
+                int loop_count = 0;
+                /* Track loop entry: if PC returns to same address many times, it's looping */
+                uint32_t loop_marker = 0;
+                int loop_hits = 0;
                 for (si = 0; si < 5000000; si++) {
+                    uint32_t pc = vf->cpu.r[15];
+                    /* Detect stuck-in-loop: same PC visited many times */
+                    if (pc == last_pc) {
+                        loop_count++;
+                        if (loop_count > 50000) { loop_pc = pc; break; }
+                    } else {
+                        last_pc = pc;
+                        loop_count = 0;
+                    }
+                    /* Detect repeating BL pattern — main loop marker */
+                    if (pc >= 0x10000000 && pc < 0x11000000) {
+                        uint32_t insn = *(uint32_t*)(vf->ram + (pc - 0x10000000));
+                        if ((insn & 0x0F000000) == 0x0B000000) {
+                            int32_t off = ((int32_t)(insn << 8)) >> 6;
+                            bl_pc[bl_idx % VFF_TRACE_N] = pc;
+                            bl_target[bl_idx % VFF_TRACE_N] = pc + 8 + off;
+                            bl_idx++;
+                            /* Track if the FIRST BL in the pattern repeats */
+                            if (!loop_marker && bl_idx > 5) loop_marker = pc;
+                            if (pc == loop_marker) {
+                                loop_hits++;
+                                if (loop_hits > 200) {
+                                    printf("[VFF-EXEC] Loop detected: PC=%08X repeated %d times, breaking\n",
+                                           pc, loop_hits);
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     arm9_step(&vf->cpu);
                     if (vf->cpu.r[15] == 0x10FFF000) break;
                 }
-                printf("[VFF-EXEC] Scene init: %d steps R0=%08X\n", si, vf->cpu.r[0]);
+                printf("[VFF-EXEC] Scene init: %d steps R0=%08X%s\n", si, vf->cpu.r[0],
+                       loop_pc ? " (STUCK)" : si >= 5000000 ? " (TIMEOUT)" : "");
+                if (loop_pc)
+                    printf("[VFF-EXEC] Stuck at PC=%08X (loop)\n", loop_pc);
+                /* Print last BL calls before stuck/timeout */
+                if (si >= 5000000 || loop_pc) {
+                    int n = bl_idx < VFF_TRACE_N ? bl_idx : VFF_TRACE_N;
+                    int start = bl_idx < VFF_TRACE_N ? 0 : bl_idx - VFF_TRACE_N;
+                    printf("[VFF-EXEC] Last %d BL calls:\n", n);
+                    for (int ti = 0; ti < n; ti++) {
+                        int idx = (start + ti) % VFF_TRACE_N;
+                        printf("  [%d] PC=%08X → BL %08X\n", ti, bl_pc[idx], bl_target[idx]);
+                    }
+                }
                 /* Check what was written to scene table */
                 printf("[VFF-EXEC] [10500808]=%08X [1050080C]=%08X [10500810]=%08X\n",
                        *(uint32_t*)(vf->ram+0x500808),
