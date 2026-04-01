@@ -6931,7 +6931,13 @@ void vflash_run_frame(VFlash *vf) {
                 /* Build 64×240 ARGB scene from block 0 with tilemap lookup */
                 static uint32_t scene64[64*240];
                 int nblocks = (int)(s2size / 0x3C00);
-                for (int sy = 0; sy < 240; sy++) {
+                /* Block 0 rows 0-55 = viewport mask (not pixels). Skip them.
+                 * Map source rows 56-239 (184 rows) → scene rows 0-239. */
+                int src_start = 56;
+                int src_rows = 240 - src_start; /* 184 source rows */
+                for (int dy = 0; dy < 240; dy++) {
+                    int sy = src_start + dy * src_rows / 240;
+                    if (sy >= 240) sy = 239;
                     for (int sx = 0; sx < 64; sx++) {
                         uint8_t b0val = vf->ram[s2off + sy*64 + sx];
                         uint8_t pv;
