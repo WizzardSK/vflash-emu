@@ -1,33 +1,37 @@
 # V.Flash Emulator — Current Task
 
-## Stav (2026-04-01)
-- Alokátor overflow opravený (commit d177062), sec[0] kód zachovaný
-- Garbled framebuffer odstránený, displej je čistý čierny
-- Scooby-Doo dosahuje bp=900
-- **VFLASH_NOJIT=1** povinné (JIT SIGILL crash)
+## State (2026-04-02)
+- Scene init FIXED — all 20 layers initialize (commit 78252f8)
+- C-side frame driver implemented (commit 8ddb263)
+- Per-layer callbacks execute (6.5M steps for Scooby-Doo) but produce sparse output
+- **VFLASH_NOJIT=1** required (JIT has SIGILL crash)
 
-## Blocking: Čierna obrazovka
-Natívny render pipeline beží (50M budget) ale nič nekreslí.
-RTOS funkcie (10A9082C, 10ABCB24, 10AA0FC0/C8) sú HLE'd a vracajú 0.
-Render objekty nemajú správne tile data pointery, palety, rozmery.
+## Blocking: Render Output
+Scooby-Doo is a 3D game — per-layer callbacks run but need:
+- Decompressed textures from sec[1] (custom compression, unknown format)
+- 3D scene graph (camera, mesh positions, animations)
+- Full render context (RTOS render state machine)
 
-Init funkcia 0x104BC818 (NEPOŠKODENÁ) iteruje 20 vrstiev:
-1. Alokuje objekt (0x10A3D9E4 → bump 0x700000)
-2. Inicializuje cez RTOS (0x10AADCB8 → bump 0x680000)
-3. Volá 0x10A9082C(mode, desc_table[layer*16]) → scene handle
-4. Volá 0x10AA0FC0(handle) → width, 0x10AA0FC8(handle) → height
-5. Ukladá cez property settery (10AF3F18=width, 10AF3F3C=height)
+SpongeBob init gets stuck in RTOS loop at 10A07C74 (waiting for semaphore/timer).
 
-Descriptor table 0x10648B20/2C = ZEROED (RTOS nezaplnil).
-Layer table 0x10643998 = OK (20 entít, callback pointery).
+## Frame Driver Results (Scooby-Doo)
+- Layers 0-3, 8-9, 14: <500 steps (quick return)
+- Layers 4, 12-13: ~500K steps (hit budget)
+- Layers 6-7, 10-11, 16: ~1M steps (2 callbacks × 500K)
+- Framebuffer: 3-6 non-zero pixels (nearly empty)
 
-## Prístupy na riešenie
-A. Disassemblovať 10A9082C — zistiť čo vracia, HLE s reálnymi hodnotami
-B. Nechať viac kódu bežať natívne (init 104BC818 je celý)
-C. C-side renderer čítajúci layer table 0x643998 priamo
+## Bugs Fixed This Session (78252f8)
+1. BSS zeroing protection blocked stack writes during native code execution
+2. HLE property setters set R0=0, breaking object pointer chains
+3. Property setters wrote to stack-resident objects, corrupting loop counter
+4. AA5AA0 returned NULL → crash in virtual dispatch
 
-## Nástroje
-- tmp adresár: /home/wizzard/share/GitHub/tmp/
+## Next Steps
+1. **sec[1] decompression** — reverse-engineer custom compression (6.5-7.3 bits/byte)
+2. **SpongeBob RTOS loop** — HLE 10A07C74 so init completes
+3. **Render context setup** — properly populate 0x10BE3C40 for native engine
+4. **Try simpler game** — Spider-Man or other 2D title
+
+## Tools
 - RAM dump: /tmp/vflash_ram2.bin (16MB, base 0x10000000)
 - Disassembler: /home/wizzard/share/GitHub/tmp/disasm_cb <ram.bin> <VA_hex> [count]
-- Detailný progress: pozri memory/vflash-progress.md

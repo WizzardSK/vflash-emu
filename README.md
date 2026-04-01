@@ -35,23 +35,24 @@ Background voice/SFX audio plays automatically from WAV files on disc.
 
 ## Status
 
-**Game scene rendering with palette colors** — VFF sec[2] tilemap rendered to RGB565
-framebuffer via C-side compositor. Palette extracted from sec[0] embedded data.
-BSS trampoline fix routes game's entity dispatch (0x109D1A24 `MOV PC,R2`) through
-ARM trampolines at BSS addresses, connecting the RTOS render pipeline to our draw code.
+**VFF scene init fully working** — all 20 game layers initialize via native ARM code
+execution (4310 steps for Scooby-Doo, 20 render objects allocated). Three bugs fixed:
+BSS zeroing protection blocking stack writes, HLE property setters clobbering R0 and
+corrupting loop counter via stack overlap, AA5AA0 returning NULL. C-side frame driver
+calls per-layer render callbacks (update/prepare/render at vtable offsets 0x18/0x28/0x38)
+with 500K step budget per callback. Layer table at 0x10643998 fully decoded (stride 0x40,
+per-layer function pointers + common RTOS vtable entries).
+
 ARM926EJ-S → x86_64 JIT compiler (9000+ blocks). µMORE v4.0 RTOS boots, game task
 launched via HLE FIQ + Nucleus TCB. 1.4MB game code relocated from BOOT.BIN CD.
-
-**VFF scene rendering pipeline**: sec[2] block 0 (64×240, 8bpp) rendered as scene with
-XBGR1555 palette from sec[0]. 126-214 tile blocks per game. Circular viewport mask
-from block 0 rows 0-55. Tested: SpongeBob shows recognizable colored scene (red/green/
-yellow Bikini Bottom), Scooby-Doo shows blue sky + brown terrain, Spider-Man shows
-city structures in grayscale. Shared renderer runs for all games (BOOT.BIN + relocated).
+VFF sec[2] tilemap rendered to RGB565 framebuffer via C-side compositor. Palette
+extracted from sec[0] embedded data.
 
 **VFF format decoded**: sec[0]=ARM scene code (352KB-1.6MB), sec[1]=compressed sprites
 (custom format, not zlib), sec[2]=tilemap blocks (64×240 each, 8bpp) + raw tile strips
-at +0x88000 (512px wide). Tile blocks contain actual game graphics (buildings, terrain,
-characters). VFF entry point is code address, NOT dispatch table.
+at +0x88000 (512px wide). VFF entry point is dispatch table address, init callback at
++0x20. Scene init iterates 20 layers: allocates render objects, calls RTOS init
+functions, sets width/height/color properties, creates scene handles.
 
 Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spider-Man.
 
@@ -76,7 +77,7 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **Kernel service vtable** | ✅ Initialized from ROM, native dispatch works |
 | **CD-ROM init** | ✅ Native through kernel vtable, disc query succeeds |
 | **VFF scene loading** | ✅ ARM code + graphics + tilemap loaded to RAM |
-| **VFF scene init** | ✅ 58-entry dispatch table (graphics/audio/render layers) |
+| **VFF scene init** | ✅ All 20 layers init (4310 steps, 20 render objects allocated) |
 | **VFF scene builder** | ✅ 65 callbacks, dispatch table setup |
 | **VFF sec[2] tilemap** | ✅ 156 blocks decoded, circular viewport mask extracted |
 | **VFF tile rendering** | ✅ 10 parallax layers, per-layer color, box filter, scrolling |
@@ -98,6 +99,7 @@ Games tested: Cars, SpongeBob, Scooby-Doo, Disney Princess, The Incredibles, Spi
 | **Per-frame forced IRQ** | ✅ Timer IRQ delivery for BOOT.BIN games (JIT bypass) |
 | **Per-slice IRQ delivery** | ✅ Check IRQ after each JIT slice for CPSR windows |
 | **Render processing** | ✅ VFF tile layers rendering (sky/ground/road visible) |
+| **C-side frame driver** | ✅ Per-layer render callbacks (6.5M steps, 3D needs textures) |
 | **PTX display** | ✅ 8bpp with palette via native render FB pipeline (RGB565) |
 | **RTOS IRQ vector chain** | ✅ SDRAM[0xFF98]→0x10FFF200 HLE handler (timer+INTC+VIC) |
 | **HLE IRQ handler** | ✅ Clears ZEVIO timer, SoC INTC, VIC ACK/vector/EOI |
@@ -123,10 +125,17 @@ ROM[0x00] → flash remap → SDRAM cal (0xB8000Axx, ~6 frames)
   → BOOT.BIN game init → NULL trap catches missing vtables
   → bp=900, game engine idle loop at 0x109FC1B8
   → VFF scene data loaded (sec[0]+sec[1]+sec[2] from CD)
-  → VFF scene init: entry scan for dispatch table population (WIP)
+  → VFF scene init: 20 layers initialized, render objects allocated
+  → C-side frame driver: per-layer callbacks executing (render WIP)
 ```
 
 ### Remaining for gameplay
+
+**Scene init working, render output needed**: All 20 game layers initialize with
+proper render objects. C-side frame driver calls per-layer callbacks (update/prepare/
+render). For 3D games (Scooby-Doo), callbacks execute millions of steps but need
+decompressed textures and full render context to produce visible output. For 2D games
+(SpongeBob), init gets stuck in RTOS semaphore loop at 10A07C74.
 
 **VFF sec[2] fully decoded**: 156 blocks × 15360 bytes each. Block 0 rows 0-55 =
 circular viewport mask (64×49, antialiased edge indices 0-20). Offset 0x88000+ =
@@ -140,19 +149,20 @@ in BOOT.BIN ARM code. Resource table: 59 entries (55 sprites + 4 metadata).
 Memory watchpoint active on sec[1] region (0x1067A000-0x1093E000 for Spider-Man)
 — will capture decompressor PC once VFF scene init populates render entities.
 
-**VFF scene init blocker**: Init callback loops infinitely — RTOS functions return -7
-(NU_UNAVAILABLE) without proper Nucleus task/heap context. Scooby init at 0x104BC890
-loops through render engine at 0x10A0D990-0x10A0DAB4, calling mutex/alloc functions
-that fail. Fix: HLE the specific RTOS function returning -7, or RE sec[2] format
-directly from sec[0] ARM code in Ghidra.
+**VFF scene init**: ✅ FIXED. Init callback at 0x104BC818 (Scooby-Doo) now runs all 20
+layer iterations (4310 steps). Three critical bugs found and fixed: (1) BSS zero-write
+protection silently blocked stack writes during native execution, (2) HLE property setters
+set R0=0 which broke caller chains passing object pointers, (3) property object at SP+4
+overlapped with loop counter at SP+0x18 — height=240 (0xF0) overwrote loop counter.
+20 render objects allocated at 0x10702080-0x10703F60 (vtable=0x10643998). Layer descriptor
+table at 0x10643998 fully intact with per-layer callback pointers.
 
-**Render draw path**: render_processing (0x10A89100) is called every game loop
-iteration but returns early. The function checks render context flags at
-0x10BE3C40 (ctx[0]=error, ctx[1]=frame_ready) and render enable at 0x10BE3EC0.
-These are set per-frame but the inner draw path has additional state dependencies
-(display list population, entity vtable dispatch, VBlank callback) that need
-further analysis. The relocated render code writes to display controller registers
-(0xB80007xx) configuring VIC, framebuffer address, and VBlank callback.
+**Render pipeline**: C-side frame driver calls per-layer callbacks with 500K step budget.
+For Scooby-Doo (3D game), callbacks execute 6.5M total steps but produce only sparse
+framebuffer output — 3D rendering needs decompressed textures from sec[1] (custom
+compression format, 6.5-7.3 bits/byte entropy) and full RTOS render context state.
+Native render engine at 10B265E8 returns after 15 steps (render context not populated).
+Display list at 0xB90000 populated from VFF dispatch table (20 objects).
 
 **Native alloc**: 10A775E0 gets stuck in uninitialized game heap. HLE'd with
 separate bump area at 0x390000. 10A77648 (variant) HLE'd at 0x320000.
@@ -175,8 +185,12 @@ separate bump area at 0x390000. 10A77648 (variant) HLE'd at 0x320000.
 - HLE render_init (10A881F0): sets 5 ready flags, skips RTOS callbacks
 - VBlank toggle: MMIO 0x900A0018 bit25 flips on each read
 - Display list vector: 100 entity pointers at 0x10B90000
-- Render budget: 200K instructions per frame, force return if stuck
+- Render budget: 50M instructions per frame, force return if stuck
 - Skip task_notify (10A6FC60): prevents RTOS tree traversal stuck
+- BSS write protection with bss_protect_off flag for native code execution
+- Scene init HLE: bump allocators (A3D9E4, AADCB8), property setters (AF3Exx-AF42xx)
+- AA5AA0 safe vtable: dummy object at 0x10FFD400 with MOV PC,LR stubs
+- C-side frame driver: per-layer callbacks from layer table 0x10643998
 - State machine fix: force [param_1+0x104] = 0x84 (done) at 109D2754
 - Game mode fix: intercept [10B902C0] reads, return 3 (not 4=error)
 - ATAPI sense fix: no error (0x00) instead of unit attention (0x06)
