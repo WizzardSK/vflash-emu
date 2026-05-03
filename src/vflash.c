@@ -7436,23 +7436,28 @@ void vflash_run_frame(VFlash *vf) {
                         }
                         foff += ssz;
                     }
-                    /* Load VFF entry/dispatch table if it falls just past sec[0].
-                     * Spider-Man: sec[0] dst=0x10374000 size=0x171000, entry=0x104E5000
-                     * = dst+size. The table follows sec[0] in the VFF file. */
+                    /* DON'T load 8KB at vff_entry from CD — it's not a separately
+                     * stored "entry table" in the VFF file. The byte range past
+                     * sec[0] in the file IS sec[1] data, so this load was actually
+                     * corrupting vff_entry with sec[1] content (0xCB BB CB BF…).
+                     * vff_entry is the runtime-populated dispatch table address;
+                     * scene init writes callback pointers into it at boot. */
+                    /* Read explicit callback fields from VFF header and inject them
+                     * at the start of the dispatch table area so the existing scan
+                     * (which calls any sec[0]-range pointer in the table) can find
+                     * them without the unrunable native scene init. */
                     if (vff_entry >= 0x10000000 && vff_entry < 0x10000000 + VFLASH_RAM_SIZE) {
-                        uint32_t sec0_dst = *(uint32_t*)(vhdr + 0x30);
-                        uint32_t sec0_sz  = *(uint32_t*)(vhdr + 0x34);
-                        if (vff_entry >= sec0_dst && vff_entry <= sec0_dst + sec0_sz + 0x1000) {
-                            /* Entry table is at or near end of sec[0]. Load extra 8KB from CD. */
-                            uint32_t et_foff = 0x400 + (vff_entry - sec0_dst);
-                            uint32_t et_roff = vff_entry - 0x10000000;
-                            uint32_t et_sz = 0x2000; /* 8KB dispatch table */
-                            if (et_roff + et_sz <= VFLASH_RAM_SIZE) {
-                                int rd = cdrom_read_file(vf->cd, &ve,
-                                            vf->ram + et_roff, et_foff, et_sz);
-                                printf("[VFF] Entry table %dB → %08X (at sec[0]+0x%X)\n",
-                                       rd, vff_entry, vff_entry - sec0_dst);
-                            }
+                        uint32_t cb1 = *(uint32_t*)(vhdr + 0x18);
+                        uint32_t cb2 = *(uint32_t*)(vhdr + 0x1C);
+                        uint32_t init_cb = *(uint32_t*)(vhdr + 0x20);
+                        uint32_t et_roff = vff_entry - 0x10000000;
+                        if (et_roff + 0x100 <= VFLASH_RAM_SIZE) {
+                            memset(vf->ram + et_roff, 0, 0x100);
+                            *(uint32_t*)(vf->ram + et_roff + 0x00) = cb1;
+                            *(uint32_t*)(vf->ram + et_roff + 0x04) = cb2;
+                            *(uint32_t*)(vf->ram + et_roff + 0x08) = init_cb;
+                            printf("[VFF-DT-INJECT] %08X: cb1=%08X cb2=%08X init_cb=%08X\n",
+                                   vff_entry, cb1, cb2, init_cb);
                         }
                     }
                 }
@@ -7729,12 +7734,16 @@ void vflash_run_frame(VFlash *vf) {
                 int bl_count = 0;
                 int total_cb_steps = 0;
                 int cb_called = 0;
-                /* Scan dispatch table for callback pointers and call each one */
+                /* Scan dispatch table for callback pointers and call each one.
+                 * Range covers full sec[0]: 0x171000 for Spider-Man, not just
+                 * the 0x20000 window — VFF callbacks can live anywhere in sec[0]
+                 * including its tail (cb1=0x104E4AD4 ≈ sec[0]+0x170AD4). */
                 vf->bss_protect_off = 1;
                 if (dt_off + 0x1000 < VFLASH_RAM_SIZE) {
+                    uint32_t s0_limit = vf->sec0_size ? vf->sec0_size : 0x200000;
                     for (uint32_t di = 0; di < 0xDA0; di += 4) {
                         uint32_t v = *(uint32_t*)(vf->ram + dt_off + di);
-                        if (v >= s0_addr && v < s0_addr + 0x20000) {
+                        if (v >= s0_addr && v < s0_addr + s0_limit) {
                             /* This is a callback pointer — call it */
                             vf->cpu.r[0] = 0x10300000;
                             vf->cpu.r[1] = di;
