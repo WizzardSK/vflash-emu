@@ -7460,35 +7460,54 @@ void vflash_run_frame(VFlash *vf) {
              * init_cb from header is often a small utility, not the main init. */
             uint32_t entry = 0;
             if (vff_entry >= 0x10000000) {
-                /* Scan sec[0] for a LDR that references vff_entry as literal pool */
+                /* Scan sec[0] for the literal value vff_entry (dispatch table addr).
+                 * For each hit, find the LDR PC-relative that targets the literal,
+                 * then walk back from the LDR to the enclosing function's prologue.
+                 * Prologue forms accepted: PUSH {…,LR} (E92D…), SUB SP,SP,#imm
+                 * (E24DDxxx), or STR LR,[SP,#-4]! (E52DE004). */
                 uint32_t s0_off = s0_addr - 0x10000000;
                 for (uint32_t scan = 0; scan < s0_size && scan < 0x100000; scan += 4) {
                     uint32_t val = *(uint32_t*)(vf->ram + s0_off + scan);
-                    if (val == vff_entry) {
-                        printf("[VFF-SCAN] Found literal 0x%08X at s0+0x%X, checking back for PUSH...\n", vff_entry, scan);
-                        /* Debug: show value at expected PUSH location */
-                        if (scan >= 0xB0) {
-                            uint32_t expected = *(uint32_t*)(vf->ram + s0_off + scan - 0xB0);
-                            printf("[VFF-SCAN] [s0+0x%X]=0x%08X (expected PUSH E92D4030)\n",
-                                   scan - 0xB0, expected);
-                        }
-                        /* Found literal pool with dispatch table address.
-                         * Search backward for the function's PUSH prologue. */
-                        int back_found = 0;
-                        for (int32_t back = (int32_t)scan - 4; back >= 0 && (scan - (uint32_t)back) < 0x400; back -= 4) {
-                            uint32_t pv = *(uint32_t*)(vf->ram + s0_off + (uint32_t)back);
-                            /* Accept PUSH with LR, or STMDB SP! (any variant) */
-                            if (((pv & 0xFFFF0000) == 0xE92D0000 && (pv & 0x4000)) ||
-                                ((pv & 0xFFFF0000) == 0xE92D0000 && (pv & 0xFF) > 0x10)) {
-                                back_found = 1;
-                                entry = s0_addr + (uint32_t)back;
-                                printf("[VFF-EXEC] Found scene init at 0x%08X (refs dispatch table 0x%08X)\n",
-                                       entry, vff_entry);
+                    if (val != vff_entry) continue;
+                    printf("[VFF-SCAN] Found literal 0x%08X at s0+0x%X\n", vff_entry, scan);
+
+                    /* Find LDR Rd, [PC, #imm] that targets this literal. */
+                    int32_t ldr_off = -1;
+                    for (int32_t lp = (int32_t)scan - 8;
+                         lp >= 0 && ((int32_t)scan - lp) < 0x1000; lp -= 4) {
+                        uint32_t li = *(uint32_t*)(vf->ram + s0_off + lp);
+                        /* LDR Rd, [PC, #imm12]: 0xE59FXXXX (U=1) or 0xE51FXXXX (U=0) */
+                        if ((li & 0x0FFF0000) == 0x059F0000 ||
+                            (li & 0x0FFF0000) == 0x051F0000) {
+                            uint32_t imm = li & 0xFFF;
+                            int u = (li >> 23) & 1;
+                            int32_t target = lp + 8 + (u ? (int32_t)imm : -(int32_t)imm);
+                            if (target == (int32_t)scan) {
+                                ldr_off = lp;
                                 break;
                             }
                         }
-                        if (entry) break;
                     }
+                    if (ldr_off < 0) continue;
+                    printf("[VFF-SCAN] LDR PC-rel at s0+0x%X loads literal\n", ldr_off);
+
+                    /* Walk backward from LDR to find function prologue. */
+                    for (int32_t fb = ldr_off - 4;
+                         fb >= 0 && (ldr_off - fb) < 0x1000; fb -= 4) {
+                        uint32_t pv = *(uint32_t*)(vf->ram + s0_off + fb);
+                        int is_prologue =
+                            ((pv & 0xFFFF0000) == 0xE92D0000 && (pv & 0x4000)) ||
+                            ((pv & 0xFFFF0000) == 0xE92D0000 && (pv & 0xFF) > 0x10) ||
+                            ((pv & 0xFFFFF000) == 0xE24DD000) ||
+                            (pv == 0xE52DE004);
+                        if (is_prologue) {
+                            entry = s0_addr + (uint32_t)fb;
+                            printf("[VFF-EXEC] Found scene init at 0x%08X (insn=%08X, refs %08X)\n",
+                                   entry, pv, vff_entry);
+                            break;
+                        }
+                    }
+                    if (entry) break;
                 }
             }
             if (!entry) {
