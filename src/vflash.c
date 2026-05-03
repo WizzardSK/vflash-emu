@@ -5017,6 +5017,17 @@ void vflash_run_frame(VFlash *vf) {
         *(uint32_t*)(vf->ram + 0xFFB8) = 0x10FFF200u;
     }
 
+    /* Lazy-install B . stub at game-loop fallback anchors when empty.
+     * arm9.c null-trap fallback redirects PC there with IRQ enabled —
+     * without a stub, PC drifts through zeros and hits BSS-call HLE
+     * which returns to LR=0, bouncing back to NULL infinitely. */
+    if (vf->boot_phase >= 800) {
+        if (*(uint32_t*)(vf->ram + 0x9D1CE0) == 0)
+            *(uint32_t*)(vf->ram + 0x9D1CE0) = 0xEAFFFFFEu; /* B . */
+        if (*(uint32_t*)(vf->ram + 0xFFF000) == 0)
+            *(uint32_t*)(vf->ram + 0xFFF000) = 0xEAFFFFFEu; /* B . */
+    }
+
     int done = 0;
     int slice_count = 0;
     while (done < TOTAL) {
@@ -7043,7 +7054,7 @@ void vflash_run_frame(VFlash *vf) {
                 } else {
                     vf->cpu.r[15] = 0x109D1CE0;
                 }
-                vf->cpu.cpsr = 0x000000D3;
+                vf->cpu.cpsr = 0x00000013; /* IRQ enabled — let timer recover */
             }
         }
 
@@ -7900,7 +7911,7 @@ void vflash_run_frame(VFlash *vf) {
         }
         if (!game_in_bootbin) {
             vf->cpu.r[15] = 0x109D1CE0;
-            vf->cpu.cpsr = 0x000000D3;
+            vf->cpu.cpsr = 0x00000013; /* IRQ enabled */
             vf->timer.timer[0].ctrl = 0;
             vf->timer.irq.enable = 0;
             vf->timer.irq.status = 0;

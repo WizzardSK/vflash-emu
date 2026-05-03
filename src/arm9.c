@@ -1076,10 +1076,12 @@ int arm9_step(ARM9 *cpu) {
             if (lr_valid && sp_valid && lr != inst_addr) {
                 PC = lr & ~3u;
             } else {
-                /* LR or SP corrupted — jump to game loop with safe state */
-                PC = 0x109D1CE0; /* game loop */
+                /* LR or SP corrupted — jump to game-loop anchor.
+                 * IRQ must stay enabled so timer can drive recovery;
+                 * a B . stub at 0x109D1CE0 is lazy-installed by vflash. */
+                PC = 0x109D1CE0;
                 cpu->r[13] = 0x10B8DAC0; /* safe SP */
-                cpu->cpsr = 0x000000D3; /* SVC, IRQ off */
+                cpu->cpsr = 0x00000013; /* SVC, IRQ enabled */
             }
             cpu->cycles += 1;
             return 1;
