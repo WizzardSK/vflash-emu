@@ -240,7 +240,7 @@ int main(int argc, char **argv) {
         /* Auto-screenshot in headless mode after game starts */
         if (headless) {
             static int screenshot_done = 0;
-            if (!screenshot_done && fps_count >= 200) {
+            if (!screenshot_done && fps_count >= 50) {
                 uint32_t *fb = vflash_get_framebuffer(vf);
                 FILE *pf = fopen("/tmp/vflash_screen.ppm", "wb");
                 if (pf) {
