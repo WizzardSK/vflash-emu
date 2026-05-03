@@ -4094,6 +4094,36 @@ static int hle_service_intercept(void *ctx, uint32_t addr) {
         cpu->r[15] = cpu->r[14] & ~3u;
         return 1;
     }
+    /* HLE RTOS allocator entries 0x10A8C290 and 0x10A8C344 (size in R0).
+     * Both have a state dispatch (LDRLS PC, [PC, R3, LSL #2]) keyed off
+     * unpopulated state at 0x10B18FE8 — without real RTOS heap init the
+     * dispatch jumps to junk targets and ends in panic loops at 0x10A88290
+     * or 0x10A8C3A0. Hand out from a dedicated bump region. R0=0 / junk
+     * pointer values are coerced to a small benign allocation. */
+    if (vf->boot_phase >= 800 &&
+        (addr == 0x10A8C290 || addr == 0x10A8C344)) {
+        static uint32_t rtos_alloc_bump = 0x780000; /* 0x780000-0x800000 = 512KB */
+        uint32_t size = cpu->r[0];
+        /* Treat junk-pointer or pre-aligned-RAM values as size=0x10. */
+        if (size == 0 || size > 0x4000) size = 0x10;
+        size = (size + 15) & ~15u;
+        if (rtos_alloc_bump + size < 0x800000) {
+            uint32_t ptr = 0x10000000 + rtos_alloc_bump;
+            memset(vf->ram + rtos_alloc_bump, 0, size);
+            rtos_alloc_bump += size;
+            cpu->r[0] = ptr;
+        } else {
+            cpu->r[0] = 0;
+        }
+        static int al_log = 0;
+        if (al_log < 16) {
+            printf("[HLE-ALLOC] %08X size=%X → %08X (LR=%08X)\n",
+                   addr, size, cpu->r[0], cpu->r[14]);
+            al_log++;
+        }
+        cpu->r[15] = cpu->r[14] & ~3u;
+        return 1;
+    }
     /* HLE render object setup functions (10AFxxxx range).
      * These set properties on render context objects allocated above.
      * Log R0 (object ptr) and R1 (value) to decode layer structure. */
